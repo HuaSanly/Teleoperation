@@ -1,0 +1,14 @@
+2026-01-08 19:48:09 [udp_iframe] frame_id=0 enc_bytes=49515 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:48:17 [udp_iframe] frame_id=256 enc_bytes=52713 data_pkts=44 parity_pkts=12 total_pkts=56 fec.table=1 groups=2 r=6
+2026-01-08 19:48:26 [udp_iframe] frame_id=512 enc_bytes=50721 data_pkts=43 parity_pkts=12 total_pkts=55 fec.table=1 groups=2 r=6
+2026-01-08 19:48:34 [udp_iframe] frame_id=768 enc_bytes=50170 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:48:43 [udp_iframe] frame_id=1024 enc_bytes=49536 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:48:51 [udp_iframe] frame_id=1280 enc_bytes=49859 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:49:00 [udp_iframe] frame_id=1536 enc_bytes=50400 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:49:08 [udp_iframe] frame_id=1792 enc_bytes=47849 data_pkts=40 parity_pkts=10 total_pkts=50 fec.table=1 groups=2 r=5
+2026-01-08 19:49:17 [udp_iframe] frame_id=2048 enc_bytes=49168 data_pkts=41 parity_pkts=10 total_pkts=51 fec.table=1 groups=2 r=5
+2026-01-08 19:49:26 [udp_iframe] frame_id=2304 enc_bytes=45253 data_pkts=38 parity_pkts=10 total_pkts=48 fec.table=1 groups=2 r=5
+2026-01-08 19:49:34 [udp_iframe] frame_id=2560 enc_bytes=43635 data_pkts=37 parity_pkts=10 total_pkts=47 fec.table=1 groups=2 r=5
+2026-01-08 19:49:43 [udp_iframe] frame_id=2816 enc_bytes=54846 data_pkts=46 parity_pkts=12 total_pkts=58 fec.table=1 groups=2 r=6
+2026-01-08 19:49:51 [udp_iframe] frame_id=3072 enc_bytes=49268 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
+2026-01-08 19:50:00 [udp_iframe] frame_id=3328 enc_bytes=50306 data_pkts=42 parity_pkts=12 total_pkts=54 fec.table=1 groups=2 r=6
