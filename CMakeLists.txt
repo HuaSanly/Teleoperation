@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(teleoperation_robot_bridge)
 
-## Compile as C++11, supported in ROS Kinetic and newer
-# add_compile_options(-std=c++11)
+## Compile as C++17 (needed for ported ROS2 code)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
@@ -10,7 +12,22 @@ project(teleoperation_robot_bridge)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   std_msgs
+  sensor_msgs
+  geometry_msgs
 )
+
+find_package(Protobuf REQUIRED)
+find_package(gRPC CONFIG QUIET)
+
+set(GRPC_FOUND_CONFIG FALSE)
+if(gRPC_FOUND)
+  set(GRPC_FOUND_CONFIG TRUE)
+endif()
+
+if(NOT GRPC_FOUND_CONFIG)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GRPC REQUIRED grpc++ grpc)
+endif()
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
@@ -102,10 +119,8 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-#  INCLUDE_DIRS include
-#  LIBRARIES teleoperation_robot_bridge
-#  CATKIN_DEPENDS roscpp std_msgs
-#  DEPENDS system_lib
+  INCLUDE_DIRS include
+  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs
 )
 
 ###########
@@ -115,8 +130,85 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
+)
+
+# gRPC / Protobuf generated sources
+file(GLOB PROTO_FILES "${CMAKE_CURRENT_SOURCE_DIR}/proto/*.proto")
+if(NOT PROTO_FILES)
+  message(WARNING "No .proto files found in ${CMAKE_CURRENT_SOURCE_DIR}/proto")
+endif()
+
+if(TARGET gRPC::grpc_cpp_plugin)
+  set(gRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
+else()
+  find_program(gRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
+  if(NOT gRPC_CPP_PLUGIN_EXECUTABLE)
+    message(FATAL_ERROR "grpc_cpp_plugin not found. Ensure gRPC is installed and grpc_cpp_plugin is in PATH.")
+  endif()
+endif()
+
+set(PROTO_GENS_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY ${PROTO_GENS_DIR})
+
+set(PROTO_SRCS "")
+set(PROTO_HDRS "")
+
+foreach(PROTO_FILE ${PROTO_FILES})
+  get_filename_component(PROTO_NAME ${PROTO_FILE} NAME_WE)
+  set(PROTO_SRC "${PROTO_GENS_DIR}/${PROTO_NAME}.pb.cc")
+  set(PROTO_HDR "${PROTO_GENS_DIR}/${PROTO_NAME}.pb.h")
+  set(GRPC_SRC "${PROTO_GENS_DIR}/${PROTO_NAME}.grpc.pb.cc")
+  set(GRPC_HDR "${PROTO_GENS_DIR}/${PROTO_NAME}.grpc.pb.h")
+
+  add_custom_command(
+    OUTPUT "${PROTO_SRC}" "${PROTO_HDR}" "${GRPC_SRC}" "${GRPC_HDR}"
+    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+    ARGS --grpc_out="${PROTO_GENS_DIR}"
+      --cpp_out="${PROTO_GENS_DIR}"
+      --plugin=protoc-gen-grpc=${gRPC_CPP_PLUGIN_EXECUTABLE}
+      -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+      "${PROTO_FILE}"
+    DEPENDS "${PROTO_FILE}"
+  )
+
+  list(APPEND PROTO_SRCS ${PROTO_SRC} ${GRPC_SRC})
+  list(APPEND PROTO_HDRS ${PROTO_HDR} ${GRPC_HDR})
+endforeach()
+
+add_library(${PROJECT_NAME}_grpc_proto ${PROTO_SRCS} ${PROTO_HDRS})
+if(GRPC_FOUND_CONFIG)
+  target_link_libraries(${PROJECT_NAME}_grpc_proto
+    ${Protobuf_LIBRARIES}
+    gRPC::grpc++
+  )
+else()
+  target_link_libraries(${PROJECT_NAME}_grpc_proto
+    ${Protobuf_LIBRARIES}
+    ${GRPC_LIBRARIES}
+  )
+  target_include_directories(${PROJECT_NAME}_grpc_proto PUBLIC
+    ${GRPC_INCLUDE_DIRS}
+  )
+endif()
+target_include_directories(${PROJECT_NAME}_grpc_proto PUBLIC
+  "${PROTO_GENS_DIR}"
+)
+
+## Declare a C++ executable
+add_executable(${PROJECT_NAME}
+  src/main_node.cpp
+  src/signaling_client.cpp
+)
+
+target_link_libraries(${PROJECT_NAME}
+  ${catkin_LIBRARIES}
+  ${PROJECT_NAME}_grpc_proto
+)
+
+target_include_directories(${PROJECT_NAME} PUBLIC
+  ${PROTO_GENS_DIR}
 )
 
 ## Declare a C++ library
@@ -190,6 +282,19 @@ include_directories(
 #   # myfile2
 #   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 # )
+
+install(TARGETS ${PROJECT_NAME}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+  FILES_MATCHING PATTERN "*.hpp"
+)
+
+install(DIRECTORY launch config
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
 
 #############
 ## Testing ##

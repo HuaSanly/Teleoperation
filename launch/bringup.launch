@@ -1,0 +1,10 @@
+<launch>
+  <arg name="node_name" default="teleoperation_robot_bridge" />
+
+  <rosparam command="load" file="$(find teleoperation_robot_bridge)/config/params.yaml" ns="teleoperation_robot_bridge" />
+
+  <node pkg="teleoperation_robot_bridge"
+        type="teleoperation_robot_bridge"
+        name="$(arg node_name)"
+        output="screen" />
+</launch>

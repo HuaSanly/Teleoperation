@@ -1,0 +1,69 @@
+# ROS1 参数文件（供 teleoperation_robot_bridge 节点读取）
+# 使用私有命名空间加载：rosparam command="load" file=... ns="teleoperation_robot_bridge"
+
+server_ip: "grpc-pro.eifuture.com"
+server_port: 7777
+use_ssl: true
+device_id: "007"
+token: "secure"
+
+udp_ip: "162.14.226.58"
+udp_port: 7778
+
+pose_udp:
+  enabled: true
+  bind_ip: "0.0.0.0"
+  bind_port: 7780
+  allowed_remote_ip: ""
+  recv_timeout_ms: 100
+  qos:
+    depth: 10
+  frame_id:
+    hmd: "vr_hmd"
+    left_controller: "vr_left_controller"
+    right_controller: "vr_right_controller"
+    left_aim: "vr_left_aim"
+    right_aim: "vr_right_aim"
+  publish_euler: true
+  publish_buttons: true
+  publish_aim: true
+
+video:
+  profile: [3840, 1520, 30]
+  device: "/dev/video0"
+  pixel_format: "mjpeg"
+  v4l2:
+    buffer_count: 3
+  converter:
+    buffer_pool_size: 8
+    compute: "vic"
+    dec_layout: "block"
+    out_layout: "pitch"
+  encoder:
+    bitrate: 40000000
+    intra_refresh:
+      enabled: true
+      interval_slices: 1
+    low_freq_idr:
+      enabled: true
+      interval_sec: 3
+    idr_interval: 90
+    idr_interval_gops: 90
+    force_idr_every_n: 0
+    qp_range_i_min: 10
+    qp_range_i_max: 40
+    qp_range_p_min: 10
+    qp_range_p_max: 40
+    output_plane_buffers: 3
+    capture_plane_buffers: 3
+    max_perf_mode: false
+    hw_preset: "ultrafast"
+    rate_control: "cbr"
+    peak_bitrate: 40000000
+    virtual_buffer_size: 200000
+    num_reference_frames: 1
+    num_b_frames: 0
+    insert_sps_pps_at_idr: 1
+  recording:
+    enabled: false
+    output_dir: ""
