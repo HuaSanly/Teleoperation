@@ -18,6 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG QUIET)
+find_package(OpenSSL REQUIRED)
 
 set(GRPC_FOUND_CONFIG FALSE)
 if(gRPC_FOUND)
@@ -200,11 +201,18 @@ target_include_directories(${PROJECT_NAME}_grpc_proto PUBLIC
 add_executable(${PROJECT_NAME}
   src/main_node.cpp
   src/signaling_client.cpp
+  src/udp/udp_manager.cpp
+  src/udp/pose_udp_receiver.cpp
+  src/udp/udp_packet.cpp
+  src/udp/udp_video_sender.cpp
+  src/udp/gf256.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}
   ${catkin_LIBRARIES}
   ${PROJECT_NAME}_grpc_proto
+  OpenSSL::SSL
+  OpenSSL::Crypto
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -287,7 +295,7 @@ install(TARGETS ${PROJECT_NAME}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(DIRECTORY include/${PROJECT_NAME}/
+install(DIRECTORY include/
   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
   FILES_MATCHING PATTERN "*.hpp"
 )

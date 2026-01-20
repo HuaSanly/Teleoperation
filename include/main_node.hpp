@@ -6,7 +6,10 @@
 #include <string>
 #include <vector>
 
-#include "teleoperation_robot_bridge/signaling_client.hpp"
+#include "signaling_client.hpp"
+#include "udp/pose_udp_receiver.hpp"
+#include "udp/udp_manager.hpp"
+#include "udp/udp_video_sender.hpp"
 
 namespace trb
 {
@@ -20,9 +23,28 @@ struct Config
     std::string device_id;
     std::string token;
 
+    // gRPC lifecycle
+    double grpc_register_retry_sec = 3.0;
+    double grpc_heartbeat_sec = 15.0;
+
     // UDP
     std::string udp_ip;
     int udp_port = 0;
+    std::string udp_bind_ip;
+    int udp_bind_port = 0;
+    int udp_recv_timeout_ms = 0;
+    std::string udp_allowed_remote_ip;
+    bool udp_pacing_enabled = true;
+    int udp_pacing_bps = 30000000;
+    int udp_pacing_queue_max_packets = 1024;
+    int udp_pacing_queue_max_bytes = 300000;
+    bool udp_handshake_enabled = true;
+    double udp_handshake_interval_sec = 1.0;
+    double udp_ping_interval_sec = 5.0;
+    double udp_handshake_timeout_sec = 10.0;
+    int udp_max_payload_bytes = 1200;
+    bool udp_fec_enabled = true;
+    int udp_fec_table_id = 1;
 
     // Pose UDP
     bool pose_udp_enabled = false;
@@ -83,12 +105,28 @@ class MainNode
 {
 public:
     explicit MainNode(ros::NodeHandle nh, ros::NodeHandle pnh);
+    ~MainNode();
 
 private:
+    enum class State
+    {
+        kConnecting,
+        kRegistered,
+        kRunning
+    };
+
     void loadParams();
     void initGrpc();
+    void initUdp();
+    void tryRegister();
+    void enterRunningState();
+    void tryEnterRunning();
+    void setState(State next, const std::string &reason);
+    static const char *stateToString(State s);
     void onSignalingEvent(const signaling::EventMessage &msg);
     void heartbeatTimerCallback(const ros::TimerEvent &event);
+    void registerRetryTimerCallback(const ros::TimerEvent &event);
+    void udpReadyTimerCallback(const ros::TimerEvent &event);
 
     ros::NodeHandle nh_;
     ros::NodeHandle pnh_;
@@ -96,6 +134,16 @@ private:
 
     std::shared_ptr<SignalingClient> signaling_client_;
     ros::Timer heartbeat_timer_;
+    ros::Timer register_retry_timer_;
+    ros::Timer udp_ready_timer_;
+    bool grpc_registered_ = false;
+    State state_ = State::kConnecting;
+
+    bool udp_control_ready_ = false;
+
+    std::unique_ptr<udp::UdpManager> udp_manager_;
+    std::unique_ptr<udp::PoseUdpReceiver> pose_udp_receiver_;
+    std::unique_ptr<udp::UdpVideoSender> udp_video_sender_;
 };
 
 } // namespace trb

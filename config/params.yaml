@@ -7,8 +7,32 @@ use_ssl: true
 device_id: "007"
 token: "secure"
 
+grpc:
+  register_retry_sec: 3.0
+  heartbeat_sec: 15.0
+
 udp_ip: "162.14.226.58"
 udp_port: 7778
+
+udp:
+  bind_ip: "0.0.0.0"
+  bind_port: 0
+  recv_timeout_ms: 100
+  allowed_remote_ip: ""
+  max_payload_bytes: 1200
+  pacing:
+    enabled: true
+    bps: 30000000
+    queue_max_packets: 1024
+    queue_max_bytes: 300000
+  fec:
+    enabled: true
+    table_id: 1
+  handshake:
+    enabled: true
+    interval_sec: 1.0
+    ping_interval_sec: 5.0
+    timeout_sec: 10.0
 
 pose_udp:
   enabled: true

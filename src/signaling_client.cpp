@@ -1,4 +1,4 @@
-#include "teleoperation_robot_bridge/signaling_client.hpp"
+#include "signaling_client.hpp"
 
 #include <cstdlib>
 #include <utility>
