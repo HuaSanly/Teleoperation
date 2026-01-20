@@ -1,4 +1,5 @@
 #include "udp/udp_stream_manager.hpp"
+#include "udp/scream_controller.hpp"
 #include "udp/gf256.hpp"
 #include "utils/teleop_logger.hpp"
 #include <array>
@@ -448,6 +449,15 @@ namespace trb
 
             const uint16_t total_fragments = static_cast<uint16_t>((size + kMaxPayloadSize - 1) / kMaxPayloadSize);
 
+            if (scream_enabled_.load())
+            {
+                std::lock_guard<std::mutex> lk(scream_mutex_);
+                if (scream_controller_)
+                {
+                    scream_controller_->onFrameEncoded(size, capture_timestamp_us);
+                }
+            }
+
             uint8_t fec_table_id = 0;
             {
                 std::lock_guard<std::mutex> lk(fec_mutex_);
@@ -511,7 +521,7 @@ namespace trb
                 const size_t chunk_size = std::min(kMaxPayloadSize, size - offset);
 
                 VideoPacketHeaderV2 header;
-                header.Type = 0x01;
+                header.Type = kVideoPacketType;
                 header.PacketSeqNum = packet_seq_num_++;
                 header.Timestamp = timestamp;
                 header.FrameId = current_frame_id;
@@ -541,6 +551,7 @@ namespace trb
                 QueueItem qi;
                 qi.kind = QueueItem::Kind::Datagram;
                 qi.frame_id = current_frame_id;
+                qi.packet_seq_num = header.PacketSeqNum;
                 qi.bytes = packet;
                 qi.wire_bytes = packet.size();
                 enqueueItem(std::move(qi));
@@ -612,7 +623,7 @@ namespace trb
                     }
 
                     VideoPacketHeaderV2 parity_header;
-                    parity_header.Type = 0x01;
+                    parity_header.Type = kVideoPacketType;
                     parity_header.PacketSeqNum = packet_seq_num_++;
                     parity_header.Timestamp = timestamp;
                     parity_header.FrameId = current_frame_id;
@@ -636,6 +647,7 @@ namespace trb
                     QueueItem pq;
                     pq.kind = QueueItem::Kind::Datagram;
                     pq.frame_id = current_frame_id;
+                    pq.packet_seq_num = parity_header.PacketSeqNum;
                     pq.bytes = packet;
                     pq.wire_bytes = packet.size();
                     enqueueItem(std::move(pq));
@@ -863,7 +875,20 @@ namespace trb
                 }
 
                 const bool pacing_enabled = pacing_enabled_.load();
-                const uint64_t pacing_bps = pacing_bps_.load();
+                uint64_t pacing_bps = pacing_bps_.load();
+
+                if (scream_enabled_.load())
+                {
+                    std::lock_guard<std::mutex> lk(scream_mutex_);
+                    if (scream_controller_)
+                    {
+                        const uint64_t scream_bps = scream_controller_->pacingRateBps();
+                        if (scream_bps > 0)
+                        {
+                            pacing_bps = scream_bps;
+                        }
+                    }
+                }
                 const double rate_bytes_per_sec = (pacing_enabled && pacing_bps > 0)
                                                       ? (static_cast<double>(pacing_bps) / 8.0)
                                                       : 0.0;
@@ -913,6 +938,16 @@ namespace trb
                     if (rc >= 0)
                     {
                         sent_total_pkts_.fetch_add(1, std::memory_order_relaxed);
+
+                        if (scream_enabled_.load())
+                        {
+                            std::lock_guard<std::mutex> lk(scream_mutex_);
+                            if (scream_controller_)
+                            {
+                                const uint64_t send_time_us = static_cast<uint64_t>(toSteadyUs(s0));
+                                scream_controller_->onPacketSent(item.packet_seq_num, item.wire_bytes, send_time_us);
+                            }
+                        }
                     }
                     if (stats.send_calls_us == 0)
                     {
@@ -1060,12 +1095,42 @@ namespace trb
                     {
                         // Data-plane: allow reusing this socket for other datagrams, e.g. pose (Type=0x02)
                         const uint8_t type = static_cast<uint8_t>(buffer[0]);
-                        if (type == 0x02)
+                        if (type == kPosePacketType)
                         {
                             auto cb = pose_datagram_cb_;
                             if (cb)
                             {
                                 cb(reinterpret_cast<const uint8_t *>(buffer), static_cast<size_t>(len));
+                            }
+                        }
+                        else if (type == kScreamFeedbackType)
+                        {
+                            if (static_cast<size_t>(len) < sizeof(ScreamFeedbackHeader))
+                            {
+                                continue;
+                            }
+
+                            const auto *hdr = reinterpret_cast<const ScreamFeedbackHeader *>(buffer);
+                            const uint16_t bits = hdr->AckVectorBits;
+                            const size_t bytes = static_cast<size_t>((bits + 7u) / 8u);
+                            if (sizeof(ScreamFeedbackHeader) + bytes > static_cast<size_t>(len))
+                            {
+                                continue;
+                            }
+
+                            if (scream_enabled_.load())
+                            {
+                                std::lock_guard<std::mutex> lk(scream_mutex_);
+                                if (scream_controller_)
+                                {
+                                    ScreamFeedback fb;
+                                    fb.base_seq = hdr->BaseSeq;
+                                    fb.ack_vector_bits = bits;
+                                    fb.rx_timestamp_ntp = hdr->RxTimestamp;
+                                    fb.ack_vector.assign(reinterpret_cast<const uint8_t *>(buffer + sizeof(ScreamFeedbackHeader)),
+                                                         reinterpret_cast<const uint8_t *>(buffer + sizeof(ScreamFeedbackHeader) + bytes));
+                                    scream_controller_->onFeedback(fb);
+                                }
                             }
                         }
                     }
@@ -1076,6 +1141,17 @@ namespace trb
         void UdpStreamManager::setPoseDatagramCallback(std::function<void(const uint8_t *, size_t)> cb)
         {
             pose_datagram_cb_ = std::move(cb);
+        }
+
+        void UdpStreamManager::setScreamController(std::unique_ptr<IScreamController> controller)
+        {
+            std::lock_guard<std::mutex> lk(scream_mutex_);
+            scream_controller_ = std::move(controller);
+        }
+
+        void UdpStreamManager::setScreamEnabled(bool enabled)
+        {
+            scream_enabled_.store(enabled, std::memory_order_relaxed);
         }
 
         void UdpStreamManager::signalingThreadMain()

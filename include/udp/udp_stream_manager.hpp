@@ -21,6 +21,8 @@ namespace trb
     namespace udp
     {
 
+    class IScreamController;
+
         class UdpStreamManager
         {
         public:
@@ -75,6 +77,10 @@ namespace trb
             // This is used to reuse the video stream socket for pose datagrams (Type=0x02).
             void setPoseDatagramCallback(std::function<void(const uint8_t *, size_t)> cb);
 
+            // Optional: attach an external SCReAM controller.
+            void setScreamController(std::unique_ptr<IScreamController> controller);
+            void setScreamEnabled(bool enabled);
+
         private:
             struct QueueItem
             {
@@ -86,6 +92,7 @@ namespace trb
 
                 Kind kind{Kind::Datagram};
                 uint32_t frame_id{0};
+                uint16_t packet_seq_num{0};
 
                 // Datagram payload (header + payload). Used when kind==Datagram.
                 std::vector<uint8_t> bytes;
@@ -168,6 +175,10 @@ namespace trb
             std::atomic<bool> handshake_success_{false};
             std::mutex handshake_mutex_;
             std::condition_variable handshake_cv_;
+
+            std::mutex scream_mutex_;
+            std::unique_ptr<IScreamController> scream_controller_;
+            std::atomic<bool> scream_enabled_{false};
         };
 
     } // namespace udp

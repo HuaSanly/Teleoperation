@@ -222,6 +222,20 @@ endif()
 
 list(APPEND EXTRA_LIBS video_converter video_encoder)
 
+# SCReAM reference (Ericsson)
+add_library(scream_ref
+  scream/code/ScreamTx.cpp
+  scream/code/ScreamV2Tx.cpp
+  scream/code/ScreamV2TxStream.cpp
+  scream/code/RtpQueue.cpp
+)
+
+target_include_directories(scream_ref PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/scream/code>
+)
+
+list(APPEND EXTRA_LIBS scream_ref)
+
 add_executable(${PROJECT_NAME}
   src/main_node.cpp
   src/signaling_client.cpp
@@ -232,11 +246,14 @@ add_executable(${PROJECT_NAME}
   src/udp/udp_packet.cpp
   src/udp/gf256.cpp
   src/udp/pose_udp_receiver.cpp
+  src/udp/scream_controller.cpp
+  src/udp/scream_controller_ericsson.cpp
   src/udp/udp_stream_manager.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<INSTALL_INTERFACE:include>
   "${PROTO_GENS_DIR}"
 )

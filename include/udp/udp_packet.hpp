@@ -8,11 +8,15 @@
 namespace trb::udp
 {
 
+    constexpr uint8_t kVideoPacketType = 0x01;
+    constexpr uint8_t kPosePacketType = 0x02;
+    constexpr uint8_t kScreamFeedbackType = 0x03;
+
     // Video header V2 (final) based on doc/PROTOCOL_UDP_VIDEO_V2.md.
     // Total header size: 26 bytes. All multi-byte fields are Little-Endian on wire.
     struct VideoPacketHeaderV2
     {
-        uint8_t Type{0x01};
+        uint8_t Type{kVideoPacketType};
         uint16_t PacketSeqNum{0};
         uint64_t Timestamp{0};
         uint32_t FrameId{0};
@@ -25,6 +29,18 @@ namespace trb::udp
         // When FecTableId==0, the packet does not participate in FEC.
         uint8_t FecTableId{0};
     };
+
+    // SCReAM feedback header (Type=0x03).
+    // AckVector follows this header with length ceil(AckVectorBits/8).
+#pragma pack(push, 1)
+    struct ScreamFeedbackHeader
+    {
+        uint8_t Type{kScreamFeedbackType};
+        uint16_t BaseSeq{0};
+        uint16_t AckVectorBits{0};
+        uint64_t RxTimestamp{0};
+    };
+#pragma pack(pop)
 
     enum class FecScheme : uint8_t
     {

@@ -17,6 +17,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "main_node.hpp"
 #include "utils/teleop_logger.hpp"
+#include "udp/scream_controller.hpp"
+#include "udp/scream_controller_ericsson.hpp"
 
 namespace trb
 {
@@ -164,6 +166,39 @@ namespace trb
             udp_stream_manager_->setStopAfterFramesEnabled(stop_after_frames_enabled);
 
             udp_stream_manager_->setHeaderLogMaxPackets(header_log_max_packets);
+        }
+
+        if (udp_stream_manager_)
+        {
+            const bool scream_enabled = this->declare_parameter<bool>("udp.scream.enabled", false);
+            const int64_t scream_fallback_bps = this->declare_parameter<int64_t>(
+                "udp.scream.fallback_pacing_bps",
+                pacing_bps > 0 ? pacing_bps : static_cast<int64_t>(0));
+            const int64_t scream_min_pacing_bps = this->declare_parameter<int64_t>("udp.scream.min_pacing_bps", 0);
+            const int64_t scream_max_pacing_bps = this->declare_parameter<int64_t>("udp.scream.max_pacing_bps", 0);
+            const int64_t scream_min_target_bps = this->declare_parameter<int64_t>("udp.scream.min_target_bitrate_bps", 0);
+            const int64_t scream_max_target_bps = this->declare_parameter<int64_t>("udp.scream.max_target_bitrate_bps", 0);
+
+            std::unique_ptr<trb::udp::IScreamController> scream;
+            if (scream_enabled)
+            {
+                scream = std::make_unique<trb::udp::ScreamControllerEricsson>();
+            }
+            else
+            {
+                scream = std::make_unique<trb::udp::ScreamControllerSimple>();
+            }
+            trb::udp::ScreamControllerConfig cfg;
+            cfg.enabled = scream_enabled;
+            cfg.fallback_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_fallback_bps));
+            cfg.min_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_min_pacing_bps));
+            cfg.max_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_pacing_bps));
+            cfg.min_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_min_target_bps));
+            cfg.max_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_target_bps));
+            scream->setConfig(cfg);
+
+            udp_stream_manager_->setScreamController(std::move(scream));
+            udp_stream_manager_->setScreamEnabled(scream_enabled);
         }
 
         if (udp_stream_manager_)
