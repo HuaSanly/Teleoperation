@@ -28,6 +28,9 @@ namespace trb::video
         using EncodedFrameCallback = std::function<void(const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)>;
         void setEncodedFrameCallback(EncodedFrameCallback callback);
 
+        // Update encoder target bitrate (bps). No-op if encoder is unavailable.
+        void setTargetBitrate(uint32_t bitrate_bps);
+
     private:
         class Impl;
         std::unique_ptr<Impl> impl_;

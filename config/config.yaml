@@ -50,7 +50,9 @@
     # - udp_header_once: UDP packet headers (up to udp.header_log.max_packets; 0 means unlimited)
     # - udp_handshake: UDP HELLO/ACK logs
     # - udp_frame_end: per-frame summary logs
-    logging.file.topics: ["udp_iframe"]
+    # - udp_scream_feedback: received SCReAM feedback headers (Type=0x03)
+    # - udp_scream_rate: SCReAM target/pacing rate logs
+    logging.file.topics: ["udp_scream_rate"]
 
     # ---------------- UDP header dump (debug) ----------------
     # Maximum number of UDP packet headers to write to file when udp_header_once is enabled.
@@ -75,11 +77,24 @@
     # Recommended: set bps slightly above encoder bitrate to cover
     # UDP header overhead and (optional) FEC redundancy.
     udp.pacing.enabled: true
-    udp.pacing.bps: 30000000
+    udp.pacing.bps: 62000000
     # Queue bounds cap worst-case latency when the network stalls.
     # Smaller = lower latency but more drops during stalls.
-    udp.pacing.queue_max_packets: 1024
-    udp.pacing.queue_max_bytes: 300000
+    udp.pacing.queue_max_packets: 2048
+    udp.pacing.queue_max_bytes: 600000
+
+    # ---------------- SCReAM congestion control ----------------
+    # Enables Ericsson SCReAM sender-side controller.
+    # Requires receiver-side feedback (Type=0x03) to be effective.
+    udp.scream.enabled: true
+    # Fallback pacing when SCReAM has not converged yet.
+    udp.scream.fallback_pacing_bps: 60000000
+    # Optional clamps for pacing rate.
+    udp.scream.min_pacing_bps: 5000000
+    udp.scream.max_pacing_bps: 80000000 
+    # Optional clamps for target media bitrate.
+    udp.scream.min_target_bitrate_bps: 5000000
+    udp.scream.max_target_bitrate_bps: 80000000
 
     # ---------------- FEC (low-latency) ----------------
     # V2 FEC is selected by table_id only.
@@ -120,7 +135,7 @@
     # video.converter.layout: "pitch"
 
     # Encoder (NV12 dmabuf -> H264)
-    video.encoder.bitrate: 40000000
+    video.encoder.bitrate: 60000000
     # Intra refresh ("I-frame smoothing") + low-frequency IDR:
     # - intra refresh: gradually refreshes the picture across P-frames
     # - low-frequency IDR: provides a clean join/recovery point every N seconds
@@ -135,9 +150,9 @@
     video.encoder.idr_interval_gops: 90
     video.encoder.force_idr_every_n: 0
     video.encoder.qp_range_i_min: 10
-    video.encoder.qp_range_i_max: 40
+    video.encoder.qp_range_i_max: 32
     video.encoder.qp_range_p_min: 10
-    video.encoder.qp_range_p_max: 40
+    video.encoder.qp_range_p_max: 32
     video.encoder.output_plane_buffers: 3
     video.encoder.capture_plane_buffers: 3
 
@@ -148,8 +163,8 @@
     video.encoder.max_perf_mode: false
     video.encoder.hw_preset: "ultrafast"          # ultrafast|fast|medium|slow|disable|default
     video.encoder.rate_control: "cbr"            # cbr|vbr|cq|default
-    video.encoder.peak_bitrate: 40000000         # optional; often = bitrate for CBR
-    video.encoder.virtual_buffer_size: 200000    # bytes; start with ~2-4 frames of VBV
+    video.encoder.peak_bitrate: 60000000         # optional; often = bitrate for CBR
+    video.encoder.virtual_buffer_size: 400000    # bytes; start with ~2-4 frames of VBV
     video.encoder.num_reference_frames: 1        # reduce DPB latency
     video.encoder.num_b_frames: 0                # key setting for low latency
     video.encoder.insert_sps_pps_at_idr: 1       # useful for streaming decoders

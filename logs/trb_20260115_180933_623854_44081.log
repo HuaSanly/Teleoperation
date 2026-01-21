@@ -1,2 +1,0 @@
-2026-01-15 18:09:33 [udp_iframe] frame_id=0 enc_bytes=39318 data_pkts=33 parity_pkts=8 total_pkts=41 fec.table=1 groups=2 r=4
-2026-01-15 18:09:42 [udp_iframe] frame_id=256 enc_bytes=33061 data_pkts=28 parity_pkts=7 total_pkts=35 fec.table=1 groups=1 r=7

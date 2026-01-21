@@ -81,6 +81,9 @@ namespace trb
             void setScreamController(std::unique_ptr<IScreamController> controller);
             void setScreamEnabled(bool enabled);
 
+            // Optional: receive SCReAM target bitrate updates (bps).
+            void setTargetBitrateCallback(std::function<void(uint64_t)> cb);
+
         private:
             struct QueueItem
             {
@@ -179,6 +182,11 @@ namespace trb
             std::mutex scream_mutex_;
             std::unique_ptr<IScreamController> scream_controller_;
             std::atomic<bool> scream_enabled_{false};
+
+            std::mutex target_bitrate_mutex_;
+            std::function<void(uint64_t)> target_bitrate_cb_;
+            uint64_t last_target_bps_{0};
+            std::chrono::steady_clock::time_point last_target_update_tp_{std::chrono::steady_clock::time_point::min()};
         };
 
     } // namespace udp

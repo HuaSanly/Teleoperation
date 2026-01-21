@@ -50,29 +50,32 @@ SCReAM 接入需要：
 [FeedbackHeader (固定 16 bytes)] + [AckVector 可变长度]
 ```
 
-### 3.2 反馈头定义
+### 3.2 反馈头定义（AckVector 位图）
 
 ```
 #pragma pack(push, 1)
 typedef struct {
   uint8_t  Type;              // 0x03
   uint16_t BaseSeq;           // ack_vector 基准序号（PacketSeqNum）
-  uint16_t AckVectorBits;     // AckVector 位数（bit 数，建议 32/64/128）
+  uint16_t AckVectorBits;     // AckVector 位数（bit 数，建议 128/256）
   uint64_t RxTimestamp;       // 反馈生成时间戳（NTP 64-bit）
 } FeedbackHeader;
 #pragma pack(pop)
 ```
 
+**字段说明**：
+- `BaseSeq` 为 AckVector 的基准序号，第 0 位对应 BaseSeq。
+- `AckVectorBits` 决定位图窗口大小（bit 数）。
+- `RxTimestamp` 使用接收端 `system_clock` 转 NTP64。
+
 **AckVector 定义**：
-- 紧随 `FeedbackHeader`，长度 = `AckVectorBits/8` 字节（向上取整）。
-- 第 0 位表示 `BaseSeq` 包是否收到；第 i 位表示 `(BaseSeq + i) mod 65536`。
-- 1=收到，0=未收到（或未到达）。
+- 紧随 `FeedbackHeader`，长度 = `ceil(AckVectorBits/8)` 字节。
+- 第 i 位表示 `(BaseSeq + i) mod 65536` 是否已收到（1=收到，0=未收到/丢失）。
 
 ### 3.3 建议参数
 
-- `AckVectorBits`：64（推荐），或 128（更抗抖动）
-- 反馈发送周期：10~20ms
-- `RxTimestamp` 使用接收端 `system_clock` 转 NTP64
+- 反馈发送周期：~100ms
+- `AckVectorBits`：推荐 256（窗口更大以覆盖 100ms 内的包）
 
 ---
 
@@ -86,9 +89,9 @@ typedef struct {
 
 ### 4.2 生成反馈包
 
-定时（10~20ms）：
-- 选择 `BaseSeq`（通常为“窗口最老的期望序号”）
-- 构建 `AckVector`（基于是否收到对应 `PacketSeqNum`）
+定时（~100ms）：
+- 选择 `BaseSeq`（窗口最老的期望序号）
+- 生成 `AckVector`（覆盖 `AckVectorBits`）
 - 填充 `RxTimestamp` 为当前 NTP 时间
 - 发送 `Type=0x03` 反馈包到机器人端 UDP 端口
 
@@ -107,7 +110,8 @@ typedef struct {
 
 收到 `Type=0x03`：
 - 解析 `BaseSeq`、`AckVectorBits`、`AckVector`、`RxTimestamp`
-- 更新 SCReAM sender 的 ACK/RTT/丢包估计
+- 将 AckVector 映射为已确认/丢失的包序列
+- 更新 SCReAM sender 的 RTT/丢包/队列估计
 - 计算下一阶段的 `target_rate_bps` 或 `next_send_time`
 
 ### 5.3 pacing
@@ -139,55 +143,27 @@ typedef struct {
 
 ---
 
-## 8. 机器人端改造点（文件级）
-
-- [src/udp/udp_stream_manager.cpp](src/udp/udp_stream_manager.cpp)
-  - `recvThreadMain()`：新增 Type=0x03 解析与回调
-  - `sendThreadMain()`：用 SCReAM pacing 替换固定速率
-  - 维护发送历史与 ACK 窗口
-
-- [include/udp/udp_packet.hpp](include/udp/udp_packet.hpp)
-  - 增加 FeedbackHeader 结构体与序列化
-
-- （可选）[include/video/video_encoder.hpp](include/video/video_encoder.hpp)
-  - 增加 `setBitrate(uint32_t bps)`
-
----
-
-## 9. 示例：反馈包序列化伪代码
+## 8. 示例：反馈包序列化伪代码
 
 ```
 FeedbackHeader h;
 h.Type = 0x03;
-h.Version = 0x01;
 h.BaseSeq = base_seq;
 h.AckVectorBits = bits;
-h.Reserved = 0;
 h.RxTimestamp = ntp_now();
 
-uint8_t payload[bits/8];
-fill_ack_vector(payload, bits);
+uint8_t ack[bits/8];
+fill_ack_vector(ack, bits);
 
 sendto(sock, &h, sizeof(h));
-sendto(sock, payload, bits/8);
+sendto(sock, ack, bits/8);
 ```
 
 ---
 
 ## 10. 注意事项
 
-- `PacketSeqNum` 为 16-bit 环绕，需要窗口逻辑处理（base/ack 计算应支持 wrap-around）。
-- 反馈包过大可能增加延迟，建议 64-bit 位图。
+- `PacketSeqNum` 为 16-bit 环绕，AckVector 需支持 wrap-around。
+- 反馈周期 100ms 时建议增大 `AckVectorBits`（如 256）。
 - 发送端 pacing 的精度建议保持在 1ms 级别。
 
----
-
-## 11. 后续工作建议
-
-1) 先实现 **FB 解析 + pacing 接入**（不调编码器码率）
-2) 再增加 **动态码率调节**
-3) 最后考虑 **FEC 自适应** 与 **日志指标**（RTT/丢包/速率）
-
----
-
-如需对接 SCReAM 的具体 C++ 实现或第三方库，请提供你们计划采用的 SCReAM 版本/接口，我会给出更贴合的代码映射与最小侵入改动方案。

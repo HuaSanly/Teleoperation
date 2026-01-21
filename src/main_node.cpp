@@ -17,7 +17,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "main_node.hpp"
 #include "utils/teleop_logger.hpp"
-#include "udp/scream_controller.hpp"
 #include "udp/scream_controller_ericsson.hpp"
 
 namespace trb
@@ -186,7 +185,7 @@ namespace trb
             }
             else
             {
-                scream = std::make_unique<trb::udp::ScreamControllerSimple>();
+                scream.reset();
             }
             trb::udp::ScreamControllerConfig cfg;
             cfg.enabled = scream_enabled;
@@ -195,10 +194,21 @@ namespace trb
             cfg.max_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_pacing_bps));
             cfg.min_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_min_target_bps));
             cfg.max_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_target_bps));
-            scream->setConfig(cfg);
-
-            udp_stream_manager_->setScreamController(std::move(scream));
+            if (scream)
+            {
+                scream->setConfig(cfg);
+                udp_stream_manager_->setScreamController(std::move(scream));
+            }
             udp_stream_manager_->setScreamEnabled(scream_enabled);
+
+            udp_stream_manager_->setTargetBitrateCallback(
+                [this](uint64_t bps)
+                {
+                    if (this->video_stream_manager_)
+                    {
+                        this->video_stream_manager_->setTargetBitrate(static_cast<uint32_t>(bps));
+                    }
+                });
         }
 
         if (udp_stream_manager_)

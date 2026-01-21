@@ -106,6 +106,9 @@ namespace trb::video
         // timestamp_us: Timestamp of the frame.
         bool encodeFrame(int dmabuf_fd, uint64_t timestamp_us);
 
+        // Update encoder bitrate at runtime (bps). Returns false on failure.
+        bool setBitrate(uint32_t bitrate_bps);
+
     private:
         static bool encoderCapturePlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg);
         static bool encoderOutputPlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg);
@@ -117,6 +120,8 @@ namespace trb::video
 
         std::mutex input_mutex_;
         std::queue<int> free_output_indices_;
+
+        std::mutex bitrate_mutex_;
 
         std::mutex map_mutex_;
         std::map<int, int> index_to_fd_;

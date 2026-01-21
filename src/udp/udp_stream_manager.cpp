@@ -1,5 +1,5 @@
 #include "udp/udp_stream_manager.hpp"
-#include "udp/scream_controller.hpp"
+#include "udp/scream_controller_ericsson.hpp"
 #include "udp/gf256.hpp"
 #include "utils/teleop_logger.hpp"
 #include <array>
@@ -834,6 +834,8 @@ namespace trb
                 int send_last_errno{0};
             } stats;
 
+            uint64_t last_scream_log_frame = 0;
+
             while (is_running_)
             {
                 QueueItem item;
@@ -876,6 +878,7 @@ namespace trb
 
                 const bool pacing_enabled = pacing_enabled_.load();
                 uint64_t pacing_bps = pacing_bps_.load();
+                uint64_t target_bps = 0;
 
                 if (scream_enabled_.load())
                 {
@@ -887,6 +890,44 @@ namespace trb
                         {
                             pacing_bps = scream_bps;
                         }
+                        target_bps = scream_controller_->targetBitrateBps();
+                    }
+                }
+
+                if (scream_enabled_.load() && target_bps > 0)
+                {
+                    const uint64_t frame_id = item.frame_id;
+                    if (frame_id >= last_scream_log_frame + 30)
+                    {
+                        last_scream_log_frame = frame_id;
+                        RCLCPP_INFO(
+                            udp_logger(),
+                            "SCReAM rate: target=%" PRIu64 " bps, pacing=%" PRIu64 " bps",
+                            target_bps,
+                            pacing_bps);
+                        trb::utils::TeleopLogger::instance().udpScreamRate(target_bps, pacing_bps);
+                    }
+                }
+                if (target_bps > 0)
+                {
+                    const auto now = clock::now();
+                    const auto elapsed = now - last_target_update_tp_;
+                    const bool rate_changed = (last_target_bps_ == 0) ||
+                                              (target_bps > last_target_bps_ * 105 / 100) ||
+                                              (target_bps < last_target_bps_ * 95 / 100);
+                    if (rate_changed || elapsed > std::chrono::milliseconds(200))
+                    {
+                        std::function<void(uint64_t)> cb;
+                        {
+                            std::lock_guard<std::mutex> lk(target_bitrate_mutex_);
+                            cb = target_bitrate_cb_;
+                        }
+                        if (cb)
+                        {
+                            cb(target_bps);
+                        }
+                        last_target_bps_ = target_bps;
+                        last_target_update_tp_ = now;
                     }
                 }
                 const double rate_bytes_per_sec = (pacing_enabled && pacing_bps > 0)
@@ -1107,6 +1148,11 @@ namespace trb
                         {
                             if (static_cast<size_t>(len) < sizeof(ScreamFeedbackHeader))
                             {
+                                RCLCPP_WARN(
+                                    udp_logger(),
+                                    "SCReAM feedback too short: len=%d header=%zu",
+                                    len,
+                                    sizeof(ScreamFeedbackHeader));
                                 continue;
                             }
 
@@ -1115,6 +1161,12 @@ namespace trb
                             const size_t bytes = static_cast<size_t>((bits + 7u) / 8u);
                             if (sizeof(ScreamFeedbackHeader) + bytes > static_cast<size_t>(len))
                             {
+                                RCLCPP_WARN(
+                                    udp_logger(),
+                                    "SCReAM feedback invalid: ack_bits=%u bytes=%zu len=%d",
+                                    static_cast<unsigned>(bits),
+                                    bytes,
+                                    len);
                                 continue;
                             }
 
@@ -1123,6 +1175,10 @@ namespace trb
                                 std::lock_guard<std::mutex> lk(scream_mutex_);
                                 if (scream_controller_)
                                 {
+                                    trb::utils::TeleopLogger::instance().udpScreamFeedbackHeader(
+                                        hdr->BaseSeq,
+                                        hdr->AckVectorBits,
+                                        hdr->RxTimestamp);
                                     ScreamFeedback fb;
                                     fb.base_seq = hdr->BaseSeq;
                                     fb.ack_vector_bits = bits;
@@ -1152,6 +1208,12 @@ namespace trb
         void UdpStreamManager::setScreamEnabled(bool enabled)
         {
             scream_enabled_.store(enabled, std::memory_order_relaxed);
+        }
+
+        void UdpStreamManager::setTargetBitrateCallback(std::function<void(uint64_t)> cb)
+        {
+            std::lock_guard<std::mutex> lk(target_bitrate_mutex_);
+            target_bitrate_cb_ = std::move(cb);
         }
 
         void UdpStreamManager::signalingThreadMain()

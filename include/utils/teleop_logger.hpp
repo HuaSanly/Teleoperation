@@ -22,6 +22,8 @@ namespace trb::utils
             UdpHandshake = 1u << 2,
             UdpFrameEnd = 1u << 3,
             H264SpsPps = 1u << 4,
+            UdpScreamFeedback = 1u << 5,
+            UdpScreamRate = 1u << 6,
         };
 
         static TeleopLogger &instance();
@@ -61,6 +63,13 @@ namespace trb::utils
                          uint32_t parity_pkts,
                          double payload_overhead_pct,
                          uint64_t fec_compute_us);
+
+        void udpScreamFeedbackHeader(uint16_t base_seq,
+                         uint16_t ack_vector_bits,
+                         uint64_t rx_timestamp_ntp);
+
+        void udpScreamRate(uint64_t target_bps,
+                   uint64_t pacing_bps);
 
         // H264 bitstream diagnostics: log every SPS/PPS NAL unit to the optional file sink.
         // nal_unit_type: 7 (SPS) or 8 (PPS)

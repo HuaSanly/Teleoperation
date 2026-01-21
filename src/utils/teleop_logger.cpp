@@ -23,6 +23,8 @@ namespace trb::utils
         constexpr const char *kTopicUdpHandshake = "udp_handshake";
         constexpr const char *kTopicUdpFrameEnd = "udp_frame_end";
         constexpr const char *kTopicH264SpsPps = "h264_sps_pps";
+            constexpr const char *kTopicUdpScreamFeedback = "udp_scream_feedback";
+        constexpr const char *kTopicUdpScreamRate = "udp_scream_rate";
 
         static std::string base64Encode(const uint8_t *data, size_t size)
         {
@@ -175,6 +177,14 @@ namespace trb::utils
             {
                 return static_cast<uint32_t>(TeleopLogger::FileTopic::H264SpsPps);
             }
+            if (t == kTopicUdpScreamFeedback)
+            {
+                return static_cast<uint32_t>(TeleopLogger::FileTopic::UdpScreamFeedback);
+            }
+            if (t == kTopicUdpScreamRate)
+            {
+                return static_cast<uint32_t>(TeleopLogger::FileTopic::UdpScreamRate);
+            }
             return 0;
         }
 
@@ -232,13 +242,15 @@ namespace trb::utils
             const uint32_t bit = topicBit(t);
             if (bit == 0)
             {
-                RCLCPP_WARN(logger, "Unknown logging.file.topics entry: %s (supported: %s,%s,%s,%s,%s)",
+                RCLCPP_WARN(logger, "Unknown logging.file.topics entry: %s (supported: %s,%s,%s,%s,%s,%s,%s)",
                             t.c_str(),
                             kTopicUdpIFrame,
                             kTopicUdpHeaderOnce,
                             kTopicUdpHandshake,
                             kTopicUdpFrameEnd,
-                            kTopicH264SpsPps);
+                            kTopicH264SpsPps,
+                            kTopicUdpScreamFeedback,
+                            kTopicUdpScreamRate);
                 continue;
             }
             mask |= bit;
@@ -464,6 +476,40 @@ namespace trb::utils
             << " overhead_pct=" << std::fixed << std::setprecision(2) << payload_overhead_pct
             << " fec_us=" << fec_compute_us;
         writeLineLocked(oss.str());
+    }
+
+    void TeleopLogger::udpScreamFeedbackHeader(uint16_t base_seq,
+                                               uint16_t ack_vector_bits,
+                                               uint64_t rx_timestamp_ntp)
+    {
+        if (!shouldWrite(FileTopic::UdpScreamFeedback))
+        {
+            return;
+        }
+
+        std::ostringstream line;
+        line << nowString() << " "
+             << "udp_scream_feedback"
+             << " base_seq=" << base_seq
+             << " ack_bits=" << ack_vector_bits
+             << " rx_ntp=" << rx_timestamp_ntp;
+        writeLineLocked(line.str());
+    }
+
+    void TeleopLogger::udpScreamRate(uint64_t target_bps,
+                                     uint64_t pacing_bps)
+    {
+        if (!shouldWrite(FileTopic::UdpScreamRate))
+        {
+            return;
+        }
+
+        std::ostringstream line;
+        line << nowString() << " "
+             << "udp_scream_rate"
+             << " target_bps=" << target_bps
+             << " pacing_bps=" << pacing_bps;
+        writeLineLocked(line.str());
     }
 
 } // namespace trb::utils

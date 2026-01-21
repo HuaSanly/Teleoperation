@@ -852,6 +852,22 @@ namespace trb::video
         return true;
     }
 
+    bool VideoEncoder::setBitrate(uint32_t bitrate_bps)
+    {
+        if (!encoder_ || bitrate_bps == 0)
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lk(bitrate_mutex_);
+        if (encoder_->setBitrate(bitrate_bps) < 0)
+        {
+            return false;
+        }
+        config_.bitrate = bitrate_bps;
+        return true;
+    }
+
     bool VideoEncoder::encoderOutputPlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg)
     {
         (void)buffer;

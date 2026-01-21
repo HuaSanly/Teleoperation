@@ -5,10 +5,40 @@
 #include <memory>
 #include <vector>
 
-#include "udp/scream_controller.hpp"
-
 namespace trb::udp
 {
+
+    struct ScreamFeedback
+    {
+        uint16_t base_seq{0};
+        uint16_t ack_vector_bits{0};
+        std::vector<uint8_t> ack_vector;
+        uint64_t rx_timestamp_ntp{0};
+    };
+
+    struct ScreamControllerConfig
+    {
+        bool enabled{false};
+        uint64_t fallback_pacing_bps{0};
+        uint64_t min_pacing_bps{0};
+        uint64_t max_pacing_bps{0};
+        uint64_t min_target_bitrate_bps{0};
+        uint64_t max_target_bitrate_bps{0};
+    };
+
+    class IScreamController
+    {
+    public:
+        virtual ~IScreamController() = default;
+
+        virtual void setConfig(const ScreamControllerConfig &config) = 0;
+        virtual void onFrameEncoded(size_t bytes, uint64_t capture_timestamp_us) = 0;
+        virtual void onPacketSent(uint16_t seq, size_t bytes, uint64_t send_time_us) = 0;
+        virtual void onFeedback(const ScreamFeedback &fb) = 0;
+
+        virtual uint64_t pacingRateBps() const = 0;
+        virtual uint64_t targetBitrateBps() const = 0;
+    };
 
     class ScreamControllerEricsson : public IScreamController
     {

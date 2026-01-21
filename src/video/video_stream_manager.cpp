@@ -47,6 +47,39 @@ namespace trb::video
             encoded_frame_callback_ = callback;
         }
 
+        void setTargetBitrate(uint32_t bitrate_bps)
+        {
+            if (bitrate_bps == 0)
+            {
+                return;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(bitrate_mutex_);
+                const auto elapsed = now - last_bitrate_update_;
+                if (last_bitrate_bps_ == bitrate_bps && elapsed < std::chrono::milliseconds(200))
+                {
+                    return;
+                }
+                if (elapsed < std::chrono::milliseconds(100))
+                {
+                    return;
+                }
+                last_bitrate_update_ = now;
+                last_bitrate_bps_ = bitrate_bps;
+            }
+
+            if (encoder_)
+            {
+                const bool ok = encoder_->setBitrate(bitrate_bps);
+                if (!ok)
+                {
+                    RCLCPP_WARN(logger_, "VideoEncoder setBitrate failed: %u bps", bitrate_bps);
+                }
+            }
+        }
+
         bool start()
         {
             if (running_.load())
@@ -568,6 +601,10 @@ namespace trb::video
 
         std::mutex callback_mutex_;
         EncodedFrameCallback encoded_frame_callback_;
+
+        std::mutex bitrate_mutex_;
+        uint32_t last_bitrate_bps_{0};
+        std::chrono::steady_clock::time_point last_bitrate_update_{std::chrono::steady_clock::time_point::min()};
     };
 
     VideoStreamManager::VideoStreamManager(rclcpp::Node &node)
@@ -595,6 +632,11 @@ namespace trb::video
     void VideoStreamManager::setEncodedFrameCallback(EncodedFrameCallback callback)
     {
         impl_->setEncodedFrameCallback(callback);
+    }
+
+    void VideoStreamManager::setTargetBitrate(uint32_t bitrate_bps)
+    {
+        impl_->setTargetBitrate(bitrate_bps);
     }
 
 } // namespace trb::video

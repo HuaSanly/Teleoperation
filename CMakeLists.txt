@@ -246,7 +246,6 @@ add_executable(${PROJECT_NAME}
   src/udp/udp_packet.cpp
   src/udp/gf256.cpp
   src/udp/pose_udp_receiver.cpp
-  src/udp/scream_controller.cpp
   src/udp/scream_controller_ericsson.cpp
   src/udp/udp_stream_manager.cpp
 )
