@@ -50,6 +50,17 @@ namespace trb
         // members
         // grpc
         bool subscribe_vr_pose_flag_ = false;
+        bool pair_auto_accept_ = true;
+        bool pair_auto_request_ = true;
+        bool pair_list_unpaired_on_start_ = false;
+        std::string desired_peer_session_id_;
+        std::string paired_peer_session_id_;
+        std::string pair_mode_ = "passive"; // active | passive
+
+        std::mutex pair_mutex_;
+        std::condition_variable pair_cv_;
+        bool paired_ready_ = false;
+        std::atomic<bool> shutting_down_{false};
 
         std::shared_ptr<SignalingClient> signaling_client_;
         std::unique_ptr<trb::video::VideoStreamManager> video_stream_manager_;
@@ -57,6 +68,11 @@ namespace trb
         std::unique_ptr<trb::udp::PoseUdpReceiver> pose_udp_receiver_;
 
         rclcpp::TimerBase::SharedPtr heartbeat_timer_;
+
+        // helpers
+        bool selfCheckCamera();
+        bool runActivePairing();
+        bool waitForPairing();
     };
 } // namespace trb
 #endif // MAIN_NODE_H

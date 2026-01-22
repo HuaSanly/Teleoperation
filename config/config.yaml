@@ -7,6 +7,16 @@
     token: "secure"
     subscribe_vr_pose_flag: false
 
+    # Pairing control
+    # pair.mode: active | passive
+    pair.mode: "passive"
+    # If active: list unpaired and choose by index
+    pair.auto_request: true
+    # If passive: auto accept requests
+    pair.auto_accept: true
+    # Optional fixed peer session id
+    pair.peer_session_id: ""
+
     udp_ip: "162.14.226.58"
     udp_port: 7778
 

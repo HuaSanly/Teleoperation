@@ -18,18 +18,52 @@
 #include "main_node.hpp"
 #include "utils/teleop_logger.hpp"
 #include "udp/scream_controller_ericsson.hpp"
+#include "video/video_v4l2_capturer.hpp"
+
+#include <linux/videodev2.h>
 
 namespace trb
 {
 
     MainNode::MainNode() : Node("main_node")
     {
+        if (!selfCheckCamera())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Camera self-check failed. Skip gRPC registration and streaming startup.");
+            return;
+        }
+
         this->initGrpc();
-        this->signaling_client_->connect();
-        this->signaling_client_->registerRobot();
-        this->initVideo();
+        if (this->signaling_client_->connect() != 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to connect gRPC signaling server");
+            return;
+        }
+        if (this->signaling_client_->registerRobot() != 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to register to gRPC signaling server");
+            return;
+        }
+
+        bool paired_ok = false;
+        if (pair_mode_ == "active")
+        {
+            paired_ok = runActivePairing();
+        }
+        else
+        {
+            paired_ok = waitForPairing();
+        }
+
+        if (!paired_ok)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Pairing not completed. Skip UDP/video startup.");
+            return;
+        }
+
         this->initUdp();
         this->initPoseUdp();
+        this->initVideo();
 
         if (this->udp_stream_manager_ && this->signaling_client_)
         {
@@ -274,6 +308,23 @@ namespace trb
         bool use_ssl = this->declare_parameter<bool>("use_ssl", false);
         std::string device_id = this->declare_parameter<std::string>("device_id", "robot_001");
         std::string token = this->declare_parameter<std::string>("token", "default_token");
+        subscribe_vr_pose_flag_ = this->declare_parameter<bool>("subscribe_vr_pose_flag", false);
+
+        // Pairing parameters
+        pair_mode_ = this->declare_parameter<std::string>("pair.mode", "passive");
+        {
+            std::transform(pair_mode_.begin(), pair_mode_.end(), pair_mode_.begin(), [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+            if (pair_mode_ != "active" && pair_mode_ != "passive")
+            {
+                RCLCPP_WARN(this->get_logger(), "Invalid pair.mode='%s', falling back to 'passive'", pair_mode_.c_str());
+                pair_mode_ = "passive";
+            }
+        }
+        desired_peer_session_id_ = this->declare_parameter<std::string>("pair.peer_session_id", "");
+        pair_auto_accept_ = this->declare_parameter<bool>("pair.auto_accept", true);
+        pair_auto_request_ = this->declare_parameter<bool>("pair.auto_request", true);
+        pair_list_unpaired_on_start_ = this->declare_parameter<bool>("pair.list_unpaired_on_start", false);
 
         RCLCPP_INFO(this->get_logger(), "Initializing SignalingClient with IP: %s, Port: %d, SSL: %s, DeviceID: %s",
                     server_ip.c_str(), server_port, use_ssl ? "true" : "false", device_id.c_str());
@@ -296,6 +347,182 @@ namespace trb
         signaling_client_->startEventStream(std::bind(&MainNode::onSignalingEvent, this, std::placeholders::_1));
     }
 
+    bool MainNode::selfCheckCamera()
+    {
+        // Unified profile: [width, height, framerate]
+        std::vector<int64_t> profile = {3840, 1520, 30};
+        this->get_parameter_or("video.profile", profile, profile);
+        uint32_t width = 3840;
+        uint32_t height = 1520;
+        uint32_t framerate = 30;
+        if (profile.size() == 3 && profile[0] > 0 && profile[1] > 0 && profile[2] > 0)
+        {
+            width = static_cast<uint32_t>(profile[0]);
+            height = static_cast<uint32_t>(profile[1]);
+            framerate = static_cast<uint32_t>(profile[2]);
+        }
+
+        std::string video_device = "/dev/video0";
+        std::string pixel_format_str = "mjpeg";
+        int64_t v4l2_buffer_count_param = 8;
+        this->get_parameter_or("video.device", video_device, video_device);
+        this->get_parameter_or("video.pixel_format", pixel_format_str, pixel_format_str);
+        this->get_parameter_or("video.v4l2.buffer_count", v4l2_buffer_count_param, v4l2_buffer_count_param);
+        const uint32_t v4l2_buffer_count = (v4l2_buffer_count_param > 0) ? static_cast<uint32_t>(v4l2_buffer_count_param) : 8;
+
+        trb::video::VideoV4L2Capturer::Config cap_cfg;
+        cap_cfg.width = width;
+        cap_cfg.height = height;
+        cap_cfg.framerate = framerate;
+        cap_cfg.device_path = video_device;
+        cap_cfg.buffer_count = v4l2_buffer_count;
+
+        std::string fmt = pixel_format_str;
+        std::transform(fmt.begin(), fmt.end(), fmt.begin(), [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        if (fmt == "mjpeg" || fmt == "mjpg")
+        {
+            cap_cfg.pixel_format = V4L2_PIX_FMT_MJPEG;
+        }
+        else if (fmt == "yuyv" || fmt == "yuy2")
+        {
+            cap_cfg.pixel_format = V4L2_PIX_FMT_YUYV;
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "Unknown video.pixel_format='%s', falling back to mjpeg", pixel_format_str.c_str());
+            cap_cfg.pixel_format = V4L2_PIX_FMT_MJPEG;
+        }
+
+        trb::video::VideoV4L2Capturer capturer;
+        if (!capturer.initialize(cap_cfg))
+        {
+            RCLCPP_ERROR(this->get_logger(), "Camera self-check: failed to initialize V4L2 capturer (%s)", video_device.c_str());
+            return false;
+        }
+
+        if (!capturer.start())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Camera self-check: failed to start V4L2 capturer (%s)", video_device.c_str());
+            return false;
+        }
+
+        bool got_frame = false;
+        for (int i = 0; i < 3; ++i)
+        {
+            trb::video::VideoV4L2Capturer::Frame frame;
+            if (capturer.dequeue(frame, 500))
+            {
+                capturer.requeue(frame.v4l2_buf);
+                got_frame = true;
+                break;
+            }
+        }
+
+        capturer.stop();
+
+        if (!got_frame)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Camera self-check: no frame received from %s", video_device.c_str());
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "Camera self-check passed (%s)", video_device.c_str());
+        }
+
+        return got_frame;
+    }
+
+    bool MainNode::runActivePairing()
+    {
+        if (!signaling_client_)
+        {
+            return false;
+        }
+
+        if (!pair_auto_request_)
+        {
+            RCLCPP_WARN(this->get_logger(), "pair.auto_request is false; switching to passive wait");
+            return waitForPairing();
+        }
+
+        while (rclcpp::ok())
+        {
+            auto list = signaling_client_->listUnpaired(signaling::RegisterRequest::VR);
+
+            if (list.empty())
+            {
+                RCLCPP_WARN(this->get_logger(), "No unpaired VR endpoints found. Retrying in 2s...");
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
+
+            std::cout << "\nUnpaired VR endpoints:" << std::endl;
+            for (size_t i = 0; i < list.size(); ++i)
+            {
+                std::cout << "  [" << (i + 1) << "] session=" << list[i].session_id()
+                          << " device=" << list[i].device_id() << std::endl;
+            }
+            std::cout << "Select index (1-" << list.size() << ", 0 to refresh): " << std::flush;
+
+            std::string line;
+            if (!std::getline(std::cin, line))
+            {
+                RCLCPP_ERROR(this->get_logger(), "Failed to read selection from stdin");
+                return false;
+            }
+
+            int choice = 0;
+            try
+            {
+                choice = std::stoi(line);
+            }
+            catch (...)
+            {
+                RCLCPP_WARN(this->get_logger(), "Invalid input. Please enter a number.");
+                continue;
+            }
+
+            if (choice == 0)
+            {
+                continue;
+            }
+
+            if (choice < 1 || static_cast<size_t>(choice) > list.size())
+            {
+                RCLCPP_WARN(this->get_logger(), "Invalid selection index: %d", choice);
+                continue;
+            }
+
+            const auto &peer_session_id = list[static_cast<size_t>(choice - 1)].session_id();
+            RCLCPP_INFO(this->get_logger(), "Requesting pair with %s", peer_session_id.c_str());
+            signaling_client_->requestPair(peer_session_id);
+
+            std::unique_lock<std::mutex> lk(pair_mutex_);
+            const bool ok = pair_cv_.wait_for(lk, std::chrono::seconds(20), [this]()
+                                              { return paired_ready_; });
+            if (ok)
+            {
+                return true;
+            }
+
+            RCLCPP_WARN(this->get_logger(), "Pairing timeout. Please select again.");
+        }
+
+        return false;
+    }
+
+    bool MainNode::waitForPairing()
+    {
+        RCLCPP_INFO(this->get_logger(), "Waiting for pairing (passive mode)...");
+        std::unique_lock<std::mutex> lk(pair_mutex_);
+        while (!paired_ready_ && rclcpp::ok() && !shutting_down_.load())
+        {
+            pair_cv_.wait_for(lk, std::chrono::milliseconds(200));
+        }
+        return paired_ready_ && !shutting_down_.load();
+    }
+
     void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
     {
         RCLCPP_INFO(this->get_logger(), "Received EventMessage from %s", msg.sender_session_id().c_str());
@@ -306,19 +533,84 @@ namespace trb
             switch (pair_event.op())
             {
             case signaling::PairEvent::REQUEST:
-                RCLCPP_INFO(this->get_logger(), "Pair Request from %s. Auto-accepting...", pair_event.peer_session_id().c_str());
-                // Auto accept for now
-                signaling_client_->acceptPair(pair_event.peer_session_id());
+            {
+                const auto &peer = pair_event.peer_session_id();
+                const bool peer_matches = desired_peer_session_id_.empty() || (peer == desired_peer_session_id_);
+                if (pair_auto_accept_ && peer_matches)
+                {
+                    RCLCPP_INFO(this->get_logger(), "Pair Request from %s. Auto-accepting...", peer.c_str());
+                    signaling_client_->acceptPair(peer);
+                    paired_peer_session_id_ = peer;
+
+                    {
+                        std::lock_guard<std::mutex> lk(pair_mutex_);
+                        paired_ready_ = true;
+                    }
+                    pair_cv_.notify_all();
+
+                    if (subscribe_vr_pose_flag_)
+                    {
+                        signaling_client_->subscribeVrPose(peer);
+                    }
+                }
+                else
+                {
+                    RCLCPP_WARN(this->get_logger(), "Pair Request from %s rejected (auto_accept=%s, desired_peer=%s)",
+                                peer.c_str(), pair_auto_accept_ ? "true" : "false", desired_peer_session_id_.c_str());
+                    signaling_client_->rejectPair(peer);
+                }
                 break;
+            }
             case signaling::PairEvent::ACCEPT:
-                RCLCPP_INFO(this->get_logger(), "Pair Accepted by %s", pair_event.peer_session_id().c_str());
+            {
+                const auto &peer = pair_event.peer_session_id();
+                RCLCPP_INFO(this->get_logger(), "Pair Accepted by %s", peer.c_str());
+                paired_peer_session_id_ = peer;
+                {
+                    std::lock_guard<std::mutex> lk(pair_mutex_);
+                    paired_ready_ = true;
+                }
+                pair_cv_.notify_all();
+                if (subscribe_vr_pose_flag_)
+                {
+                    signaling_client_->subscribeVrPose(peer);
+                }
                 break;
+            }
             case signaling::PairEvent::REJECT:
-                RCLCPP_WARN(this->get_logger(), "Pair Rejected by %s", pair_event.peer_session_id().c_str());
+            {
+                const auto &peer = pair_event.peer_session_id();
+                RCLCPP_WARN(this->get_logger(), "Pair Rejected by %s", peer.c_str());
+                if (paired_peer_session_id_ == peer)
+                {
+                    paired_peer_session_id_.clear();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(pair_mutex_);
+                    paired_ready_ = false;
+                }
+                pair_cv_.notify_all();
                 break;
+            }
             case signaling::PairEvent::UNPAIR:
-                RCLCPP_INFO(this->get_logger(), "Unpaired by %s", pair_event.peer_session_id().c_str());
+            {
+                const auto &peer = pair_event.peer_session_id();
+                RCLCPP_INFO(this->get_logger(), "Unpaired by %s", peer.c_str());
+                if (paired_peer_session_id_ == peer)
+                {
+                    paired_peer_session_id_.clear();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(pair_mutex_);
+                    paired_ready_ = false;
+                }
+                pair_cv_.notify_all();
+                if (subscribe_vr_pose_flag_)
+                {
+                    signaling_client_->unsubscribe(peer);
+                }
                 break;
+            }
             default:
                 break;
             }
@@ -351,6 +643,13 @@ namespace trb
     MainNode::~MainNode()
     {
         RCLCPP_INFO(this->get_logger(), "Shutting down MainNode...");
+
+        {
+            std::lock_guard<std::mutex> lk(pair_mutex_);
+            shutting_down_.store(true);
+            paired_ready_ = false;
+        }
+        pair_cv_.notify_all();
 
         // 1. Cancel timers
         if (heartbeat_timer_)
