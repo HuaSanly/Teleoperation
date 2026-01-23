@@ -2,8 +2,11 @@
 
 #include <ros/ros.h>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "signaling_client.hpp"
@@ -30,10 +33,7 @@ struct Config
     // UDP
     std::string udp_ip;
     int udp_port = 0;
-    std::string udp_bind_ip;
-    int udp_bind_port = 0;
     int udp_recv_timeout_ms = 0;
-    std::string udp_allowed_remote_ip;
     bool udp_pacing_enabled = true;
     int udp_pacing_bps = 30000000;
     int udp_pacing_queue_max_packets = 1024;
@@ -48,9 +48,6 @@ struct Config
 
     // Pose UDP
     bool pose_udp_enabled = false;
-    std::string pose_udp_bind_ip;
-    int pose_udp_bind_port = 0;
-    std::string pose_udp_allowed_remote_ip;
     int pose_udp_recv_timeout_ms = 0;
     int pose_udp_qos_depth = 0;
     std::string pose_udp_frame_id_hmd;
@@ -112,6 +109,7 @@ private:
     {
         kConnecting,
         kRegistered,
+        kPairing,
         kRunning
     };
 
@@ -119,8 +117,9 @@ private:
     void initGrpc();
     void initUdp();
     void tryRegister();
+    void enterPairingState();
     void enterRunningState();
-    void tryEnterRunning();
+    void tryEnterPairing();
     void setState(State next, const std::string &reason);
     static const char *stateToString(State s);
     void onSignalingEvent(const signaling::EventMessage &msg);
@@ -137,9 +136,15 @@ private:
     ros::Timer register_retry_timer_;
     ros::Timer udp_ready_timer_;
     bool grpc_registered_ = false;
-    State state_ = State::kConnecting;
+    std::atomic<State> state_{State::kConnecting};
 
     bool udp_control_ready_ = false;
+
+    std::atomic<bool> paired_{false};
+    std::atomic<bool> pairing_running_{false};
+    std::thread pairing_thread_;
+    std::mutex paired_mutex_;
+    std::string paired_peer_session_id_;
 
     std::unique_ptr<udp::UdpManager> udp_manager_;
     std::unique_ptr<udp::PoseUdpReceiver> pose_udp_receiver_;

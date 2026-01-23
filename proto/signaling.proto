@@ -4,12 +4,14 @@ option csharp_namespace = "GrpcHttp3Demo.Protos";
 
 package signaling;
 
+import "google/protobuf/empty.proto";
+
 // --- 1. HELLO (注册) ---
 message RegisterRequest {
   string token = 1;
   EndpointType role = 2;
   string device_id = 3; // 展示用，允许重复
-
+  
   enum EndpointType {
     UNKNOWN = 0;
     ROBOT = 1;
@@ -57,6 +59,7 @@ message EventMessage {
   oneof payload {
     PairEvent pair = 10;
     SystemCommand system = 11; // [新增] 系统指令
+    VideoConfig video_config = 12; // [新增] 视频参数同步（转发给配对端/订阅者）
   }
 }
 
@@ -94,14 +97,14 @@ message HeartbeatAck {
 // --- 3. PAR1 (配对 - 三方握手) ---
 message PairRequest {
   Operation op = 1;
-  string peer_session_id = 2;
+  string peer_session_id = 2; 
   PairState state = 3; // [新增] 对应 Flags
-
+  
   enum Operation {
     PAIR = 0;
     UNPAIR = 1;
   }
-
+  
   enum PairState {
     REQUEST = 0;  // Flags 0x00: 发起请求 / 通知机器人
     PENDING = 1;  // Flags 0x01: 服务器收到，处理中
@@ -119,12 +122,12 @@ message PairResponse {
 message SubscribeRequest {
   Operation op = 1;
   string publisher_session_id = 2; // 订阅谁（SessionId）
-
+  
   // 资源掩码 (对应 ResourceMask)
   bool sub_video = 3;      // 0x02
   bool sub_pose = 4;       // 0x01
   bool sub_audio = 5;      // 扩展
-
+  
   enum Operation {
     SUBSCRIBE = 0;
     UNSUBSCRIBE = 1;
@@ -142,28 +145,40 @@ message VideoConfig {
   int32 width = 2;
   int32 height = 3;
   int32 fps = 4;
-
+  
   bytes sps = 5; // H.264 SPS (不含起始码)
   bytes pps = 6; // H.264 PPS
   bytes vps = 7; // H.265 VPS
 
+  // 服务端转发用的相关ID：用于接收端回 ACK，以及服务端做超时重发。
+  // 客户端可留空；服务端会在转发时补齐。
+  string config_id = 8;
+  
   enum CodecType {
     H264 = 0;
     H265 = 1;
   }
 }
 
+message VideoConfigAck {
+  bool success = 1;
+  string message = 2;
+
+  // 对应 VideoConfig.config_id
+  string config_id = 3;
+}
+
 // --- 6. START/STOP (控制 - 带资源类型) ---
 message ControlCommand {
   CommandType type = 1;
   ResourceType resource = 2; // [新增] 控制哪个资源 (Video/Pose)
-
+  
   enum CommandType {
     STOP = 0;
     START = 1;
     FORCE_KEYFRAME = 2;
   }
-
+  
   enum ResourceType {
     ALL = 0;
     VIDEO = 1; // 对应 Category=1
@@ -179,6 +194,14 @@ service Signaling {
   rpc Subscribe (SubscribeRequest) returns (SubscribeResponse);
   rpc ListUnpaired (ListUnpairedRequest) returns (ListUnpairedResponse);
   rpc Ping (Heartbeat) returns (HeartbeatAck);
+
+  // 客户端上报视频参数（SPS/PPS/FPS 等）；服务端转发给配对端与订阅了该发布者的端。
+  // sender sessionId 从 metadata/header 的 session-id 解析。
+  rpc PublishVideoConfig (VideoConfig) returns (VideoConfigAck);
+
+  // 接收端对 EventMessage.video_config 回 ACK。
+  // sender sessionId 从 metadata/header 的 session-id 解析。
+  rpc AckVideoConfig (VideoConfigAck) returns (google.protobuf.Empty);
 
   // 事件推送流（机器人端推荐用这个，而不是 WS）：
   // 客户端发一个订阅请求以绑定 session，服务器通过 server-streaming 推送 EventMessage。

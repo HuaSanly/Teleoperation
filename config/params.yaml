@@ -4,7 +4,7 @@
 server_ip: "grpc-pro.eifuture.com"
 server_port: 7777
 use_ssl: true
-device_id: "007"
+device_id: "00898"
 token: "secure"
 
 grpc:
@@ -15,10 +15,7 @@ udp_ip: "162.14.226.58"
 udp_port: 7778
 
 udp:
-  bind_ip: "0.0.0.0"
-  bind_port: 0
   recv_timeout_ms: 100
-  allowed_remote_ip: ""
   max_payload_bytes: 1200
   pacing:
     enabled: true
@@ -36,9 +33,6 @@ udp:
 
 pose_udp:
   enabled: true
-  bind_ip: "0.0.0.0"
-  bind_port: 7780
-  allowed_remote_ip: ""
   recv_timeout_ms: 100
   qos:
     depth: 10

@@ -1,6 +1,7 @@
 #include "main_node.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 namespace trb
 {
@@ -63,20 +64,11 @@ void MainNode::initUdp()
     cfg.control_timeout_sec = config_.udp_handshake_timeout_sec;
     cfg.max_payload_bytes = static_cast<size_t>(std::max(200, config_.udp_max_payload_bytes));
 
-    if (config_.pose_udp_enabled)
-    {
-        cfg.bind_ip = config_.pose_udp_bind_ip;
-        cfg.bind_port = config_.pose_udp_bind_port;
-        cfg.allowed_remote_ip = config_.pose_udp_allowed_remote_ip;
-        cfg.recv_timeout_ms = config_.pose_udp_recv_timeout_ms;
-    }
-    else
-    {
-        cfg.bind_ip = config_.udp_bind_ip;
-        cfg.bind_port = config_.udp_bind_port;
-        cfg.allowed_remote_ip = config_.udp_allowed_remote_ip;
-        cfg.recv_timeout_ms = config_.udp_recv_timeout_ms;
-    }
+    cfg.bind_ip = "0.0.0.0";
+    cfg.bind_port = 0;
+    cfg.allowed_remote_ip.clear();
+    cfg.recv_timeout_ms = config_.pose_udp_enabled ? config_.pose_udp_recv_timeout_ms
+                                                  : config_.udp_recv_timeout_ms;
 
     udp_manager_ = std::make_unique<udp::UdpManager>(cfg);
     if (!udp_manager_->start())
@@ -104,7 +96,6 @@ void MainNode::initUdp()
     if (config_.pose_udp_enabled)
     {
         udp::PoseUdpReceiverConfig pose_cfg;
-        pose_cfg.allowed_remote_ip = config_.pose_udp_allowed_remote_ip;
         pose_cfg.frame_id_hmd = config_.pose_udp_frame_id_hmd;
         pose_cfg.frame_id_left_controller = config_.pose_udp_frame_id_left_controller;
         pose_cfg.frame_id_right_controller = config_.pose_udp_frame_id_right_controller;
@@ -154,13 +145,64 @@ void MainNode::tryRegister()
             &MainNode::udpReadyTimerCallback,
             this);
 
-        tryEnterRunning();
+        tryEnterPairing();
     }
+}
+
+void MainNode::enterPairingState()
+{
+    if (state_.load() == State::kPairing)
+    {
+        return;
+    }
+
+    setState(State::kPairing, "grpc+udp ready, waiting for pair");
+
+    if (udp_video_sender_)
+    {
+        udp_video_sender_->pause();
+    }
+
+    if (signaling_client_)
+    {
+        signaling_client_->startEventStream(
+            [this](const signaling::EventMessage &msg)
+            {
+                this->onSignalingEvent(msg);
+            });
+    }
+
+    if (pairing_running_)
+    {
+        return;
+    }
+
+    pairing_running_ = true;
+    pairing_thread_ = std::thread(
+        [this]
+        {
+            while (pairing_running_)
+            {
+                if (state_.load() == State::kPairing)
+                {
+                    if (paired_)
+                    {
+                        enterRunningState();
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        });
 }
 
 void MainNode::enterRunningState()
 {
-    if (state_ == State::kRunning)
+    if (state_.load() == State::kRunning)
+    {
+        return;
+    }
+
+    if (!paired_)
     {
         return;
     }
@@ -177,11 +219,6 @@ void MainNode::enterRunningState()
         &MainNode::heartbeatTimerCallback,
         this);
 
-    signaling_client_->startEventStream(
-        [this](const signaling::EventMessage &msg)
-        {
-            this->onSignalingEvent(msg);
-        });
     if (udp_video_sender_)
     {
         udp_video_sender_->resume();
@@ -189,28 +226,28 @@ void MainNode::enterRunningState()
     ROS_INFO("Node entered running state.");
 }
 
-void MainNode::tryEnterRunning()
+void MainNode::tryEnterPairing()
 {
-    if (state_ == State::kRunning)
+    if (state_.load() == State::kRunning || state_.load() == State::kPairing)
     {
         return;
     }
 
     if (grpc_registered_ && udp_control_ready_)
     {
-        enterRunningState();
+        enterPairingState();
     }
 }
 
 void MainNode::setState(State next, const std::string &reason)
 {
-    if (state_ == next)
+    if (state_.load() == next)
     {
         return;
     }
 
-    const State prev = state_;
-    state_ = next;
+    const State prev = state_.load();
+    state_.store(next);
     ROS_INFO("State transition: %s -> %s (%s)", stateToString(prev), stateToString(next), reason.c_str());
 }
 
@@ -226,16 +263,40 @@ void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
         {
         case signaling::PairEvent::REQUEST:
             ROS_INFO("Pair Request from %s. Auto-accepting...", pair_event.peer_session_id().c_str());
-            signaling_client_->acceptPair(pair_event.peer_session_id());
+            if (signaling_client_ && signaling_client_->acceptPair(pair_event.peer_session_id()) == 0)
+            {
+                std::lock_guard<std::mutex> lock(paired_mutex_);
+                paired_peer_session_id_ = pair_event.peer_session_id();
+                paired_ = true;
+            }
             break;
         case signaling::PairEvent::ACCEPT:
             ROS_INFO("Pair Accepted by %s", pair_event.peer_session_id().c_str());
+            {
+                std::lock_guard<std::mutex> lock(paired_mutex_);
+                paired_peer_session_id_ = pair_event.peer_session_id();
+                paired_ = true;
+            }
             break;
         case signaling::PairEvent::REJECT:
             ROS_WARN("Pair Rejected by %s", pair_event.peer_session_id().c_str());
+            paired_ = false;
             break;
         case signaling::PairEvent::UNPAIR:
             ROS_INFO("Unpaired by %s", pair_event.peer_session_id().c_str());
+            {
+                std::lock_guard<std::mutex> lock(paired_mutex_);
+                paired_peer_session_id_.clear();
+                paired_ = false;
+            }
+            if (state_.load() == State::kRunning)
+            {
+                setState(State::kPairing, "unpaired");
+                if (udp_video_sender_)
+                {
+                    udp_video_sender_->pause();
+                }
+            }
             break;
         default:
             break;
@@ -291,12 +352,12 @@ void MainNode::udpReadyTimerCallback(const ros::TimerEvent &event)
         {
             udp_ready_timer_.stop();
         }
-        tryEnterRunning();
+        tryEnterPairing();
     }
     else if (udp_control_ready_)
     {
         udp_control_ready_ = false;
-        if (state_ == State::kRunning)
+        if (state_.load() == State::kRunning)
         {
             setState(State::kRegistered, "udp control lost");
             if (udp_video_sender_)
@@ -320,10 +381,7 @@ void MainNode::loadParams()
     // UDP
     pnh_.param<std::string>("udp_ip", config_.udp_ip, "192.168.3.2");
     pnh_.param<int>("udp_port", config_.udp_port, 7778);
-    pnh_.param<std::string>("udp/bind_ip", config_.udp_bind_ip, "0.0.0.0");
-    pnh_.param<int>("udp/bind_port", config_.udp_bind_port, 0);
     pnh_.param<int>("udp/recv_timeout_ms", config_.udp_recv_timeout_ms, 100);
-    pnh_.param<std::string>("udp/allowed_remote_ip", config_.udp_allowed_remote_ip, "");
     pnh_.param<bool>("udp/pacing/enabled", config_.udp_pacing_enabled, true);
     pnh_.param<int>("udp/pacing/bps", config_.udp_pacing_bps, 30000000);
     pnh_.param<int>("udp/pacing/queue_max_packets", config_.udp_pacing_queue_max_packets, 1024);
@@ -339,9 +397,6 @@ void MainNode::loadParams()
 
     // Pose UDP
     pnh_.param<bool>("pose_udp/enabled", config_.pose_udp_enabled, false);
-    pnh_.param<std::string>("pose_udp/bind_ip", config_.pose_udp_bind_ip, "0.0.0.0");
-    pnh_.param<int>("pose_udp/bind_port", config_.pose_udp_bind_port, 7780);
-    pnh_.param<std::string>("pose_udp/allowed_remote_ip", config_.pose_udp_allowed_remote_ip, "");
     pnh_.param<int>("pose_udp/recv_timeout_ms", config_.pose_udp_recv_timeout_ms, 100);
     pnh_.param<int>("pose_udp/qos/depth", config_.pose_udp_qos_depth, 10);
     pnh_.param<std::string>("pose_udp/frame_id/hmd", config_.pose_udp_frame_id_hmd, "vr_hmd");
@@ -412,6 +467,12 @@ MainNode::~MainNode()
         udp_ready_timer_.stop();
     }
 
+    pairing_running_ = false;
+    if (pairing_thread_.joinable())
+    {
+        pairing_thread_.join();
+    }
+
     if (udp_video_sender_)
     {
         udp_video_sender_->stop();
@@ -438,6 +499,8 @@ const char *MainNode::stateToString(State s)
         return "connecting";
     case State::kRegistered:
         return "registered";
+    case State::kPairing:
+        return "pairing";
     case State::kRunning:
         return "running";
     default:
