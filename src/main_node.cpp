@@ -13,6 +13,7 @@
 #include <vector>
 #include <functional>
 #include <unordered_map>
+#include <sstream>
 
 #include "rclcpp/rclcpp.hpp"
 #include "main_node.hpp"
@@ -24,6 +25,152 @@
 
 namespace trb
 {
+
+    namespace
+    {
+        enum class H264StreamFormat
+        {
+            AnnexB,
+            Avcc,
+            Unknown,
+        };
+
+        static bool hasAnnexBStartCode(const uint8_t *data, size_t size)
+        {
+            if (!data || size < 4)
+            {
+                return false;
+            }
+            for (size_t i = 0; i + 3 < size; ++i)
+            {
+                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
+                {
+                    return true;
+                }
+                if (i + 4 < size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static bool looksLikeAvcc(const uint8_t *data, size_t size)
+        {
+            if (!data || size < 8)
+            {
+                return false;
+            }
+            size_t off = 0;
+            int nal_count = 0;
+            while (off + 4 <= size && nal_count < 3)
+            {
+                const uint32_t n = (static_cast<uint32_t>(data[off]) << 24) |
+                                   (static_cast<uint32_t>(data[off + 1]) << 16) |
+                                   (static_cast<uint32_t>(data[off + 2]) << 8) |
+                                   (static_cast<uint32_t>(data[off + 3]));
+                off += 4;
+                if (n == 0 || off + n > size)
+                {
+                    return false;
+                }
+                if (n < 1)
+                {
+                    return false;
+                }
+                off += n;
+                ++nal_count;
+            }
+            return nal_count > 0;
+        }
+
+        static H264StreamFormat detectH264Format(const uint8_t *data, size_t size)
+        {
+            if (hasAnnexBStartCode(data, size))
+            {
+                return H264StreamFormat::AnnexB;
+            }
+            if (looksLikeAvcc(data, size))
+            {
+                return H264StreamFormat::Avcc;
+            }
+            return H264StreamFormat::Unknown;
+        }
+
+        template <typename Fn>
+        static void forEachNal(const uint8_t *data, size_t size, H264StreamFormat fmt, Fn &&fn)
+        {
+            if (!data || size < 1)
+            {
+                return;
+            }
+
+            if (fmt == H264StreamFormat::AnnexB)
+            {
+                auto is_start_code = [&](size_t i, size_t &sc_len) -> bool
+                {
+                    if (i + 3 <= size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
+                    {
+                        sc_len = 3;
+                        return true;
+                    }
+                    if (i + 4 <= size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                    {
+                        sc_len = 4;
+                        return true;
+                    }
+                    return false;
+                };
+
+                size_t i = 0;
+                while (i + 3 < size)
+                {
+                    size_t sc_len = 0;
+                    if (!is_start_code(i, sc_len))
+                    {
+                        ++i;
+                        continue;
+                    }
+                    i += sc_len;
+                    const size_t nal_start = i;
+
+                    while (i + 3 < size)
+                    {
+                        size_t next_sc = 0;
+                        if (is_start_code(i, next_sc))
+                        {
+                            break;
+                        }
+                        ++i;
+                    }
+
+                    const size_t nal_end = i;
+                    if (nal_end > nal_start)
+                    {
+                        fn(data + nal_start, nal_end - nal_start);
+                    }
+                }
+            }
+            else if (fmt == H264StreamFormat::Avcc)
+            {
+                size_t off = 0;
+                while (off + 4 <= size)
+                {
+                    const uint32_t n = (static_cast<uint32_t>(data[off]) << 24) |
+                                       (static_cast<uint32_t>(data[off + 1]) << 16) |
+                                       (static_cast<uint32_t>(data[off + 2]) << 8) |
+                                       (static_cast<uint32_t>(data[off + 3]));
+                    off += 4;
+                    if (n == 0 || off + n > size)
+                    {
+                        break;
+                    }
+                    fn(data + off, n);
+                    off += n;
+                }
+            }
+        }
+    }
 
     MainNode::MainNode() : Node("main_node")
     {
@@ -84,6 +231,11 @@ namespace trb
         video_stream_manager_->setEncodedFrameCallback(
             [this](const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)
             {
+                if (!this->video_config_acked_.load(std::memory_order_relaxed))
+                {
+                    this->updateSpsPpsFromEncodedFrame(data, size);
+                    return;
+                }
                 if (this->udp_stream_manager_)
                 {
                     this->udp_stream_manager_->sendH264Frame(data, size, timestamp_us, keyframe);
@@ -93,6 +245,10 @@ namespace trb
         if (!video_stream_manager_->start())
         {
             RCLCPP_ERROR(this->get_logger(), "VideoStreamManager start failed");
+        }
+        else
+        {
+            startVideoConfigPublisher();
         }
     }
 
@@ -362,6 +518,10 @@ namespace trb
             framerate = static_cast<uint32_t>(profile[2]);
         }
 
+        video_width_ = width;
+        video_height_ = height;
+        video_fps_ = framerate;
+
         std::string video_device = "/dev/video0";
         std::string pixel_format_str = "mjpeg";
         int64_t v4l2_buffer_count_param = 8;
@@ -523,6 +683,237 @@ namespace trb
         return paired_ready_ && !shutting_down_.load();
     }
 
+    void MainNode::startVideoConfigPublisher()
+    {
+        if (video_config_running_.exchange(true))
+        {
+            return;
+        }
+        video_config_acked_.store(false, std::memory_order_relaxed);
+        video_config_thread_ = std::thread(&MainNode::videoConfigPublisherLoop, this);
+    }
+
+    void MainNode::stopVideoConfigPublisher()
+    {
+        video_config_running_.store(false, std::memory_order_relaxed);
+        video_config_cv_.notify_all();
+        if (video_config_thread_.joinable())
+        {
+            if (std::this_thread::get_id() != video_config_thread_.get_id())
+            {
+                video_config_thread_.join();
+            }
+        }
+    }
+
+    void MainNode::resetVideoConfigState()
+    {
+        std::lock_guard<std::mutex> lk(video_config_mutex_);
+        video_sps_.clear();
+        video_pps_.clear();
+        video_vps_.clear();
+        last_video_config_id_.clear();
+        video_config_acked_.store(false, std::memory_order_relaxed);
+        video_config_cv_.notify_all();
+    }
+
+    std::string MainNode::makeVideoConfigId()
+    {
+        const uint64_t seq = video_config_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const std::string sid = (signaling_client_ && !signaling_client_->sessionId().empty())
+                                    ? signaling_client_->sessionId()
+                                    : "unknown";
+        std::ostringstream oss;
+        oss << sid << "-" << now_ms << "-" << seq;
+        return oss.str();
+    }
+
+    void MainNode::updateSpsPpsFromEncodedFrame(const uint8_t *data, size_t size)
+    {
+        if (!data || size == 0)
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(video_config_mutex_);
+            if (!video_sps_.empty() && !video_pps_.empty())
+            {
+                return;
+            }
+        }
+
+        const H264StreamFormat fmt = detectH264Format(data, size);
+        if (fmt == H264StreamFormat::Unknown)
+        {
+            return;
+        }
+
+        bool ready = false;
+        forEachNal(data, size, fmt, [&](const uint8_t *nal, size_t nal_size)
+                   {
+                       if (nal_size < 1)
+                           return;
+                       const uint8_t nal_unit_type = static_cast<uint8_t>(nal[0] & 0x1Fu);
+                       if (nal_unit_type != 7 && nal_unit_type != 8)
+                           return;
+
+                       std::lock_guard<std::mutex> lk(video_config_mutex_);
+                       if (nal_unit_type == 7 && video_sps_.empty())
+                       {
+                           video_sps_.assign(nal, nal + nal_size);
+                       }
+                       else if (nal_unit_type == 8 && video_pps_.empty())
+                       {
+                           video_pps_.assign(nal, nal + nal_size);
+                       }
+
+                       if (!video_sps_.empty() && !video_pps_.empty())
+                       {
+                           ready = true;
+                       } });
+
+        if (ready)
+        {
+            video_config_cv_.notify_all();
+        }
+    }
+
+    void MainNode::videoConfigPublisherLoop()
+    {
+        while (video_config_running_.load(std::memory_order_relaxed) && rclcpp::ok() && !shutting_down_.load())
+        {
+            std::unique_lock<std::mutex> lk(video_config_mutex_);
+            video_config_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]()
+                                      { return !video_config_running_.load(std::memory_order_relaxed) ||
+                                               (paired_ready_ && !video_sps_.empty() && !video_pps_.empty()); });
+
+            if (!video_config_running_.load(std::memory_order_relaxed))
+            {
+                break;
+            }
+
+            if (!paired_ready_ || video_sps_.empty() || video_pps_.empty())
+            {
+                continue;
+            }
+
+            if (!signaling_client_)
+            {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+
+            signaling::VideoConfig config;
+            config.set_codec(signaling::VideoConfig::H264);
+            config.set_width(static_cast<int32_t>(video_width_));
+            config.set_height(static_cast<int32_t>(video_height_));
+            config.set_fps(static_cast<int32_t>(video_fps_));
+            config.set_sps(video_sps_.data(), video_sps_.size());
+            config.set_pps(video_pps_.data(), video_pps_.size());
+            const std::string config_id = makeVideoConfigId();
+            config.set_config_id(config_id);
+            last_video_config_id_ = config_id;
+
+            lk.unlock();
+
+            while (video_config_running_.load(std::memory_order_relaxed))
+            {
+                if (!paired_ready_)
+                {
+                    break;
+                }
+                if (signaling_client_->publishVideoConfig(config) == 0)
+                {
+                    video_config_acked_.store(true, std::memory_order_relaxed);
+                    RCLCPP_INFO(this->get_logger(), "VideoConfig ACK received, start streaming video");
+                    break;
+                }
+                RCLCPP_WARN(this->get_logger(), "PublishVideoConfig no-ack, retrying in 3s...");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+
+            if (video_config_acked_.load(std::memory_order_relaxed))
+            {
+                break;
+            }
+        }
+    }
+
+    bool MainNode::reRegisterAndWaitForPairing()
+    {
+        if (reconnecting_.exchange(true))
+        {
+            RCLCPP_WARN(this->get_logger(), "Reconnect already in progress; skipping");
+            return false;
+        }
+
+        if (!signaling_client_)
+        {
+            reconnecting_.store(false, std::memory_order_relaxed);
+            return false;
+        }
+
+        stopVideoConfigPublisher();
+
+        {
+            std::lock_guard<std::mutex> lk(pair_mutex_);
+            paired_ready_ = false;
+            paired_peer_session_id_.clear();
+        }
+        pair_cv_.notify_all();
+
+        signaling_client_->stopEventStream();
+        resetVideoConfigState();
+
+        bool registered = false;
+        while (rclcpp::ok() && !shutting_down_.load())
+        {
+            if (signaling_client_->connect() == 0 && signaling_client_->registerRobot() == 0)
+            {
+                registered = true;
+                break;
+            }
+            RCLCPP_WARN(this->get_logger(), "Re-register failed. Retrying in 3s...");
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+
+        if (!registered)
+        {
+            reconnecting_.store(false, std::memory_order_relaxed);
+            return false;
+        }
+
+        signaling_client_->startEventStream(std::bind(&MainNode::onSignalingEvent, this, std::placeholders::_1));
+
+        bool paired_ok = false;
+        if (pair_mode_ == "active")
+        {
+            paired_ok = runActivePairing();
+        }
+        else
+        {
+            paired_ok = waitForPairing();
+        }
+
+        if (paired_ok && udp_stream_manager_)
+        {
+            udp_stream_manager_->setSessionId(signaling_client_->sessionId());
+        }
+
+        if (paired_ok)
+        {
+            startVideoConfigPublisher();
+        }
+
+        reconnecting_.store(false, std::memory_order_relaxed);
+        return paired_ok;
+    }
+
     void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
     {
         RCLCPP_INFO(this->get_logger(), "Received EventMessage from %s", msg.sender_session_id().c_str());
@@ -548,6 +939,9 @@ namespace trb
                     }
                     pair_cv_.notify_all();
 
+                    video_config_acked_.store(false, std::memory_order_relaxed);
+                    startVideoConfigPublisher();
+
                     if (subscribe_vr_pose_flag_)
                     {
                         signaling_client_->subscribeVrPose(peer);
@@ -571,6 +965,8 @@ namespace trb
                     paired_ready_ = true;
                 }
                 pair_cv_.notify_all();
+                video_config_acked_.store(false, std::memory_order_relaxed);
+                startVideoConfigPublisher();
                 if (subscribe_vr_pose_flag_)
                 {
                     signaling_client_->subscribeVrPose(peer);
@@ -590,6 +986,7 @@ namespace trb
                     paired_ready_ = false;
                 }
                 pair_cv_.notify_all();
+                stopVideoConfigPublisher();
                 break;
             }
             case signaling::PairEvent::UNPAIR:
@@ -605,6 +1002,7 @@ namespace trb
                     paired_ready_ = false;
                 }
                 pair_cv_.notify_all();
+                stopVideoConfigPublisher();
                 if (subscribe_vr_pose_flag_)
                 {
                     signaling_client_->unsubscribe(peer);
@@ -657,6 +1055,8 @@ namespace trb
             heartbeat_timer_->cancel();
             heartbeat_timer_.reset();
         }
+
+        stopVideoConfigPublisher();
 
         // 2. Stop Video Pipeline (Producers)
         // This ensures no new frames are sent to UDP manager

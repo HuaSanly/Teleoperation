@@ -3,7 +3,7 @@
     server_ip: "grpc-pro.eifuture.com"
     server_port: 7777
     use_ssl: true
-    device_id: "007"
+    device_id: "robot_007"
     token: "secure"
     subscribe_vr_pose_flag: false
 
@@ -96,7 +96,7 @@
     # ---------------- SCReAM congestion control ----------------
     # Enables Ericsson SCReAM sender-side controller.
     # Requires receiver-side feedback (Type=0x03) to be effective.
-    udp.scream.enabled: true
+    udp.scream.enabled: false
     # Fallback pacing when SCReAM has not converged yet.
     udp.scream.fallback_pacing_bps: 60000000
     # Optional clamps for pacing rate.
@@ -149,16 +149,16 @@
     # Intra refresh ("I-frame smoothing") + low-frequency IDR:
     # - intra refresh: gradually refreshes the picture across P-frames
     # - low-frequency IDR: provides a clean join/recovery point every N seconds
-    video.encoder.intra_refresh.enabled: true
+    video.encoder.intra_refresh.enabled: false
     # NvVideoEncoder::setSliceIntrarefresh(interval_slices). 1 is the strongest refresh.
     video.encoder.intra_refresh.interval_slices: 1
-    video.encoder.low_freq_idr.enabled: true
+    video.encoder.low_freq_idr.enabled: false
     video.encoder.low_freq_idr.interval_sec: 3
 
     # These are still applied (and are overridden by low_freq_idr when enabled).
-    video.encoder.idr_interval: 90
-    video.encoder.idr_interval_gops: 90
-    video.encoder.force_idr_every_n: 0
+    video.encoder.idr_interval: 15
+    video.encoder.idr_interval_gops: 15
+    video.encoder.force_idr_every_n: 15
     video.encoder.qp_range_i_min: 10
     video.encoder.qp_range_i_max: 32
     video.encoder.qp_range_p_min: 10

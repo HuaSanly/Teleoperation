@@ -58,6 +58,9 @@ namespace trb
 
         const std::string &sessionId() const;
 
+        // 5. Publish Video Config
+        int publishVideoConfig(const signaling::VideoConfig &config);
+
     private:
         void eventStreamThread();
 

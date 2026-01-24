@@ -148,6 +148,36 @@ namespace trb
         return session_id_;
     }
 
+    int SignalingClient::publishVideoConfig(const signaling::VideoConfig &config)
+    {
+        if (!stub_)
+            return -1;
+
+        grpc::ClientContext context;
+        context.AddMetadata("session-id", session_id_);
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(2000));
+
+        signaling::VideoConfigAck response;
+        grpc::Status status = stub_->PublishVideoConfig(&context, config, &response);
+
+        if (status.ok() && response.success())
+        {
+            const std::string &sent_id = config.config_id();
+            const std::string &ack_id = response.config_id();
+            if (!sent_id.empty() && !ack_id.empty() && sent_id != ack_id)
+            {
+                RCLCPP_WARN(logger_, "PublishVideoConfig ack mismatch: sent=%s ack=%s", sent_id.c_str(), ack_id.c_str());
+                return -1;
+            }
+            RCLCPP_INFO(logger_, "PublishVideoConfig acked: %s (config_id=%s)", response.message().c_str(), ack_id.c_str());
+            return 0;
+        }
+
+        RCLCPP_WARN(logger_, "PublishVideoConfig failed: %s (gRPC code: %d, msg: %s)",
+                    response.message().c_str(), status.error_code(), status.error_message().c_str());
+        return -1;
+    }
+
     // --- New Methods ---
 
     int SignalingClient::requestPair(const std::string &peer_session_id)
