@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <ros/ros.h>
+#include <ros/package.h>
 
 #include "udp/gf256.hpp"
 
@@ -165,6 +166,11 @@ const V2FecTable &getV2FecTable()
                    {
                        const std::string filename = "UDP_VIDEO_FEC_TABLE_V1.json";
                        std::vector<std::filesystem::path> candidates;
+                       const std::string pkg_path = ros::package::getPath("teleoperation_robot_bridge");
+                       if (!pkg_path.empty())
+                       {
+                           candidates.emplace_back(std::filesystem::path(pkg_path) / "config" / filename);
+                       }
                        candidates.emplace_back(std::filesystem::path("config") / filename);
                        candidates.emplace_back(std::filesystem::path("teleoperation_robot_bridge") / "config" / filename);
                        candidates.emplace_back(std::filesystem::path("src") / "teleoperation_robot_bridge" / "config" / filename);
@@ -327,8 +333,11 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
     const uint8_t groups = fec_strategy_enabled ? fec_params.groups : 0;
     const uint8_t r_per_group = fec_strategy_enabled ? fec_params.r : 0;
 
+    double packet_ms = 0.0;
+    double fec_ms = 0.0;
     auto enqueueSource = [&](uint16_t frag_idx)
     {
+        const auto t0 = std::chrono::steady_clock::now();
         const size_t offset = static_cast<size_t>(frag_idx) * max_payload;
         const size_t chunk_size = std::min(max_payload, size - offset);
 
@@ -342,6 +351,7 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
         header.PayloadLength = static_cast<uint16_t>(chunk_size);
         header.FramePayloadLength = static_cast<uint32_t>(size);
         header.FecTableId = fec_strategy_enabled ? fec_table_id : 0;
+        header.KeyframeFlag = keyframe ? 1 : 0;
 
         packet_builder_.buildVideoPacket(header, data + offset, chunk_size, packet);
 
@@ -351,6 +361,8 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
         qi.bytes = packet;
         qi.wire_bytes = packet.size();
         enqueueItem(std::move(qi));
+        const auto t1 = std::chrono::steady_clock::now();
+        packet_ms += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
     };
 
     if (!fec_strategy_enabled)
@@ -436,6 +448,7 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
                 return;
             }
 
+            const auto t0 = std::chrono::steady_clock::now();
             std::vector<uint8_t> parity(symbol_bytes, 0);
             const uint8_t *coef_row = coef_ptr->data() + static_cast<size_t>(p) * static_cast<size_t>(k_g);
 
@@ -447,7 +460,10 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
                 const uint8_t c = coef_row[local_i++];
                 gf256::mulAdd(c, data + offset, parity.data(), chunk_size);
             }
+            const auto t1 = std::chrono::steady_clock::now();
+            fec_ms += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
 
+            const auto packet_t0 = std::chrono::steady_clock::now();
             VideoPacketHeaderV2 parity_header;
             parity_header.Type = 0x01;
             parity_header.PacketSeqNum = packet_seq_num_++;
@@ -457,6 +473,7 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
             parity_header.FramePayloadLength = static_cast<uint32_t>(size);
             parity_header.PayloadLength = static_cast<uint16_t>(symbol_bytes);
             parity_header.FecTableId = fec_table_id;
+            parity_header.KeyframeFlag = keyframe ? 1 : 0;
 
             const uint32_t frag_index = static_cast<uint32_t>(total_fragments) + static_cast<uint32_t>(g) + static_cast<uint32_t>(p) * static_cast<uint32_t>(groups);
             parity_header.FragmentIndex = static_cast<uint16_t>(frag_index & 0xFFFFu);
@@ -469,6 +486,8 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
             pq.bytes = packet;
             pq.wire_bytes = packet.size();
             enqueueItem(std::move(pq));
+            const auto packet_t1 = std::chrono::steady_clock::now();
+            packet_ms += std::chrono::duration_cast<std::chrono::microseconds>(packet_t1 - packet_t0).count() / 1000.0;
         };
 
         const uint32_t parity_total = static_cast<uint32_t>(groups) * static_cast<uint32_t>(r_per_group);
@@ -512,6 +531,8 @@ void UdpVideoSender::sendH264Frame(const uint8_t *data, size_t size, uint64_t ca
     end.capture_timestamp_us = capture_timestamp_us;
     end.enc_bytes = size;
     end.fragments = total_fragments;
+    end.packet_ms = packet_ms;
+    end.fec_ms = fec_ms;
     enqueueItem(std::move(end));
 
     (void)keyframe;
@@ -580,6 +601,8 @@ void UdpVideoSender::sendThreadMain()
         clock::time_point first_send{};
         clock::time_point last_send{};
         uint64_t pacing_sleep_us{0};
+        double packet_ms{0.0};
+        double fec_ms{0.0};
     } stats;
 
     while (running_.load())
@@ -678,14 +701,18 @@ void UdpVideoSender::sendThreadMain()
         {
             if (stats.active && stats.frame_id == item.frame_id)
             {
+                stats.packet_ms = item.packet_ms;
+                stats.fec_ms = item.fec_ms;
                 const uint64_t frame_us = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(stats.last_send - stats.first_send).count());
                 if ((item.frame_id % 30) == 0)
                 {
-                    ROS_INFO("UDP video frame=%u: packets=%u, send=%.1fms, pacing=%.1fms",
+                    ROS_INFO("UDP video frame=%u: packets=%u, send=%.1fms, packet=%.1fms, fec=%.1fms, pacing=%.1fms",
                              item.frame_id,
                              item.fragments,
                              static_cast<double>(frame_us - stats.pacing_sleep_us) / 1000.0,
+                             stats.packet_ms,
+                             stats.fec_ms,
                              static_cast<double>(stats.pacing_sleep_us) / 1000.0);
                 }
                 stats = FrameStats{};

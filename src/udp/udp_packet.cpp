@@ -87,7 +87,7 @@ void UdpPacketBuilder::buildVideoPacket(const VideoPacketHeaderV2 &header,
                                         std::vector<uint8_t> &out) const
 {
     out.clear();
-    out.reserve(26 + payload_bytes);
+    out.reserve(27 + payload_bytes);
 
     writeU8(out, header.Type);
     writeU16LE(out, header.PacketSeqNum);
@@ -98,6 +98,7 @@ void UdpPacketBuilder::buildVideoPacket(const VideoPacketHeaderV2 &header,
     writeU16LE(out, header.PayloadLength);
     writeU32LE(out, header.FramePayloadLength);
     writeU8(out, header.FecTableId);
+    writeU8(out, header.KeyframeFlag);
 
     if (payload_bytes > 0)
     {

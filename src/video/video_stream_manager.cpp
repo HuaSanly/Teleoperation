@@ -5,8 +5,47 @@
 
 #include <ros/ros.h>
 
+#include "NvBufSurface.h"
+
 namespace trb::video
 {
+
+namespace
+{
+void logDecodedSurfaceOnce(int fd)
+{
+    static std::atomic<bool> logged{false};
+    if (logged.exchange(true))
+    {
+        return;
+    }
+
+    NvBufSurface *surf = nullptr;
+    if (NvBufSurfaceFromFd(fd, reinterpret_cast<void **>(&surf)) != 0 || !surf)
+    {
+        ROS_WARN("Decoded surface: failed to query NvBufSurface from fd=%d", fd);
+        return;
+    }
+
+    const auto &s = surf->surfaceList[0];
+    ROS_INFO("Decoded surface: %ux%u colorFormat=%d layout=%d planes=%u",
+             s.width,
+             s.height,
+             static_cast<int>(s.colorFormat),
+             static_cast<int>(s.layout),
+             s.planeParams.num_planes);
+    for (uint32_t i = 0; i < s.planeParams.num_planes; ++i)
+    {
+        ROS_INFO("Decoded plane[%u]: width=%u height=%u pitch=%u psize=%u offset=%u",
+                 i,
+                 s.planeParams.width[i],
+                 s.planeParams.height[i],
+                 s.planeParams.pitch[i],
+                 s.planeParams.psize[i],
+                 s.planeParams.offset[i]);
+    }
+}
+} // namespace
 
 VideoStreamManager::VideoStreamManager(VideoStreamConfig config)
     : config_(std::move(config)),
@@ -18,9 +57,11 @@ VideoStreamManager::VideoStreamManager(VideoStreamConfig config)
                                  config_.v4l2_buffer_count}),
             decoder_({config_.profile.width,
                                 config_.profile.height,
-                                config_.decoder_pool_size,
-                                config_.decoder_out_layout}),
-            encoder_(config_.encoder)
+            config_.decoder_pool_size,
+            config_.decoder_max_perf_mode}),
+                        converter_(config_.converter),
+            encoder_(config_.encoder),
+            recorder_(config_.recorder)
 {
 }
 
@@ -51,13 +92,31 @@ bool VideoStreamManager::start()
         return false;
     }
 
-    if (!encoder_.start())
+    if (!converter_.start())
     {
-        ROS_ERROR("VideoStreamManager: encoder start failed");
+        ROS_ERROR("VideoStreamManager: converter start failed");
         decoder_.stop();
         capturer_.stop();
         running_.store(false);
         return false;
+    }
+
+    if (!encoder_.start())
+    {
+        ROS_ERROR("VideoStreamManager: encoder start failed");
+        converter_.stop();
+        decoder_.stop();
+        capturer_.stop();
+        running_.store(false);
+        return false;
+    }
+
+    if (config_.recorder.enabled)
+    {
+        if (!recorder_.start())
+        {
+            ROS_ERROR("VideoStreamManager: recorder start failed");
+        }
     }
 
     capture_thread_ = std::thread(&VideoStreamManager::captureThreadMain, this);
@@ -87,7 +146,9 @@ void VideoStreamManager::stop()
 
     capturer_.stop();
     decoder_.stop();
+    converter_.stop();
     encoder_.stop();
+    recorder_.stop();
     ROS_INFO("VideoStreamManager stopped");
 }
 
@@ -103,6 +164,7 @@ bool VideoStreamManager::isRunning() const
 
 void VideoStreamManager::captureThreadMain()
 {
+    uint64_t dropped_frames = 0;
     while (running_.load())
     {
         V4L2Frame frame;
@@ -125,9 +187,19 @@ void VideoStreamManager::captureThreadMain()
 
         {
             std::lock_guard<std::mutex> lk(frame_mutex_);
+            if (latest_frame_.has_value())
+            {
+                ++dropped_frames;
+            }
             latest_frame_ = std::move(out);
         }
         frame_cv_.notify_one();
+
+        if (dropped_frames > 0)
+        {
+            ROS_WARN_THROTTLE(2.0, "Video capture drop: pending frame overwritten (dropped=%lu)",
+                              static_cast<unsigned long>(dropped_frames));
+        }
     }
 }
 
@@ -138,7 +210,11 @@ void VideoStreamManager::pipelineThreadMain()
     uint64_t encode_ok = 0;
     uint64_t decode_fail = 0;
     uint64_t encode_fail = 0;
+    uint64_t convert_ok = 0;
+    uint64_t convert_fail = 0;
+    uint64_t keyframe_count = 0;
     double decode_total_ms = 0.0;
+    double convert_total_ms = 0.0;
     double encode_total_ms = 0.0;
 
     auto logStatsIfNeeded = [&]()
@@ -148,21 +224,30 @@ void VideoStreamManager::pipelineThreadMain()
             return;
         }
         const double decode_avg = decode_ok > 0 ? (decode_total_ms / static_cast<double>(decode_ok)) : 0.0;
+        const double convert_avg = convert_ok > 0 ? (convert_total_ms / static_cast<double>(convert_ok)) : 0.0;
         const double encode_avg = encode_ok > 0 ? (encode_total_ms / static_cast<double>(encode_ok)) : 0.0;
-        ROS_INFO("Video pipeline stats: attempts=%lu decode_ok=%lu decode_fail=%lu encode_ok=%lu encode_fail=%lu decode_avg=%.2fms encode_avg=%.2fms",
+        ROS_INFO("Video pipeline stats: attempts=%lu decode_ok=%lu decode_fail=%lu convert_ok=%lu convert_fail=%lu encode_ok=%lu encode_fail=%lu keyframes=%lu decode_avg=%.2fms convert_avg=%.2fms encode_avg=%.2fms",
                  static_cast<unsigned long>(attempt_counter),
                  static_cast<unsigned long>(decode_ok),
                  static_cast<unsigned long>(decode_fail),
+                 static_cast<unsigned long>(convert_ok),
+                 static_cast<unsigned long>(convert_fail),
                  static_cast<unsigned long>(encode_ok),
                  static_cast<unsigned long>(encode_fail),
+             static_cast<unsigned long>(keyframe_count),
                  decode_avg,
+                 convert_avg,
                  encode_avg);
         decode_total_ms = 0.0;
+        convert_total_ms = 0.0;
         encode_total_ms = 0.0;
         decode_ok = 0;
+        convert_ok = 0;
         encode_ok = 0;
         decode_fail = 0;
+        convert_fail = 0;
         encode_fail = 0;
+        keyframe_count = 0;
     };
 
     while (running_.load())
@@ -202,12 +287,30 @@ void VideoStreamManager::pipelineThreadMain()
         const double decode_ms = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count() / 1000.0;
         ++decode_ok;
 
+        ConvertedFrame converted;
+        const auto convert_start = std::chrono::steady_clock::now();
+        logDecodedSurfaceOnce(decoded.fd);
+        const bool convert_ok_flag = converter_.convert(decoded.fd, decoded.timestamp_us, converted);
+        const auto convert_end = std::chrono::steady_clock::now();
+        const double convert_ms = std::chrono::duration_cast<std::chrono::microseconds>(convert_end - convert_start).count() / 1000.0;
+        decoder_.releaseFd(decoded.fd);
+
+        if (!convert_ok_flag)
+        {
+            ++convert_fail;
+            logStatsIfNeeded();
+            continue;
+        }
+
+        ++convert_ok;
+        convert_total_ms += convert_ms;
+
         EncodedFrame encoded;
         const auto encode_start = std::chrono::steady_clock::now();
-        const bool encoded_ok = encoder_.encode(decoded.fd, decoded.timestamp_us, encoded);
+        const bool encoded_ok = encoder_.encode(converted.fd, converted.timestamp_us, encoded);
         const auto encode_end = std::chrono::steady_clock::now();
         const double encode_ms = std::chrono::duration_cast<std::chrono::microseconds>(encode_end - encode_start).count() / 1000.0;
-        decoder_.releaseFd(decoded.fd);
+        converter_.releaseFd(converted.fd);
 
         if (!encoded_ok)
         {
@@ -219,12 +322,21 @@ void VideoStreamManager::pipelineThreadMain()
         ++encode_ok;
         decode_total_ms += decode_ms;
         encode_total_ms += encode_ms;
+        if (encoded.keyframe)
+        {
+            ++keyframe_count;
+        }
 
         logStatsIfNeeded();
 
         if (encoded_frame_cb_)
         {
             encoded_frame_cb_(encoded.data.data(), encoded.data.size(), encoded.timestamp_us, encoded.keyframe);
+        }
+
+        if (config_.recorder.enabled)
+        {
+            recorder_.writeFrame(encoded.data.data(), encoded.data.size(), encoded.timestamp_us, encoded.keyframe);
         }
     }
 }

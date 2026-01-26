@@ -19,6 +19,7 @@ struct VideoPacketHeaderV2
     uint16_t PayloadLength{0};
     uint32_t FramePayloadLength{0};
     uint8_t FecTableId{0};
+    uint8_t KeyframeFlag{0};
 };
 
 class UdpPacketBuilder

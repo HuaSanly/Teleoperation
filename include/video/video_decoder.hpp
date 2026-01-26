@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -15,7 +16,7 @@ struct VideoDecoderConfig
     uint32_t width{0};
     uint32_t height{0};
     uint32_t pool_size{8};
-    std::string out_layout{"pitch"};
+    bool max_perf_mode{false};
 };
 
 struct DecodedFrame
@@ -41,20 +42,22 @@ public:
     bool isRunning() const;
 
 private:
-    bool ensureOutputPool(uint32_t width, uint32_t height);
-    void destroyPool();
-    int acquireOutputFd();
+    bool configureDecoder();
+    void destroyDecoder();
+    bool reclaimOutputBuffers();
+    uint32_t clampBufferCount(uint32_t v) const;
 
     VideoDecoderConfig config_{};
     void *decoder_{nullptr};
     bool running_{false};
 
-    uint32_t pool_width_{0};
-    uint32_t pool_height_{0};
-
     std::mutex pool_mutex_;
-    std::vector<int> free_fds_;
-    std::unordered_set<int> in_use_;
+    std::vector<uint32_t> free_output_indices_;
+    std::vector<int> capture_fd_by_index_;
+    std::unordered_map<int, uint32_t> fd_to_capture_index_;
+    std::unordered_set<int> in_use_fds_;
+
+    bool capture_configured_{false};
 };
 
 } // namespace trb::video

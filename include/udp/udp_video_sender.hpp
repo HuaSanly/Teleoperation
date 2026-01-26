@@ -60,6 +60,8 @@ private:
         uint64_t capture_timestamp_us{0};
         size_t enc_bytes{0};
         uint16_t fragments{0};
+        double packet_ms{0.0};
+        double fec_ms{0.0};
     };
 
     void enqueueItem(QueueItem &&item);

@@ -289,6 +289,7 @@ bool VideoEncoder::encode(int nv12_fd, uint64_t timestamp_us, EncodedFrame &out)
 
     if (free_output_indices_.empty())
     {
+        ROS_WARN_THROTTLE(2.0, "VideoEncoder output buffers exhausted");
         return false;
     }
 

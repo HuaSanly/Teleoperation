@@ -125,6 +125,8 @@ void SignalingClient::tickHeartbeat()
         return;
     }
 
+    ROS_INFO("Sending heartbeat (session_id=%s)", session_id_.c_str());
+
     grpc::ClientContext context;
     signaling::Heartbeat request;
     auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -313,6 +315,26 @@ std::vector<signaling::UnpairedEndpoint> SignalingClient::listUnpaired(signaling
         ROS_ERROR("ListUnpaired failed: %s", status.error_message().c_str());
     }
     return result;
+}
+
+int SignalingClient::publishVideoConfig(const signaling::VideoConfig &config, signaling::VideoConfigAck &ack)
+{
+    if (!stub_)
+    {
+        return -1;
+    }
+
+    grpc::ClientContext context;
+    context.AddMetadata("session-id", session_id_);
+
+    grpc::Status status = stub_->PublishVideoConfig(&context, config, &ack);
+    if (status.ok() && ack.success())
+    {
+        return 0;
+    }
+
+    ROS_ERROR("PublishVideoConfig failed: %s", status.error_message().c_str());
+    return -1;
 }
 
 void SignalingClient::startEventStream(EventCallback callback)

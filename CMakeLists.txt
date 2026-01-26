@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  roslib
   std_msgs
   sensor_msgs
   geometry_msgs
@@ -121,7 +122,7 @@ endif()
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
   INCLUDE_DIRS include
-  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs
+  CATKIN_DEPENDS roscpp roslib std_msgs sensor_msgs geometry_msgs
 )
 
 ###########
@@ -213,7 +214,9 @@ add_executable(${PROJECT_NAME}
   src/video/video_stream_manager.cpp
   src/video/video_v4l2_capturer.cpp
   src/video/video_decoder.cpp
+  src/video/video_converter.cpp
   src/video/video_encoder.cpp
+  src/video/video_recorder.cpp
   src/udp/udp_manager.cpp
   src/udp/pose_udp_receiver.cpp
   src/udp/udp_packet.cpp
@@ -232,6 +235,7 @@ if(EXISTS "${JETSON_MMAPI_COMMON_DIR}/NvJpegDecoder.cpp")
     ${JETSON_MMAPI_COMMON_DIR}/NvV4l2Element.cpp
     ${JETSON_MMAPI_COMMON_DIR}/NvV4l2ElementPlane.cpp
     ${JETSON_MMAPI_COMMON_DIR}/NvVideoEncoder.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvVideoDecoder.cpp
     ${JETSON_MMAPI_COMMON_DIR}/NvUtils.cpp
   )
 endif()

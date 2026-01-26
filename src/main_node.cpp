@@ -2,9 +2,134 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ros/package.h>
 
 namespace trb
 {
+
+namespace
+{
+bool findStartCodePos(const uint8_t *data, size_t size, size_t offset, size_t &sc_pos, size_t &sc_size)
+{
+    for (size_t i = offset; i + 3 < size; ++i)
+    {
+        if (data[i] == 0 && data[i + 1] == 0)
+        {
+            if (data[i + 2] == 1)
+            {
+                sc_pos = i;
+                sc_size = 3;
+                return true;
+            }
+            if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1)
+            {
+                sc_pos = i;
+                sc_size = 4;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void extractSpsPpsFromAnnexB(const uint8_t *data, size_t size, std::vector<uint8_t> &sps, std::vector<uint8_t> &pps)
+{
+    sps.clear();
+    pps.clear();
+
+    size_t pos = 0;
+    while (pos + 3 < size)
+    {
+        size_t sc_pos = 0;
+        size_t sc_size = 0;
+        if (!findStartCodePos(data, size, pos, sc_pos, sc_size))
+        {
+            break;
+        }
+
+        const size_t nal_start = sc_pos + sc_size;
+        if (nal_start >= size)
+        {
+            break;
+        }
+
+        size_t next_sc_pos = 0;
+        size_t next_sc_size = 0;
+        size_t nal_end = size;
+        if (findStartCodePos(data, size, nal_start, next_sc_pos, next_sc_size))
+        {
+            nal_end = next_sc_pos;
+            pos = next_sc_pos;
+        }
+        else
+        {
+            pos = size;
+        }
+
+        const uint8_t nal_type = data[nal_start] & 0x1F;
+        if (nal_type == 7)
+        {
+            sps.assign(data + nal_start, data + nal_end);
+        }
+        else if (nal_type == 8)
+        {
+            pps.assign(data + nal_start, data + nal_end);
+        }
+
+        if (!sps.empty() && !pps.empty())
+        {
+            break;
+        }
+    }
+}
+
+void extractSpsPpsFromAvcc(const uint8_t *data, size_t size, std::vector<uint8_t> &sps, std::vector<uint8_t> &pps)
+{
+    sps.clear();
+    pps.clear();
+
+    size_t offset = 0;
+    while (offset + 4 <= size)
+    {
+        const uint32_t nal_len = (static_cast<uint32_t>(data[offset]) << 24) |
+                                 (static_cast<uint32_t>(data[offset + 1]) << 16) |
+                                 (static_cast<uint32_t>(data[offset + 2]) << 8) |
+                                 (static_cast<uint32_t>(data[offset + 3]));
+        offset += 4;
+        if (nal_len == 0 || offset + nal_len > size)
+        {
+            break;
+        }
+
+        const uint8_t nal_type = data[offset] & 0x1F;
+        if (nal_type == 7)
+        {
+            sps.assign(data + offset, data + offset + nal_len);
+        }
+        else if (nal_type == 8)
+        {
+            pps.assign(data + offset, data + offset + nal_len);
+        }
+
+        offset += nal_len;
+
+        if (!sps.empty() && !pps.empty())
+        {
+            break;
+        }
+    }
+}
+
+void extractSpsPpsFromEncoded(const uint8_t *data, size_t size, std::vector<uint8_t> &sps, std::vector<uint8_t> &pps)
+{
+    extractSpsPpsFromAnnexB(data, size, sps, pps);
+    if (!sps.empty() || !pps.empty())
+    {
+        return;
+    }
+    extractSpsPpsFromAvcc(data, size, sps, pps);
+}
+} // namespace
 
 
 MainNode::MainNode(ros::NodeHandle nh, ros::NodeHandle pnh)
@@ -146,8 +271,12 @@ void MainNode::initVideo()
     cfg.pixel_format = config_.video_pixel_format;
     cfg.v4l2_buffer_count = config_.video_v4l2_buffer_count;
 
-    cfg.decoder_pool_size = static_cast<uint32_t>(std::max(1, config_.video_converter_buffer_pool_size));
-    cfg.decoder_out_layout = config_.video_converter_out_layout;
+    cfg.decoder_pool_size = static_cast<uint32_t>(std::max(1, config_.video_decoder_buffer_pool_size));
+    cfg.decoder_max_perf_mode = config_.video_decoder_max_perf_mode;
+
+    cfg.converter.width = cfg.profile.width;
+    cfg.converter.height = cfg.profile.height;
+    cfg.converter.buffer_count = 4;
 
     cfg.encoder.width = cfg.profile.width;
     cfg.encoder.height = cfg.profile.height;
@@ -175,10 +304,28 @@ void MainNode::initVideo()
     cfg.encoder.num_b_frames = config_.video_encoder_num_b_frames;
     cfg.encoder.insert_sps_pps_at_idr = config_.video_encoder_insert_sps_pps_at_idr;
 
+    cfg.recorder.enabled = config_.video_recording_enabled;
+    if (!config_.video_recording_output_dir.empty())
+    {
+        cfg.recorder.output_dir = config_.video_recording_output_dir;
+    }
+    else
+    {
+        const std::string pkg_path = ros::package::getPath("teleoperation_robot_bridge");
+        if (!pkg_path.empty())
+        {
+            cfg.recorder.output_dir = pkg_path + "/h264";
+        }
+        else
+        {
+            cfg.recorder.output_dir = std::string("./h264");
+        }
+    }
+
     video_stream_manager_ = std::make_unique<video::VideoStreamManager>(cfg);
     wireVideoPipeline();
 
-    ROS_INFO("Video start_without_pair = %s", config_.video_start_without_pair ? "true" : "false");
+    ROS_INFO("Video skip_connect = %s", config_.video_skip_connect ? "true" : "false");
 }
 
 void MainNode::wireVideoPipeline()
@@ -191,7 +338,46 @@ void MainNode::wireVideoPipeline()
     video_stream_manager_->setEncodedFrameCallback(
         [this](const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)
         {
-            if (udp_video_sender_)
+            if (data && size > 0)
+            {
+                bool need_sps = false;
+                bool need_pps = false;
+                {
+                    std::lock_guard<std::mutex> lk(video_param_mutex_);
+                    need_sps = cached_sps_.empty();
+                    need_pps = cached_pps_.empty();
+                }
+
+                if (need_sps || need_pps)
+                {
+                    std::vector<uint8_t> sps;
+                    std::vector<uint8_t> pps;
+                    extractSpsPpsFromEncoded(data, size, sps, pps);
+                    if (!sps.empty() || !pps.empty())
+                    {
+                        bool updated = false;
+                        std::lock_guard<std::mutex> lk(video_param_mutex_);
+                        if (!sps.empty() && cached_sps_.empty())
+                        {
+                            cached_sps_ = std::move(sps);
+                            updated = true;
+                        }
+                        if (!pps.empty() && cached_pps_.empty())
+                        {
+                            cached_pps_ = std::move(pps);
+                            updated = true;
+                        }
+                        if (updated)
+                        {
+                            ROS_INFO("Parsed SPS/PPS from encoded stream: sps=%zu pps=%zu",
+                                     cached_sps_.size(),
+                                     cached_pps_.size());
+                        }
+                    }
+                }
+            }
+
+            if (udp_video_sender_ && state_.load() == State::kRunning)
             {
                 udp_video_sender_->sendH264Frame(data, size, timestamp_us, keyframe);
             }
@@ -213,6 +399,14 @@ void MainNode::tryRegister()
         setState(State::kRegistered, "grpc registered");
         initUdp();
 
+        if (!heartbeat_timer_.hasStarted())
+        {
+            heartbeat_timer_ = nh_.createTimer(
+                ros::Duration(config_.grpc_heartbeat_sec),
+                &MainNode::heartbeatTimerCallback,
+                this);
+        }
+
         udp_ready_timer_ = nh_.createTimer(
             ros::Duration(0.2),
             &MainNode::udpReadyTimerCallback,
@@ -231,7 +425,7 @@ void MainNode::enterPairingState()
 
     setState(State::kPairing, "grpc+udp ready, waiting for pair");
 
-    if (udp_video_sender_ && !config_.video_start_without_pair)
+    if (udp_video_sender_)
     {
         udp_video_sender_->pause();
     }
@@ -260,12 +454,41 @@ void MainNode::enterPairingState()
                 {
                     if (paired_)
                     {
-                        enterRunningState();
+                        enterNegotiatingState();
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
+}
+
+void MainNode::enterNegotiatingState()
+{
+    if (state_.load() == State::kNegotiating)
+    {
+        return;
+    }
+
+    setState(State::kNegotiating, "paired, negotiating video config");
+
+    if (video_stream_manager_ && !video_stream_manager_->isRunning())
+    {
+        if (!video_stream_manager_->start())
+        {
+            ROS_ERROR("VideoStreamManager start failed (negotiating test encode)");
+        }
+    }
+
+    video_config_acked_.store(false);
+    if (video_config_timer_.hasStarted())
+    {
+        video_config_timer_.stop();
+    }
+
+    video_config_timer_ = nh_.createTimer(
+        ros::Duration(2.0),
+        &MainNode::videoConfigTimerCallback,
+        this);
 }
 
 void MainNode::enterRunningState()
@@ -275,7 +498,7 @@ void MainNode::enterRunningState()
         return;
     }
 
-    if (!paired_ && !config_.video_start_without_pair)
+    if (!paired_ && !config_.video_skip_connect)
     {
         return;
     }
@@ -287,10 +510,18 @@ void MainNode::enterRunningState()
         register_retry_timer_.stop();
     }
 
-    heartbeat_timer_ = nh_.createTimer(
-        ros::Duration(config_.grpc_heartbeat_sec),
-        &MainNode::heartbeatTimerCallback,
-        this);
+    if (video_config_timer_.hasStarted())
+    {
+        video_config_timer_.stop();
+    }
+
+    if (!heartbeat_timer_.hasStarted())
+    {
+        heartbeat_timer_ = nh_.createTimer(
+            ros::Duration(config_.grpc_heartbeat_sec),
+            &MainNode::heartbeatTimerCallback,
+            this);
+    }
 
     if (udp_video_sender_)
     {
@@ -315,7 +546,7 @@ void MainNode::tryEnterPairing()
 
     if (grpc_registered_ && udp_control_ready_)
     {
-        if (config_.video_start_without_pair)
+        if (config_.video_skip_connect)
         {
             paired_ = true;
             enterRunningState();
@@ -325,6 +556,69 @@ void MainNode::tryEnterPairing()
             enterPairingState();
         }
     }
+}
+
+bool MainNode::publishVideoConfigOnce()
+{
+    if (!signaling_client_)
+    {
+        return false;
+    }
+
+    signaling::VideoConfig cfg;
+    cfg.set_codec(signaling::VideoConfig::H264);
+    if (config_.video_profile.size() >= 3)
+    {
+        cfg.set_width(config_.video_profile[0]);
+        cfg.set_height(config_.video_profile[1]);
+        cfg.set_fps(config_.video_profile[2]);
+    }
+
+    bool has_sps = false;
+    bool has_pps = false;
+    {
+        std::lock_guard<std::mutex> lk(video_param_mutex_);
+        if (!cached_sps_.empty())
+        {
+            cfg.set_sps(cached_sps_.data(), static_cast<int>(cached_sps_.size()));
+            has_sps = true;
+        }
+        if (!cached_pps_.empty())
+        {
+            cfg.set_pps(cached_pps_.data(), static_cast<int>(cached_pps_.size()));
+            has_pps = true;
+        }
+    }
+
+    if (!has_sps || !has_pps)
+    {
+        ROS_WARN_THROTTLE(2.0, "VideoConfig not sent: missing SPS/PPS (sps=%d pps=%d)",
+                          has_sps ? 1 : 0,
+                          has_pps ? 1 : 0);
+        return false;
+    }
+
+    ROS_INFO("Publishing VideoConfig via gRPC (codec=%s width=%d height=%d fps=%d sps=%zu pps=%zu)",
+             cfg.codec() == signaling::VideoConfig::H265 ? "H265" : "H264",
+             cfg.width(),
+             cfg.height(),
+             cfg.fps(),
+             static_cast<size_t>(cfg.sps().size()),
+             static_cast<size_t>(cfg.pps().size()));
+
+    signaling::VideoConfigAck ack;
+    if (signaling_client_->publishVideoConfig(cfg, ack) == 0 && ack.success())
+    {
+        ROS_INFO("VideoConfig acknowledged: codec=%s width=%d height=%d fps=%d sps=%zu pps=%zu",
+                 cfg.codec() == signaling::VideoConfig::H265 ? "H265" : "H264",
+                 cfg.width(),
+                 cfg.height(),
+                 cfg.fps(),
+                 static_cast<size_t>(cfg.sps().size()),
+                 static_cast<size_t>(cfg.pps().size()));
+        return true;
+    }
+    return false;
 }
 
 void MainNode::setState(State next, const std::string &reason)
@@ -390,7 +684,7 @@ void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
                 paired_peer_session_id_.clear();
                 paired_ = false;
             }
-            if (state_.load() == State::kRunning)
+            if (state_.load() == State::kRunning || state_.load() == State::kNegotiating)
             {
                 setState(State::kPairing, "unpaired");
                 if (udp_video_sender_)
@@ -468,6 +762,24 @@ void MainNode::udpReadyTimerCallback(const ros::TimerEvent &event)
         }
     }
 }
+
+void MainNode::videoConfigTimerCallback(const ros::TimerEvent &event)
+{
+    (void)event;
+    if (state_.load() != State::kNegotiating)
+    {
+        return;
+    }
+
+    if (publishVideoConfigOnce())
+    {
+        video_config_acked_.store(true);
+        enterRunningState();
+        return;
+    }
+
+    ROS_WARN_THROTTLE(2.0, "Video config not acknowledged yet; waiting for ACK...");
+}
 void MainNode::loadParams()
 {
     // Signaling
@@ -517,12 +829,10 @@ void MainNode::loadParams()
     pnh_.param<std::string>("video/device", config_.video_device, "/dev/video0");
     pnh_.param<std::string>("video/pixel_format", config_.video_pixel_format, "mjpeg");
     pnh_.param<int>("video/v4l2/buffer_count", config_.video_v4l2_buffer_count, 3);
-    pnh_.param<bool>("video/start_without_pair", config_.video_start_without_pair, false);
+    pnh_.param<bool>("video/skip_connect", config_.video_skip_connect, false);
 
-    pnh_.param<int>("video/converter/buffer_pool_size", config_.video_converter_buffer_pool_size, 8);
-    pnh_.param<std::string>("video/converter/compute", config_.video_converter_compute, "vic");
-    pnh_.param<std::string>("video/converter/dec_layout", config_.video_converter_dec_layout, "block");
-    pnh_.param<std::string>("video/converter/out_layout", config_.video_converter_out_layout, "pitch");
+    pnh_.param<int>("video/decoder/buffer_pool_size", config_.video_decoder_buffer_pool_size, 8);
+    pnh_.param<bool>("video/decoder/max_perf_mode", config_.video_decoder_max_perf_mode, false);
 
     pnh_.param<int>("video/encoder/bitrate", config_.video_encoder_bitrate, 40000000);
     pnh_.param<bool>("video/encoder/intra_refresh/enabled", config_.video_encoder_intra_refresh_enabled, true);
@@ -609,6 +919,8 @@ const char *MainNode::stateToString(State s)
         return "registered";
     case State::kPairing:
         return "pairing";
+    case State::kNegotiating:
+        return "negotiating";
     case State::kRunning:
         return "running";
     default:

@@ -65,13 +65,9 @@ struct Config
     std::string video_device;
     std::string video_pixel_format;
     int video_v4l2_buffer_count = 0;
-    bool video_start_without_pair = false;
-
-    int video_converter_buffer_pool_size = 0;
-    std::string video_converter_compute;
-    std::string video_converter_dec_layout;
-    std::string video_converter_out_layout;
-
+    bool video_skip_connect = false;
+    int video_decoder_buffer_pool_size = 0;
+    bool video_decoder_max_perf_mode = false;
     int video_encoder_bitrate = 0;
     bool video_encoder_intra_refresh_enabled = false;
     int video_encoder_intra_refresh_interval_slices = 0;
@@ -112,6 +108,7 @@ private:
         kConnecting,
         kRegistered,
         kPairing,
+        kNegotiating,
         kRunning
     };
 
@@ -122,14 +119,17 @@ private:
     void wireVideoPipeline();
     void tryRegister();
     void enterPairingState();
+    void enterNegotiatingState();
     void enterRunningState();
     void tryEnterPairing();
+    bool publishVideoConfigOnce();
     void setState(State next, const std::string &reason);
     static const char *stateToString(State s);
     void onSignalingEvent(const signaling::EventMessage &msg);
     void heartbeatTimerCallback(const ros::TimerEvent &event);
     void registerRetryTimerCallback(const ros::TimerEvent &event);
     void udpReadyTimerCallback(const ros::TimerEvent &event);
+    void videoConfigTimerCallback(const ros::TimerEvent &event);
 
     ros::NodeHandle nh_;
     ros::NodeHandle pnh_;
@@ -139,16 +139,22 @@ private:
     ros::Timer heartbeat_timer_;
     ros::Timer register_retry_timer_;
     ros::Timer udp_ready_timer_;
+    ros::Timer video_config_timer_;
     bool grpc_registered_ = false;
     std::atomic<State> state_{State::kConnecting};
 
     bool udp_control_ready_ = false;
 
     std::atomic<bool> paired_{false};
+    std::atomic<bool> video_config_acked_{false};
     std::atomic<bool> pairing_running_{false};
     std::thread pairing_thread_;
     std::mutex paired_mutex_;
     std::string paired_peer_session_id_;
+
+    std::mutex video_param_mutex_;
+    std::vector<uint8_t> cached_sps_;
+    std::vector<uint8_t> cached_pps_;
 
     std::unique_ptr<udp::UdpManager> udp_manager_;
     std::unique_ptr<udp::PoseUdpReceiver> pose_udp_receiver_;

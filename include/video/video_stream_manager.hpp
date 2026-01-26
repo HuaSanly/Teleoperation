@@ -10,8 +10,10 @@
 #include <thread>
 #include <vector>
 
+#include "video/video_converter.hpp"
 #include "video/video_decoder.hpp"
 #include "video/video_encoder.hpp"
+#include "video/video_recorder.hpp"
 #include "video/video_v4l2_capturer.hpp"
 
 namespace trb::video
@@ -32,9 +34,12 @@ struct VideoStreamConfig
     int v4l2_buffer_count{4};
 
     uint32_t decoder_pool_size{8};
-    std::string decoder_out_layout{"pitch"};
+    bool decoder_max_perf_mode{false};
+
+    VideoConverterConfig converter{};
 
     VideoEncoderConfig encoder{};
+    VideoRecorderConfig recorder{};
 };
 
 class VideoStreamManager
@@ -65,7 +70,9 @@ private:
     VideoStreamConfig config_{};
     VideoV4L2Capturer capturer_;
     VideoDecoder decoder_;
+    VideoConverter converter_;
     VideoEncoder encoder_;
+    VideoRecorder recorder_;
 
     std::atomic<bool> running_{false};
     std::thread capture_thread_;

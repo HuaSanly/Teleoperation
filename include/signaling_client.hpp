@@ -50,6 +50,9 @@ public:
     // 7. List Unpaired
     std::vector<signaling::UnpairedEndpoint> listUnpaired(signaling::RegisterRequest::EndpointType desired_role);
 
+    // 5. Video Config
+    int publishVideoConfig(const signaling::VideoConfig &config, signaling::VideoConfigAck &ack);
+
     // 8. Event Stream
     void startEventStream(EventCallback callback);
     void stopEventStream();
