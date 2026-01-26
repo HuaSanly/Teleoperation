@@ -13,6 +13,7 @@
 #include "udp/pose_udp_receiver.hpp"
 #include "udp/udp_manager.hpp"
 #include "udp/udp_video_sender.hpp"
+#include "video/video_stream_manager.hpp"
 
 namespace trb
 {
@@ -64,6 +65,7 @@ struct Config
     std::string video_device;
     std::string video_pixel_format;
     int video_v4l2_buffer_count = 0;
+    bool video_start_without_pair = false;
 
     int video_converter_buffer_pool_size = 0;
     std::string video_converter_compute;
@@ -116,6 +118,8 @@ private:
     void loadParams();
     void initGrpc();
     void initUdp();
+    void initVideo();
+    void wireVideoPipeline();
     void tryRegister();
     void enterPairingState();
     void enterRunningState();
@@ -149,6 +153,8 @@ private:
     std::unique_ptr<udp::UdpManager> udp_manager_;
     std::unique_ptr<udp::PoseUdpReceiver> pose_udp_receiver_;
     std::unique_ptr<udp::UdpVideoSender> udp_video_sender_;
+
+    std::unique_ptr<video::VideoStreamManager> video_stream_manager_;
 };
 
 } // namespace trb

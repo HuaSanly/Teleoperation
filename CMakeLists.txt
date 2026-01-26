@@ -135,6 +135,15 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
+set(JETSON_MMAPI_DIR "/usr/src/jetson_multimedia_api")
+set(JETSON_MMAPI_COMMON_DIR "${JETSON_MMAPI_DIR}/samples/common/classes")
+if(EXISTS "${JETSON_MMAPI_DIR}/include/NvJpegDecoder.h")
+  include_directories(
+    ${JETSON_MMAPI_DIR}/include
+    ${JETSON_MMAPI_DIR}/include/libjpeg-8b
+  )
+endif()
+
 # gRPC / Protobuf generated sources
 file(GLOB PROTO_FILES "${CMAKE_CURRENT_SOURCE_DIR}/proto/*.proto")
 if(NOT PROTO_FILES)
@@ -201,6 +210,10 @@ target_include_directories(${PROJECT_NAME}_grpc_proto PUBLIC
 add_executable(${PROJECT_NAME}
   src/main_node.cpp
   src/signaling_client.cpp
+  src/video/video_stream_manager.cpp
+  src/video/video_v4l2_capturer.cpp
+  src/video/video_decoder.cpp
+  src/video/video_encoder.cpp
   src/udp/udp_manager.cpp
   src/udp/pose_udp_receiver.cpp
   src/udp/udp_packet.cpp
@@ -208,12 +221,54 @@ add_executable(${PROJECT_NAME}
   src/udp/gf256.cpp
 )
 
+if(EXISTS "${JETSON_MMAPI_COMMON_DIR}/NvJpegDecoder.cpp")
+  target_sources(${PROJECT_NAME} PRIVATE
+    ${JETSON_MMAPI_COMMON_DIR}/NvJpegDecoder.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvBufSurface.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvBuffer.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvElement.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvElementProfiler.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvLogging.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvV4l2Element.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvV4l2ElementPlane.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvVideoEncoder.cpp
+    ${JETSON_MMAPI_COMMON_DIR}/NvUtils.cpp
+  )
+endif()
+
 target_link_libraries(${PROJECT_NAME}
   ${catkin_LIBRARIES}
   ${PROJECT_NAME}_grpc_proto
   OpenSSL::SSL
   OpenSSL::Crypto
 )
+
+set(JETSON_LIB_PATHS
+  /usr/lib/aarch64-linux-gnu
+  /usr/lib/aarch64-linux-gnu/tegra
+  /usr/lib
+)
+find_library(NVV4L2_LIB nvv4l2 PATHS ${JETSON_LIB_PATHS})
+find_library(NVBUF_SURFACE_LIB nvbufsurface PATHS ${JETSON_LIB_PATHS})
+find_library(NVBUF_TRANSFORM_LIB nvbufsurftransform PATHS ${JETSON_LIB_PATHS})
+find_library(NVJPEG_LIB nvjpeg PATHS ${JETSON_LIB_PATHS})
+find_library(V4L2_LIB v4l2 PATHS ${JETSON_LIB_PATHS})
+
+if(NVV4L2_LIB)
+  target_link_libraries(${PROJECT_NAME} ${NVV4L2_LIB})
+endif()
+if(NVBUF_SURFACE_LIB)
+  target_link_libraries(${PROJECT_NAME} ${NVBUF_SURFACE_LIB})
+endif()
+if(NVBUF_TRANSFORM_LIB)
+  target_link_libraries(${PROJECT_NAME} ${NVBUF_TRANSFORM_LIB})
+endif()
+if(NVJPEG_LIB)
+  target_link_libraries(${PROJECT_NAME} ${NVJPEG_LIB})
+endif()
+if(V4L2_LIB)
+  target_link_libraries(${PROJECT_NAME} ${V4L2_LIB})
+endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC
   ${PROTO_GENS_DIR}

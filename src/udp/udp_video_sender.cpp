@@ -1,5 +1,7 @@
 #include "udp/udp_video_sender.hpp"
 
+#include "udp/udp_manager.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>

@@ -11,6 +11,7 @@ MainNode::MainNode(ros::NodeHandle nh, ros::NodeHandle pnh)
     : nh_(std::move(nh)), pnh_(std::move(pnh)) //nh公有、pnh私有
 {
     loadParams();
+    initVideo();
     initGrpc();
     ROS_INFO("teleoperation_robot_bridge node initialized");
 
@@ -123,6 +124,78 @@ void MainNode::initUdp()
                 pose_udp_receiver_->handleDatagram(data, size);
             }
         });
+
+    wireVideoPipeline();
+}
+
+void MainNode::initVideo()
+{
+    if (video_stream_manager_)
+    {
+        return;
+    }
+
+    video::VideoStreamConfig cfg;
+    if (config_.video_profile.size() >= 3)
+    {
+        cfg.profile.width = static_cast<uint32_t>(std::max(0, config_.video_profile[0]));
+        cfg.profile.height = static_cast<uint32_t>(std::max(0, config_.video_profile[1]));
+        cfg.profile.fps = static_cast<uint32_t>(std::max(0, config_.video_profile[2]));
+    }
+    cfg.device = config_.video_device;
+    cfg.pixel_format = config_.video_pixel_format;
+    cfg.v4l2_buffer_count = config_.video_v4l2_buffer_count;
+
+    cfg.decoder_pool_size = static_cast<uint32_t>(std::max(1, config_.video_converter_buffer_pool_size));
+    cfg.decoder_out_layout = config_.video_converter_out_layout;
+
+    cfg.encoder.width = cfg.profile.width;
+    cfg.encoder.height = cfg.profile.height;
+    cfg.encoder.fps = cfg.profile.fps;
+    cfg.encoder.bitrate = static_cast<uint32_t>(std::max(0, config_.video_encoder_bitrate));
+    cfg.encoder.idr_interval = static_cast<uint32_t>(std::max(0, config_.video_encoder_idr_interval));
+    cfg.encoder.iframe_interval = static_cast<uint32_t>(std::max(0, config_.video_encoder_idr_interval_gops));
+    cfg.encoder.force_idr_every_n = static_cast<uint32_t>(std::max(0, config_.video_encoder_force_idr_every_n));
+    cfg.encoder.intra_refresh_enabled = config_.video_encoder_intra_refresh_enabled;
+    cfg.encoder.intra_refresh_interval_slices = static_cast<uint32_t>(std::max(0, config_.video_encoder_intra_refresh_interval_slices));
+    cfg.encoder.low_freq_idr_enabled = config_.video_encoder_low_freq_idr_enabled;
+    cfg.encoder.low_freq_idr_interval_sec = config_.video_encoder_low_freq_idr_interval_sec;
+    cfg.encoder.qp_range_i_min = static_cast<uint32_t>(std::max(0, config_.video_encoder_qp_range_i_min));
+    cfg.encoder.qp_range_i_max = static_cast<uint32_t>(std::max(0, config_.video_encoder_qp_range_i_max));
+    cfg.encoder.qp_range_p_min = static_cast<uint32_t>(std::max(0, config_.video_encoder_qp_range_p_min));
+    cfg.encoder.qp_range_p_max = static_cast<uint32_t>(std::max(0, config_.video_encoder_qp_range_p_max));
+    cfg.encoder.output_plane_buffers = static_cast<uint32_t>(std::max(2, config_.video_encoder_output_plane_buffers));
+    cfg.encoder.capture_plane_buffers = static_cast<uint32_t>(std::max(2, config_.video_encoder_capture_plane_buffers));
+    cfg.encoder.max_perf_mode = config_.video_encoder_max_perf_mode;
+    cfg.encoder.hw_preset = config_.video_encoder_hw_preset;
+    cfg.encoder.rate_control = config_.video_encoder_rate_control;
+    cfg.encoder.peak_bitrate = static_cast<uint32_t>(std::max(0, config_.video_encoder_peak_bitrate));
+    cfg.encoder.virtual_buffer_size = static_cast<uint32_t>(std::max(0, config_.video_encoder_virtual_buffer_size));
+    cfg.encoder.num_reference_frames = config_.video_encoder_num_reference_frames;
+    cfg.encoder.num_b_frames = config_.video_encoder_num_b_frames;
+    cfg.encoder.insert_sps_pps_at_idr = config_.video_encoder_insert_sps_pps_at_idr;
+
+    video_stream_manager_ = std::make_unique<video::VideoStreamManager>(cfg);
+    wireVideoPipeline();
+
+    ROS_INFO("Video start_without_pair = %s", config_.video_start_without_pair ? "true" : "false");
+}
+
+void MainNode::wireVideoPipeline()
+{
+    if (!video_stream_manager_ || !udp_video_sender_)
+    {
+        return;
+    }
+
+    video_stream_manager_->setEncodedFrameCallback(
+        [this](const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)
+        {
+            if (udp_video_sender_)
+            {
+                udp_video_sender_->sendH264Frame(data, size, timestamp_us, keyframe);
+            }
+        });
 }
 
 // ------------state machine------------
@@ -158,7 +231,7 @@ void MainNode::enterPairingState()
 
     setState(State::kPairing, "grpc+udp ready, waiting for pair");
 
-    if (udp_video_sender_)
+    if (udp_video_sender_ && !config_.video_start_without_pair)
     {
         udp_video_sender_->pause();
     }
@@ -202,7 +275,7 @@ void MainNode::enterRunningState()
         return;
     }
 
-    if (!paired_)
+    if (!paired_ && !config_.video_start_without_pair)
     {
         return;
     }
@@ -223,6 +296,13 @@ void MainNode::enterRunningState()
     {
         udp_video_sender_->resume();
     }
+    if (video_stream_manager_ && !video_stream_manager_->isRunning())
+    {
+        if (!video_stream_manager_->start())
+        {
+            ROS_ERROR("VideoStreamManager start failed");
+        }
+    }
     ROS_INFO("Node entered running state.");
 }
 
@@ -235,7 +315,15 @@ void MainNode::tryEnterPairing()
 
     if (grpc_registered_ && udp_control_ready_)
     {
-        enterPairingState();
+        if (config_.video_start_without_pair)
+        {
+            paired_ = true;
+            enterRunningState();
+        }
+        else
+        {
+            enterPairingState();
+        }
     }
 }
 
@@ -249,6 +337,19 @@ void MainNode::setState(State next, const std::string &reason)
     const State prev = state_.load();
     state_.store(next);
     ROS_INFO("State transition: %s -> %s (%s)", stateToString(prev), stateToString(next), reason.c_str());
+
+    if (prev == State::kRunning && next != State::kRunning)
+    {
+        if (video_stream_manager_ && video_stream_manager_->isRunning())
+        {
+            video_stream_manager_->stop();
+            ROS_INFO("VideoStreamManager stopped due to state transition");
+        }
+        if (udp_video_sender_)
+        {
+            udp_video_sender_->pause();
+        }
+    }
 }
 
 // ------------callback------------
@@ -416,6 +517,7 @@ void MainNode::loadParams()
     pnh_.param<std::string>("video/device", config_.video_device, "/dev/video0");
     pnh_.param<std::string>("video/pixel_format", config_.video_pixel_format, "mjpeg");
     pnh_.param<int>("video/v4l2/buffer_count", config_.video_v4l2_buffer_count, 3);
+    pnh_.param<bool>("video/start_without_pair", config_.video_start_without_pair, false);
 
     pnh_.param<int>("video/converter/buffer_pool_size", config_.video_converter_buffer_pool_size, 8);
     pnh_.param<std::string>("video/converter/compute", config_.video_converter_compute, "vic");
@@ -484,6 +586,12 @@ MainNode::~MainNode()
         udp_manager_.reset();
     }
     pose_udp_receiver_.reset();
+
+    if (video_stream_manager_)
+    {
+        video_stream_manager_->stop();
+        video_stream_manager_.reset();
+    }
 
     if (signaling_client_)
     {

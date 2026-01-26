@@ -48,10 +48,11 @@ pose_udp:
 
 video:
   profile: [3840, 1520, 30]
-  device: "/dev/video0"
+  device: "/dev/video2"
   pixel_format: "mjpeg"
   v4l2:
     buffer_count: 3
+  start_without_pair: true
   converter:
     buffer_pool_size: 8
     compute: "vic"
