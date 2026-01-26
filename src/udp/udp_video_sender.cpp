@@ -552,6 +552,16 @@ void UdpVideoSender::enqueueItem(QueueItem &&item)
     const size_t max_packets = config_.queue_max_packets;
     const size_t max_bytes = config_.queue_max_bytes;
 
+    if ((max_packets > 0 && queue_.size() > static_cast<size_t>(max_packets * 0.9)) ||
+        (max_bytes > 0 && queue_bytes_ > static_cast<size_t>(max_bytes * 0.9)))
+    {
+        ROS_WARN_THROTTLE(2.0, "UDP video queue high-water: packets=%zu/%zu bytes=%zu/%zu",
+                          queue_.size(),
+                          max_packets,
+                          queue_bytes_,
+                          max_bytes);
+    }
+
     while (!queue_.empty() &&
            ((max_packets > 0 && queue_.size() > max_packets) || (max_bytes > 0 && queue_bytes_ > max_bytes)))
     {
@@ -570,6 +580,7 @@ void UdpVideoSender::dropOldestFrameLocked()
     }
 
     const uint32_t drop_frame_id = queue_.front().frame_id;
+    size_t dropped_packets = 0;
     while (!queue_.empty() && queue_.front().frame_id == drop_frame_id)
     {
         QueueItem &front = queue_.front();
@@ -583,9 +594,14 @@ void UdpVideoSender::dropOldestFrameLocked()
             {
                 queue_bytes_ = 0;
             }
+            ++dropped_packets;
         }
         queue_.pop_front();
     }
+
+    ROS_WARN_THROTTLE(2.0, "UDP video drop frame=%u packets=%zu (queue full)",
+                      drop_frame_id,
+                      dropped_packets);
 }
 
 void UdpVideoSender::sendThreadMain()
