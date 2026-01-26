@@ -17,14 +17,17 @@ udp_port: 7778
 udp:
   recv_timeout_ms: 100
   max_payload_bytes: 1200
+  send_threads: 1
+  send:
+    nonblocking: false
   pacing:
     enabled: true
-    bps: 100000000
-    queue_max_packets: 1024
-    queue_max_bytes: 1048576
+    queue_max_bytes: 4194304
+    target_bps: 50000000
   fec:
     enabled: true
     table_id: 1
+    threads: 8
   handshake:
     enabled: true
     interval_sec: 1.0
@@ -52,20 +55,21 @@ video:
   pixel_format: "mjpeg"
   v4l2:
     buffer_count: 6
-  skip_connect: false  #是否跳过grpc连接检查
+  # skip_connect: false  #是否跳过grpc连接检查
+  skip_connect: true #是否跳过grpc连接检查
   decoder:
     buffer_pool_size: 10
     max_perf_mode: false
   encoder:
-    bitrate: 40000000
+    bitrate: 20000000
     intra_refresh:
       enabled: false
       interval_slices: 1
     low_freq_idr:
       enabled: false
       interval_sec: 3
-    idr_interval: 30
-    idr_interval_gops: 30
+    idr_interval: 15
+    idr_interval_gops: 15
     force_idr_every_n: 0
     qp_range_i_min: 10
     qp_range_i_max: 40
@@ -76,8 +80,8 @@ video:
     max_perf_mode: false
     hw_preset: "ultrafast"
     rate_control: "cbr"
-    peak_bitrate: 40000000
-    virtual_buffer_size: 1000000
+    peak_bitrate: 20000000
+    virtual_buffer_size: 500000
     num_reference_frames: 1
     num_b_frames: 0
     insert_sps_pps_at_idr: 1

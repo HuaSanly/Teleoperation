@@ -82,7 +82,7 @@ stateDiagram-v2
 * 退化触发（任一满足即可进入 DEGRADED）：
   * `dropped_frames` 持续增长（例如 5s 内增长 > N）
   * UDP `EAGAIN` 丢包持续发生（例如 5s 内 > 0 且趋势上升）
-  * pacing 队列长期逼近上限（`queue_max_bytes` 或 `queue_max_packets` 持续接近 100%）
+  * pacing 队列长期逼近上限（`queue_max_bytes` 持续接近 100%）
 * 恢复判定：连续 `>3s` 无明显丢帧且队列延迟回落到阈值内
 
 ### SCReAM/拥塞控制接入点（建议提前预留模块边界）
@@ -105,7 +105,7 @@ stateDiagram-v2
   * 调整 I/IDR 策略：
     * 拥塞时适当增大 I/IDR 间隔（降低峰值），或开启 intra-refresh 并保留低频 IDR
   * FEC 降级：严重拥塞时可临时关闭 FEC（例如 `udp.fec.table_id=0`），用更低冗余换取更少占用
-  * 硬性控延迟：降低 `udp.pacing.queue_max_bytes/queue_max_packets`（会增加丢帧概率，但可避免延迟堆积）
+  * 硬性控延迟：降低 `udp.pacing.queue_max_bytes`（会增加丢帧概率，但可避免延迟堆积）
 
 * Level 2（重连/重建，最后手段）
   * UDP 重连：触发 HELLO/ACK 重新握手或重建 socket（适用于对端切网/NAT 异常）
@@ -371,8 +371,6 @@ stateDiagram-v2
 * `udp.fec.table_id`：`1`，FEC 表 ID（当前仅支持 1；设为 0 禁用）
 
 * `udp.pacing.enabled`：`true`，pacing 开关
-* `udp.pacing.bps`：默认根据 `video.encoder.bitrate` 推导（含 FEC/头部开销），可手动覆盖
-* `udp.pacing.queue_max_packets`：`1024`，pacing 队列最大包数
 * `udp.pacing.queue_max_bytes`：`1048576`，pacing 队列最大字节数
 
 * `udp.send.nonblocking`：`true`，非阻塞发送（EAGAIN 时丢包并统计）

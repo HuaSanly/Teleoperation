@@ -30,6 +30,7 @@ struct UdpConfig
     double control_timeout_sec{10.0};
 
     size_t max_payload_bytes{1200};
+    bool send_nonblocking{true};
 };
 
 class UdpManager

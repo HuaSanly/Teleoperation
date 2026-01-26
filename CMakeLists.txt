@@ -221,6 +221,7 @@ add_executable(${PROJECT_NAME}
   src/udp/pose_udp_receiver.cpp
   src/udp/udp_packet.cpp
   src/udp/udp_video_sender.cpp
+  src/udp/fec_executor.cpp
   src/udp/gf256.cpp
 )
 

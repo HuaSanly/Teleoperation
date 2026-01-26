@@ -47,6 +47,13 @@ class VideoStreamManager
 public:
     using EncodedFrameCallback = std::function<void(const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)>;
 
+    struct CaptureStats
+    {
+        uint64_t captured{0};
+        uint64_t overwritten{0};
+        uint64_t encoded{0};
+    };
+
     explicit VideoStreamManager(VideoStreamConfig config);
     ~VideoStreamManager();
 
@@ -54,6 +61,8 @@ public:
     void stop();
 
     void setEncodedFrameCallback(EncodedFrameCallback cb);
+
+    CaptureStats getCaptureStats() const;
 
     bool isRunning() const;
 
@@ -81,6 +90,10 @@ private:
     std::mutex frame_mutex_;
     std::condition_variable frame_cv_;
     std::optional<Frame> latest_frame_;
+
+    std::atomic<uint64_t> captured_frames_{0};
+    std::atomic<uint64_t> overwritten_frames_{0};
+    std::atomic<uint64_t> encoded_frames_{0};
 
     EncodedFrameCallback encoded_frame_cb_;
 };

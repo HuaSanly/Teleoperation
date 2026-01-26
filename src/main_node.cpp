@@ -189,6 +189,7 @@ void MainNode::initUdp()
     cfg.control_ping_interval_sec = config_.udp_ping_interval_sec;
     cfg.control_timeout_sec = config_.udp_handshake_timeout_sec;
     cfg.max_payload_bytes = static_cast<size_t>(std::max(200, config_.udp_max_payload_bytes));
+    cfg.send_nonblocking = config_.udp_send_nonblocking;
 
     cfg.bind_ip = "0.0.0.0";
     cfg.bind_port = 0;
@@ -209,11 +210,12 @@ void MainNode::initUdp()
     udp::UdpVideoSenderConfig video_cfg;
     video_cfg.max_payload_bytes = static_cast<size_t>(std::max(200, config_.udp_max_payload_bytes));
     video_cfg.pacing_enabled = config_.udp_pacing_enabled;
-    video_cfg.pacing_bps = static_cast<uint64_t>(std::max(0, config_.udp_pacing_bps));
-    video_cfg.queue_max_packets = static_cast<size_t>(std::max(0, config_.udp_pacing_queue_max_packets));
     video_cfg.queue_max_bytes = static_cast<size_t>(std::max(0, config_.udp_pacing_queue_max_bytes));
+    video_cfg.pacing_target_bps = std::max(0, config_.udp_pacing_target_bps);
     video_cfg.fec_enabled = config_.udp_fec_enabled;
     video_cfg.fec_table_id = static_cast<uint8_t>(config_.udp_fec_table_id & 0xFF);
+    video_cfg.fec_threads = config_.udp_fec_threads;
+    video_cfg.send_threads = config_.udp_send_threads;
 
     udp_video_sender_ = std::make_unique<udp::UdpVideoSender>(video_cfg);
     udp_video_sender_->start(udp_manager_.get());
@@ -489,6 +491,14 @@ void MainNode::enterNegotiatingState()
         ros::Duration(2.0),
         &MainNode::videoConfigTimerCallback,
         this);
+
+    if (!video_stats_timer_.hasStarted())
+    {
+        video_stats_timer_ = nh_.createTimer(
+            ros::Duration(1.0),
+            &MainNode::videoStatsTimerCallback,
+            this);
+    }
 }
 
 void MainNode::enterRunningState()
@@ -520,6 +530,14 @@ void MainNode::enterRunningState()
         heartbeat_timer_ = nh_.createTimer(
             ros::Duration(config_.grpc_heartbeat_sec),
             &MainNode::heartbeatTimerCallback,
+            this);
+    }
+
+    if (!video_stats_timer_.hasStarted())
+    {
+        video_stats_timer_ = nh_.createTimer(
+            ros::Duration(1.0),
+            &MainNode::videoStatsTimerCallback,
             this);
     }
 
@@ -780,6 +798,42 @@ void MainNode::videoConfigTimerCallback(const ros::TimerEvent &event)
 
     ROS_WARN_THROTTLE(2.0, "Video config not acknowledged yet; waiting for ACK...");
 }
+
+void MainNode::videoStatsTimerCallback(const ros::TimerEvent &event)
+{
+    (void)event;
+
+    uint64_t captured = 0;
+    uint64_t overwritten = 0;
+    uint64_t encoded = 0;
+    uint64_t dropped = 0;
+    uint64_t sent = 0;
+    uint64_t sent_packets = 0;
+
+    if (video_stream_manager_)
+    {
+        const auto stats = video_stream_manager_->getCaptureStats();
+        captured = stats.captured;
+        overwritten = stats.overwritten;
+        encoded = stats.encoded;
+    }
+
+    if (udp_video_sender_)
+    {
+        const auto stats = udp_video_sender_->getSendStats();
+        dropped = stats.dropped_frames;
+        sent = stats.sent_frames;
+        sent_packets = stats.sent_packets;
+    }
+
+    ROS_INFO("Video stats total: captured=%lu overwritten=%lu encoded=%lu dropped=%lu sent=%lu packets=%lu",
+             static_cast<unsigned long>(captured),
+             static_cast<unsigned long>(overwritten),
+             static_cast<unsigned long>(encoded),
+             static_cast<unsigned long>(dropped),
+             static_cast<unsigned long>(sent),
+             static_cast<unsigned long>(sent_packets));
+}
 void MainNode::loadParams()
 {
     // Signaling
@@ -796,17 +850,19 @@ void MainNode::loadParams()
     pnh_.param<int>("udp_port", config_.udp_port, 7778);
     pnh_.param<int>("udp/recv_timeout_ms", config_.udp_recv_timeout_ms, 100);
     pnh_.param<bool>("udp/pacing/enabled", config_.udp_pacing_enabled, true);
-    pnh_.param<int>("udp/pacing/bps", config_.udp_pacing_bps, 30000000);
-    pnh_.param<int>("udp/pacing/queue_max_packets", config_.udp_pacing_queue_max_packets, 1024);
     pnh_.param<int>("udp/pacing/queue_max_bytes", config_.udp_pacing_queue_max_bytes, 300000);
+    pnh_.param<int>("udp/pacing/target_bps", config_.udp_pacing_target_bps, 0);
     pnh_.param<bool>("udp/handshake/enabled", config_.udp_handshake_enabled, true);
     pnh_.param<double>("udp/handshake/interval_sec", config_.udp_handshake_interval_sec, 1.0);
     pnh_.param<double>("udp/handshake/ping_interval_sec", config_.udp_ping_interval_sec, 5.0);
     pnh_.param<double>("udp/handshake/timeout_sec", config_.udp_handshake_timeout_sec, 10.0);
     pnh_.param<int>("udp/max_payload_bytes", config_.udp_max_payload_bytes, 1200);
+    pnh_.param<bool>("udp/send/nonblocking", config_.udp_send_nonblocking, true);
 
     pnh_.param<bool>("udp/fec/enabled", config_.udp_fec_enabled, true);
     pnh_.param<int>("udp/fec/table_id", config_.udp_fec_table_id, 1);
+    pnh_.param<int>("udp/fec/threads", config_.udp_fec_threads, 0);
+    pnh_.param<int>("udp/send_threads", config_.udp_send_threads, 1);
 
     // Pose UDP
     pnh_.param<bool>("pose_udp/enabled", config_.pose_udp_enabled, false);
@@ -877,6 +933,10 @@ MainNode::~MainNode()
     if (udp_ready_timer_.hasStarted())
     {
         udp_ready_timer_.stop();
+    }
+    if (video_stats_timer_.hasStarted())
+    {
+        video_stats_timer_.stop();
     }
 
     pairing_running_ = false;

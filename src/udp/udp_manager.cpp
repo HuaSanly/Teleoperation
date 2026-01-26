@@ -60,6 +60,21 @@ bool UdpManager::start()
     int reuse = 1;
     ::setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+    int sndbuf = 64 * 1024 * 1024;
+    if (::setsockopt(sockfd_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0)
+    {
+        ROS_WARN("UdpManager: setsockopt(SO_SNDBUF) failed: %s", std::strerror(errno));
+    }
+    else
+    {
+        int actual = 0;
+        socklen_t len = sizeof(actual);
+        if (::getsockopt(sockfd_, SOL_SOCKET, SO_SNDBUF, &actual, &len) == 0)
+        {
+            ROS_INFO("UdpManager: SO_SNDBUF set to %d bytes", actual);
+        }
+    }
+
     if (config_.recv_timeout_ms > 0)
     {
         timeval tv;
@@ -153,7 +168,17 @@ bool UdpManager::sendToRemote(const uint8_t *data, size_t size)
         return false;
     }
 
-    const ssize_t sent = ::sendto(sockfd_, data, size, 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+    const int flags = config_.send_nonblocking ? MSG_DONTWAIT : 0;
+    const ssize_t sent = ::sendto(sockfd_, data, size, flags, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+    if (sent < 0)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            return false;
+        }
+        ROS_WARN_THROTTLE(2.0, "UdpManager: sendto failed: %s", std::strerror(errno));
+        return false;
+    }
     return sent == static_cast<ssize_t>(size);
 }
 

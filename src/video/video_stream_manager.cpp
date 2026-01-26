@@ -157,6 +157,15 @@ void VideoStreamManager::setEncodedFrameCallback(EncodedFrameCallback cb)
     encoded_frame_cb_ = std::move(cb);
 }
 
+VideoStreamManager::CaptureStats VideoStreamManager::getCaptureStats() const
+{
+    CaptureStats stats;
+    stats.captured = captured_frames_.load(std::memory_order_relaxed);
+    stats.overwritten = overwritten_frames_.load(std::memory_order_relaxed);
+    stats.encoded = encoded_frames_.load(std::memory_order_relaxed);
+    return stats;
+}
+
 bool VideoStreamManager::isRunning() const
 {
     return running_.load();
@@ -164,7 +173,6 @@ bool VideoStreamManager::isRunning() const
 
 void VideoStreamManager::captureThreadMain()
 {
-    uint64_t dropped_frames = 0;
     while (running_.load())
     {
         V4L2Frame frame;
@@ -183,28 +191,34 @@ void VideoStreamManager::captureThreadMain()
         out.data.assign(frame.data, frame.data + frame.bytes_used);
         out.timestamp_us = frame.timestamp_us;
 
+        constexpr uint64_t kStatsModulo = 1000000000ULL;
+        const uint64_t cap = captured_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (cap >= kStatsModulo)
+        {
+            captured_frames_.store(cap % kStatsModulo, std::memory_order_relaxed);
+        }
+
         capturer_.requeue(frame.index);
 
         {
             std::lock_guard<std::mutex> lk(frame_mutex_);
             if (latest_frame_.has_value())
             {
-                ++dropped_frames;
+                const uint64_t over = overwritten_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (over >= kStatsModulo)
+                {
+                    overwritten_frames_.store(over % kStatsModulo, std::memory_order_relaxed);
+                }
             }
             latest_frame_ = std::move(out);
         }
         frame_cv_.notify_one();
-
-        if (dropped_frames > 0)
-        {
-            ROS_WARN_THROTTLE(2.0, "Video capture drop: pending frame overwritten (dropped=%lu)",
-                              static_cast<unsigned long>(dropped_frames));
-        }
     }
 }
 
 void VideoStreamManager::pipelineThreadMain()
 {
+    constexpr uint64_t kStatsModulo = 1000000000ULL;
     uint64_t attempt_counter = 0;
     uint64_t decode_ok = 0;
     uint64_t encode_ok = 0;
@@ -320,6 +334,11 @@ void VideoStreamManager::pipelineThreadMain()
         }
 
         ++encode_ok;
+        const uint64_t enc = encoded_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (enc >= kStatsModulo)
+        {
+            encoded_frames_.store(enc % kStatsModulo, std::memory_order_relaxed);
+        }
         decode_total_ms += decode_ms;
         encode_total_ms += encode_ms;
         if (encoded.keyframe)
