@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <iostream>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -10,7 +11,12 @@ namespace trb::udp
 {
 
     UdpSocket::UdpSocket(const std::string &dest_ip, int dest_port)
-        : dest_ip_(dest_ip), dest_port_(dest_port), sockfd_(-1)
+        : UdpSocket(dest_ip, dest_port, "", 0)
+    {
+    }
+
+    UdpSocket::UdpSocket(const std::string &dest_ip, int dest_port, const std::string &bind_ip, int bind_port)
+        : dest_ip_(dest_ip), dest_port_(dest_port), bind_ip_(bind_ip), bind_port_(bind_port), sockfd_(-1)
     {
         std::memset(&dest_addr_, 0, sizeof(dest_addr_));
     }
@@ -34,15 +40,33 @@ namespace trb::udp
             return false;
         }
 
-        std::memset(&dest_addr_, 0, sizeof(dest_addr_));
-        dest_addr_.sin_family = AF_INET;
-        dest_addr_.sin_port = htons(dest_port_);
-        if (inet_pton(AF_INET, dest_ip_.c_str(), &dest_addr_.sin_addr) <= 0)
+        if (!bind_ip_.empty() || bind_port_ > 0)
         {
-            std::cerr << "Invalid UDP dest address" << std::endl;
-            close();
-            return false;
+            sockaddr_in bind_addr;
+            std::memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_port = htons(static_cast<uint16_t>(bind_port_));
+            if (bind_ip_.empty())
+            {
+                bind_addr.sin_addr.s_addr = INADDR_ANY;
+            }
+            else if (inet_pton(AF_INET, bind_ip_.c_str(), &bind_addr.sin_addr) <= 0)
+            {
+                std::cerr << "Invalid UDP bind address" << std::endl;
+                close();
+                return false;
+            }
+
+            if (::bind(sockfd_, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
+            {
+                std::cerr << "Failed to bind UDP socket" << std::endl;
+                close();
+                return false;
+            }
         }
+
+        resetRemote();
+        setRecvTimeoutMs(recv_timeout_ms_);
 
         return true;
     }
@@ -54,6 +78,13 @@ namespace trb::udp
             ::close(sockfd_);
             sockfd_ = -1;
         }
+    }
+
+    void UdpSocket::setRemote(const std::string &dest_ip, int dest_port)
+    {
+        dest_ip_ = dest_ip;
+        dest_port_ = dest_port;
+        resetRemote();
     }
 
     void UdpSocket::setSendNonBlocking(bool enabled)
@@ -70,6 +101,48 @@ namespace trb::udp
         ::setsockopt(sockfd_, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
     }
 
+    int UdpSocket::sendBufferBytes() const
+    {
+        if (sockfd_ < 0)
+        {
+            return -1;
+        }
+        int bytes = 0;
+        socklen_t len = sizeof(bytes);
+        if (::getsockopt(sockfd_, SOL_SOCKET, SO_SNDBUF, &bytes, &len) < 0)
+        {
+            return -1;
+        }
+        return bytes;
+    }
+
+    void UdpSocket::setRecvTimeoutMs(int timeout_ms)
+    {
+        recv_timeout_ms_ = timeout_ms;
+        if (sockfd_ < 0)
+        {
+            return;
+        }
+        timeval tv;
+        tv.tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 0;
+        tv.tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0;
+        ::setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&tv), sizeof(tv));
+    }
+
+    bool UdpSocket::waitWritable(int timeout_ms) const
+    {
+        if (sockfd_ < 0)
+        {
+            return false;
+        }
+
+        pollfd poll_fd{};
+        poll_fd.fd = sockfd_;
+        poll_fd.events = POLLOUT;
+        const int rc = ::poll(&poll_fd, 1, timeout_ms);
+        return rc > 0 && (poll_fd.revents & POLLOUT) != 0;
+    }
+
     int UdpSocket::send(const void *data, size_t size)
     {
         if (sockfd_ < 0)
@@ -79,22 +152,38 @@ namespace trb::udp
         return ::sendto(sockfd_, data, size, flags, reinterpret_cast<sockaddr *>(&dest_addr_), sizeof(dest_addr_));
     }
 
-    int UdpSocket::receive(void *buffer, size_t size, int timeout_ms)
+    int UdpSocket::receive(void *buffer, size_t size)
     {
         if (sockfd_ < 0)
             return -1;
 
-        if (timeout_ms > 0)
-        {
-            timeval tv;
-            tv.tv_sec = timeout_ms / 1000;
-            tv.tv_usec = (timeout_ms % 1000) * 1000;
-            ::setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&tv), sizeof(tv));
-        }
-
         sockaddr_in src_addr;
         socklen_t addr_len = sizeof(src_addr);
         return ::recvfrom(sockfd_, buffer, size, 0, reinterpret_cast<sockaddr *>(&src_addr), &addr_len);
+    }
+
+    int UdpSocket::receive(void *buffer, size_t size, int timeout_ms)
+    {
+        setRecvTimeoutMs(timeout_ms);
+        return receive(buffer, size);
+    }
+
+    void UdpSocket::resetRemote()
+    {
+        std::memset(&dest_addr_, 0, sizeof(dest_addr_));
+        dest_addr_.sin_family = AF_INET;
+        dest_addr_.sin_port = htons(static_cast<uint16_t>(dest_port_));
+        if (!dest_ip_.empty())
+        {
+            if (inet_pton(AF_INET, dest_ip_.c_str(), &dest_addr_.sin_addr) <= 0)
+            {
+                dest_addr_.sin_addr.s_addr = INADDR_ANY;
+            }
+        }
+        else
+        {
+            dest_addr_.sin_addr.s_addr = INADDR_ANY;
+        }
     }
 
 } // namespace trb::udp

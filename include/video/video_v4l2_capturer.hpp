@@ -46,6 +46,7 @@ namespace trb::video
 
         // Start/stop V4L2 streaming. No internal thread is created.
         bool start();
+        void interrupt();
         void stop();
 
         bool isRunning() const;

@@ -59,6 +59,20 @@ namespace trb::video
         return true;
     }
 
+    void VideoV4L2Capturer::interrupt()
+    {
+        if (!running_)
+        {
+            return;
+        }
+
+        running_ = false;
+
+        // STREAMOFF breaks poll/DQBUF quickly but keeps the mapped buffers
+        // alive until the owner thread has finished consuming the last frame.
+        streamOff();
+    }
+
     void VideoV4L2Capturer::stop()
     {
         if (!running_)
@@ -67,11 +81,7 @@ namespace trb::video
             return;
         }
 
-        running_ = false;
-
-        // STREAMOFF can break poll/DQBUF quickly
-        streamOff();
-
+        interrupt();
         closeDevice();
     }
 
@@ -115,7 +125,7 @@ namespace trb::video
     {
         struct pollfd fds[1];
         fds[0].fd = cam_fd_;
-        fds[0].events = POLLIN;
+        fds[0].events = POLLIN | POLLPRI | POLLERR;
         fds[0].revents = 0;
 
         const int pr = poll(fds, 1, timeout_ms);
@@ -130,7 +140,16 @@ namespace trb::video
         if (pr == 0)
             return false;
 
-        return (fds[0].revents & POLLIN) != 0;
+        if (!running_.load())
+            return false;
+
+        if ((fds[0].revents & (POLLERR | POLLPRI)) != 0 && (fds[0].revents & POLLIN) == 0)
+        {
+            std::cerr << "poll returned non-POLLIN revents=0x" << std::hex << fds[0].revents << std::dec
+                      << "; attempting DQBUF anyway" << std::endl;
+        }
+
+        return (fds[0].revents & (POLLIN | POLLPRI | POLLERR)) != 0;
     }
 
     bool VideoV4L2Capturer::dequeue(Frame &frame, int timeout_ms)
@@ -234,6 +253,11 @@ namespace trb::video
         actual_width_ = fmt.fmt.pix.width;
         actual_height_ = fmt.fmt.pix.height;
         actual_pixel_format_ = fmt.fmt.pix.pixelformat;
+
+        std::cerr << "VideoV4L2Capturer negotiated format: "
+              << actual_width_ << "x" << actual_height_
+              << " pixfmt=0x" << std::hex << actual_pixel_format_ << std::dec
+              << std::endl;
 
         // best-effort set framerate
         if (config_.framerate != 0)

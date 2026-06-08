@@ -1,4 +1,6 @@
 /logs/
+/h264/
+/urdf/
 # Prerequisites
 *.d
 
@@ -40,3 +42,5 @@
 
 # debug information files
 *.dwo
+
+h264/output.h264

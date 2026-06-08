@@ -8,11 +8,10 @@
 
 #include "rclcpp/rclcpp.hpp"
 
+#include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "geometry_msgs/msg/vector3_stamped.hpp"
+#include "std_msgs/msg/u_int32.hpp"
 #include "sensor_msgs/msg/joy.hpp"
-#include "std_msgs/msg/bool.hpp"
-#include "std_msgs/msg/float32.hpp"
 
 namespace trb::udp
 {
@@ -28,9 +27,12 @@ namespace trb::udp
         int recv_timeout_ms{100};
         int qos_depth{10};
 
+        std::string frame_id_waist{"vr_waist"};
         std::string frame_id_hmd{"vr_hmd"};
         std::string frame_id_left_controller{"vr_left_controller"};
         std::string frame_id_right_controller{"vr_right_controller"};
+        std::string frame_id_left_foot{"vr_left_foot"};
+        std::string frame_id_right_foot{"vr_right_foot"};
         std::string frame_id_left_aim{"vr_left_aim"};
         std::string frame_id_right_aim{"vr_right_aim"};
 
@@ -72,21 +74,11 @@ namespace trb::udp
         rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_left_controller_;
         rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_right_controller_;
 
-        rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_hmd_euler_;
-        rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_left_controller_euler_;
-        rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_right_controller_euler_;
+        rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_joint24_;
+        rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr pub_joint24_valid_mask_;
 
         rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr pub_left_joy_;
         rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr pub_right_joy_;
-
-        rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_left_aim_;
-        rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_right_aim_;
-        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_left_aim_valid_;
-        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_right_aim_valid_;
-        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_left_pinch_;
-        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_right_pinch_;
-        rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_left_pinch_strength_;
-        rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_right_pinch_strength_;
     };
 
 } // namespace trb::udp

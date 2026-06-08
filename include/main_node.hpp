@@ -1,32 +1,31 @@
 #ifndef MAIN_NODE_H
 #define MAIN_NODE_H
 
-/*
-    __________      ___.               _____                   __
-    \______   \ ____\_ |__   ____     /     \ _____    _______/  |_  ___________
-     |       _//  _ \| __ \ /  _ \   /  \ /  \\__  \  /  ___/\   __\/ __ \_  __ \
-     |    |   (  <_> ) \_\ (  <_> ) /    Y    \/ __ \_\___ \  |  | \  ___/|  | \/
-     |____|_  /\____/|___  /\____/  \____|__  (____  /____  > |__|  \___  >__|
-              \/           \/                 \/     \/     \/            \/
-*/
-
 #include <atomic>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <iostream>
-#include <memory>
-#include <string>
-
+#include <chrono>
 #include <cstddef>
-#include <unordered_map>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
-#include "signaling_client.hpp"
-#include "video/video_stream_manager.hpp"
-#include "udp/udp_stream_manager.hpp"
-#include "udp/pose_udp_receiver.hpp"
+
+#include "teleop_robot_bridge/msg/agv_battery_state.hpp"
+#include "teleop_robot_bridge/msg/agv_device_state.hpp"
+#include "teleop_robot_bridge/msg/arm_joint_feedback.hpp"
+#include "teleop_robot_bridge/msg/temperature.hpp"
+#include "teleop_robot_bridge/msg/waist_joint_feedback.hpp"
+
+#include "audio/audio_module.hpp"
+#include "grpc/grpc_module.hpp"
+#include "telemetry/robot_telemetry_types.hpp"
+#include "udp/udp_module.hpp"
+#include "video/video_module.hpp"
 
 namespace trb
 {
@@ -35,69 +34,155 @@ namespace trb
     public:
         MainNode();
         ~MainNode();
-        void initGrpc();
-        void initVideo();
-        void initUdp();
-        void initPoseUdp();
 
     private:
-        // methods
-        // handle
-        void heartbeatTimerCallback();
-        void onSignalingEvent(const signaling::EventMessage &msg);
+        enum class State
+        {
+            kConnecting = 0,
+            kRegistered = 1,
+            kPairing = 2,
+            kNegotiating = 3,
+            kRunning = 4,
+        };
 
-        void startVideoConfigPublisher();
-        void stopVideoConfigPublisher();
-        void videoConfigPublisherLoop();
-        void updateSpsPpsFromEncodedFrame(const uint8_t *data, size_t size);
-        void resetVideoConfigState();
-        std::string makeVideoConfigId();
-        bool reRegisterAndWaitForPairing();
-
+        void configureLogging();
+        void loadPairingParams();
+        void loadRobotTelemetryParams();
+        void enterDirectRunningMode();
+        void enterPairingState();
+        void startVideoAndNegotiate();
         void stopVideo();
+        void startRobotTelemetry();
+        void stopRobotTelemetry();
+        void updateRobotTelemetryLifecycle();
+        bool isRobotTelemetryOnline() const;
+        void telemetryTimerCallback();
+        void jointTelemetryTimerCallback();
+        void publishRobotTelemetrySnapshot();
+        void publishRobotJointTelemetrySnapshot();
+        void onTelemetryBatteryState(const teleop_robot_bridge::msg::AgvBatteryState::SharedPtr msg);
+        void onTelemetryTemperature(const teleop_robot_bridge::msg::Temperature::SharedPtr msg);
+        void onTelemetryDeviceState(const teleop_robot_bridge::msg::AgvDeviceState::SharedPtr msg);
+        void onWaistJointFeedback(const teleop_robot_bridge::msg::WaistJointFeedback::SharedPtr msg);
+        void onArmJointFeedback(const teleop_robot_bridge::msg::ArmJointFeedback::SharedPtr msg);
+        void teardownActiveSession(const std::string &reason, State target_state);
+        void postSessionWork(std::function<void()> work, const char *label);
+        void drainSessionWork();
 
-        // members
-        // grpc
-        bool subscribe_vr_pose_flag_ = false;
-        bool pair_auto_accept_ = true;
-        bool pair_auto_request_ = true;
-        bool pair_list_unpaired_on_start_ = false;
+        void onGrpcRegistered();
+        void onGrpcHeartbeatFail();
+        void onGrpcStreamEnd();
+        void onUdpHandshakeReady();
+        void onUdpPeerLost();
+        void handleUdpPeerLost();
+        void onSignalingEvent(const signaling::EventMessage &msg);
+        void handleSignalingEvent(const signaling::EventMessage &msg);
+        void handleRemoteAudioConfig(const signaling::AudioConfig &config);
+        bool validateRemoteAudioConfig(const signaling::AudioConfig &config,
+                       trb::audio::AudioModule::Config &remote_config,
+                       std::string &message) const;
+        bool wantsRemoteAudio() const;
+        void onEncodedVideoFrame(const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe);
+        void onEncodedAudioPacket(const uint8_t *data, size_t size, uint64_t timestamp_ntp);
+        void onSpsPpsCaptured(const std::vector<uint8_t> &sps,
+                      const std::vector<uint8_t> &pps,
+                      const std::vector<uint8_t> &vps);
+        void requestVideoKeyframeRecovery(const char *reason, std::chrono::steady_clock::time_point now);
+
+        void negotiationRetryTimerCallback();
+        void pairingRetryTimerCallback();
+        void videoStatsTimerCallback();
+        void ensureNegotiationRetryTimer();
+        void stopNegotiationRetryTimer();
+        void ensurePairingRetryTimer();
+        void stopPairingRetryTimer();
+        bool tryActivePairing();
+
+        bool publishVideoConfig();
+        bool publishAudioConfig();
+        void tryAdvanceNegotiation();
+        void resetVideoConfigState();
+        void loadFovTable();
+
+        void setState(State next, const std::string &reason);
+        static const char *stateToString(State state);
+
+        std::unique_ptr<GrpcModule> grpc_module_;
+        std::unique_ptr<trb::audio::AudioModule> audio_module_;
+        std::unique_ptr<trb::udp::UdpModule> udp_module_;
+        std::unique_ptr<trb::video::VideoModule> video_module_;
+
+        rclcpp::TimerBase::SharedPtr negotiation_retry_timer_;
+        rclcpp::TimerBase::SharedPtr pairing_retry_timer_;
+        rclcpp::TimerBase::SharedPtr session_work_timer_;
+        rclcpp::TimerBase::SharedPtr video_stats_timer_;
+        rclcpp::TimerBase::SharedPtr telemetry_timer_;
+        rclcpp::TimerBase::SharedPtr joint_telemetry_timer_;
+        rclcpp::Subscription<teleop_robot_bridge::msg::AgvBatteryState>::SharedPtr telemetry_battery_sub_;
+        rclcpp::Subscription<teleop_robot_bridge::msg::Temperature>::SharedPtr telemetry_temperature_sub_;
+        rclcpp::Subscription<teleop_robot_bridge::msg::AgvDeviceState>::SharedPtr telemetry_device_state_sub_;
+        rclcpp::Subscription<teleop_robot_bridge::msg::WaistJointFeedback>::SharedPtr waist_joint_feedback_sub_;
+        rclcpp::Subscription<teleop_robot_bridge::msg::ArmJointFeedback>::SharedPtr arm_joint_feedback_sub_;
+        std::chrono::steady_clock::time_point last_video_stats_time_;
+        std::chrono::steady_clock::time_point video_start_time_{};
+        std::chrono::steady_clock::time_point last_video_keyframe_request_time_{};
+
+        std::atomic<State> state_{State::kConnecting};
+        std::atomic<bool> shutting_down_{false};
+        std::atomic<bool> session_teardown_in_progress_{false};
+        bool direct_running_mode_{false};
+
+        std::mutex session_work_mutex_;
+        std::deque<std::function<void()>> session_work_queue_;
+
+        bool subscribe_vr_pose_flag_{false};
+        bool pair_auto_accept_{true};
+        bool pair_auto_request_{true};
+        bool pair_list_unpaired_on_start_{false};
         std::string desired_peer_session_id_;
         std::string paired_peer_session_id_;
-        std::string pair_mode_ = "passive"; // active | passive
+        std::string paired_vr_version_;
+        std::string pair_mode_{"passive"};
 
-        std::mutex pair_mutex_;
-        std::condition_variable pair_cv_;
-        bool paired_ready_ = false;
-        std::atomic<bool> shutting_down_{false};
-
-        std::shared_ptr<SignalingClient> signaling_client_;
-        std::unique_ptr<trb::video::VideoStreamManager> video_stream_manager_;
-        std::unique_ptr<trb::udp::UdpStreamManager> udp_stream_manager_;
-        std::unique_ptr<trb::udp::PoseUdpReceiver> pose_udp_receiver_;
-
-        rclcpp::TimerBase::SharedPtr heartbeat_timer_;
-
-        // video config publish state
-        uint32_t video_width_ = 0;
-        uint32_t video_height_ = 0;
-        uint32_t video_fps_ = 0;
-        std::vector<uint8_t> video_sps_;
-        std::vector<uint8_t> video_pps_;
-        std::vector<uint8_t> video_vps_;
-        std::atomic<uint64_t> video_config_seq_{0};
-        std::string last_video_config_id_;
         std::mutex video_config_mutex_;
-        std::condition_variable video_config_cv_;
-        std::atomic<bool> video_config_running_{false};
-        std::atomic<bool> video_config_acked_{false};
-        std::atomic<bool> reconnecting_{false};
-        std::thread video_config_thread_;
+        bool video_config_sent_{false};
+        bool video_started_{false};
 
-        // helpers
-        bool selfCheckCamera();
-        bool runActivePairing();
-        bool waitForPairing();
+        struct FovEntry
+        {
+            uint32_t width{0};
+            uint32_t height{0};
+            float hfov{0.0f};
+            float vfov{0.0f};
+            float dfov{0.0f};
+        };
+        std::vector<FovEntry> fov_table_;
+
+        struct RobotTelemetryConfig
+        {
+            bool enabled{false};
+            double period_sec{1.0};
+            telemetry::RobotTelemetrySnapshot snapshot;
+        };
+
+        struct RobotJointTelemetryConfig
+        {
+            bool enabled{false};
+            double period_sec{0.02};
+            std::string waist_topic{"/waist_joint_feedback"};
+            std::string arm_topic{"/arm_joint_feedback"};
+            telemetry::RobotJointTelemetrySnapshot snapshot;
+        };
+
+        std::mutex telemetry_snapshot_mutex_;
+        RobotTelemetryConfig telemetry_config_;
+        std::mutex joint_telemetry_snapshot_mutex_;
+        RobotJointTelemetryConfig joint_telemetry_config_;
+        std::atomic<bool> telemetry_active_{false};
+        std::atomic<bool> joint_telemetry_active_{false};
+
+        std::atomic<uint64_t> dropped_video_before_running_{0};
     };
 } // namespace trb
+
 #endif // MAIN_NODE_H

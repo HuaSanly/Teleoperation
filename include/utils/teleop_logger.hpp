@@ -43,7 +43,8 @@ namespace trb::utils
                            uint16_t total_frags,
                            uint16_t payload_len,
                            uint32_t frame_len,
-                           uint8_t fec_table_id);
+                           uint8_t fec_table_id,
+                           uint8_t keyframe_flag);
 
         void udpIFrame(uint32_t frame_id,
                        size_t enc_bytes,

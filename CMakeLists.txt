@@ -6,15 +6,36 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(yaml-cpp REQUIRED)
+find_package(PkgConfig QUIET)
 
-# gRPC / Protobuf (for signaling_client.hpp)
+set(TRB_AUDIO_GSTREAMER_ENABLED FALSE)
+if(PkgConfig_FOUND)
+  pkg_check_modules(GSTREAMER_AUDIO QUIET IMPORTED_TARGET
+    gstreamer-1.0
+    gstreamer-app-1.0
+  )
+  if(TARGET PkgConfig::GSTREAMER_AUDIO)
+    set(TRB_AUDIO_GSTREAMER_ENABLED TRUE)
+    message(STATUS "Found GStreamer audio development packages")
+  else()
+    message(WARNING "GStreamer audio development packages not found; teleop_robot_bridge audio module will build in stub mode.")
+  endif()
+else()
+  message(WARNING "PkgConfig not found; teleop_robot_bridge audio module will build in stub mode.")
+endif()
+
+# gRPC / Protobuf
 find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
@@ -98,9 +119,30 @@ ament_target_dependencies(video_converter
 # Jetson Multimedia API (MJPEG hardware decode + NV12 NVMM)
 set(JETSON_MM_API_PATH "/usr/src/jetson_multimedia_api")
 set(JETSON_COMMON_DIR "${JETSON_MM_API_PATH}/samples/common")
+set(JETSON_LIBRARY_DIRS
+  /usr/lib/aarch64-linux-gnu/nvidia
+  /usr/lib/aarch64-linux-gnu/tegra
+)
+set(VIDEO_ADVANCED_SOURCES "")
+set(VIDEO_ADVANCED_INCLUDE_DIRS "")
+set(VIDEO_ADVANCED_LIBS "")
 
 if(EXISTS "${JETSON_MM_API_PATH}")
   message(STATUS "Found Jetson Multimedia API at ${JETSON_MM_API_PATH}")
+
+  find_path(JETSON_JPEG_INCLUDE_DIR
+    NAMES jpeglib.h
+    PATHS
+      "${JETSON_MM_API_PATH}/include/libjpeg-9f"
+      "${JETSON_MM_API_PATH}/include/libjpeg-8b"
+    NO_DEFAULT_PATH
+  )
+  if(NOT JETSON_JPEG_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "Jetson Multimedia API JPEG headers not found. Expected jpeglib.h under "
+      "${JETSON_MM_API_PATH}/include/libjpeg-9f or ${JETSON_MM_API_PATH}/include/libjpeg-8b")
+  endif()
+  message(STATUS "Using Jetson JPEG headers: ${JETSON_JPEG_INCLUDE_DIR}")
 
   # Jetson Multimedia API sources are third-party; keep our code strict, but
   # silence known noisy warnings from upstream headers/samples.
@@ -131,15 +173,36 @@ if(EXISTS "${JETSON_MM_API_PATH}")
 
   target_include_directories(video_converter PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    ${JETSON_MM_API_PATH}/include/libjpeg-8b
+    ${JETSON_JPEG_INCLUDE_DIR}
     ${JETSON_MM_API_PATH}/include
     ${JETSON_COMMON_DIR}/classes
   )
 
-  link_directories(
-    "/usr/lib/aarch64-linux-gnu/nvidia"
-    "/usr/lib/aarch64-linux-gnu/tegra"
+  find_library(JETSON_NVV4L2_LIBRARY
+    NAMES nvv4l2
+    PATHS ${JETSON_LIBRARY_DIRS}
   )
+  find_library(JETSON_NVBUFSURFACE_LIBRARY
+    NAMES nvbufsurface
+    PATHS ${JETSON_LIBRARY_DIRS}
+  )
+  find_library(JETSON_NVBUFSURFTRANSFORM_LIBRARY
+    NAMES nvbufsurftransform
+    PATHS ${JETSON_LIBRARY_DIRS}
+  )
+  find_library(JETSON_NVMM_JPEG_LIBRARY
+    NAMES nvmm_jpeg
+    PATHS ${JETSON_LIBRARY_DIRS}
+  )
+
+  if(NOT JETSON_NVV4L2_LIBRARY OR
+     NOT JETSON_NVBUFSURFACE_LIBRARY OR
+     NOT JETSON_NVBUFSURFTRANSFORM_LIBRARY OR
+     NOT JETSON_NVMM_JPEG_LIBRARY)
+    message(FATAL_ERROR
+      "Jetson multimedia libraries not found in configured search paths. "
+      "Expected nvv4l2, nvbufsurface, nvbufsurftransform, nvmm_jpeg under: ${JETSON_LIBRARY_DIRS}")
+  endif()
 
   target_sources(video_converter PRIVATE
     "${JETSON_COMMON_DIR}/classes/NvJpegDecoder.cpp"
@@ -156,10 +219,10 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   target_link_libraries(video_converter
     Threads::Threads
     v4l2
-    nvv4l2
-    nvbufsurface
-    nvbufsurftransform
-    nvmm_jpeg
+    ${JETSON_NVV4L2_LIBRARY}
+    ${JETSON_NVBUFSURFACE_LIBRARY}
+    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
+    ${JETSON_NVMM_JPEG_LIBRARY}
   )
 
   # Video Encoder (H.264 hardware encode)
@@ -190,7 +253,7 @@ if(EXISTS "${JETSON_MM_API_PATH}")
 
   target_include_directories(video_encoder PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    ${JETSON_MM_API_PATH}/include/libjpeg-8b
+    ${JETSON_JPEG_INCLUDE_DIR}
     ${JETSON_MM_API_PATH}/include
     ${JETSON_COMMON_DIR}/classes
   )
@@ -210,9 +273,53 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   target_link_libraries(video_encoder
     Threads::Threads
     v4l2
-    nvv4l2
-    nvbufsurface
-    nvbufsurftransform
+    ${JETSON_NVV4L2_LIBRARY}
+    ${JETSON_NVBUFSURFACE_LIBRARY}
+    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
+  )
+
+  find_path(VPI_INCLUDE_DIR
+    NAMES vpi/VPI.h
+    PATHS
+      /opt/nvidia/vpi4/include
+      /opt/nvidia/vpi3/include
+      /opt/nvidia/vpi2/include
+      /usr/include
+  )
+  find_library(VPI_LIBRARY
+    NAMES nvvpi
+    PATHS
+      /opt/nvidia/vpi4/lib/aarch64-linux-gnu
+      /opt/nvidia/vpi3/lib/aarch64-linux-gnu
+      /opt/nvidia/vpi2/lib/aarch64-linux-gnu
+      /lib/aarch64-linux-gnu
+      /usr/lib/aarch64-linux-gnu
+  )
+  if(NOT VPI_INCLUDE_DIR OR NOT VPI_LIBRARY)
+    message(FATAL_ERROR "VPI headers/library not found; required for VideoUndistorter")
+  endif()
+
+  list(APPEND VIDEO_ADVANCED_SOURCES
+    src/video/video_decoder.cpp
+    src/video/video_undistorter.cpp
+    src/video/eye_image_publisher.cpp
+  )
+  list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
+    ${OpenCV_INCLUDE_DIRS}
+    ${VPI_INCLUDE_DIR}
+  )
+  list(APPEND VIDEO_ADVANCED_LIBS
+    ${OpenCV_LIBS}
+    yaml-cpp
+    ${VPI_LIBRARY}
+    ${JETSON_NVBUFSURFACE_LIBRARY}
+    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
+    ${JETSON_NVV4L2_LIBRARY}
+  )
+  set_source_files_properties(
+    src/video/video_stream_manager.cpp
+    src/video/video_decoder.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-pedantic"
   )
 else()
   message(WARNING "Jetson Multimedia API not found at ${JETSON_MM_API_PATH}. video_converter will be built in stub mode.")
@@ -222,72 +329,109 @@ endif()
 
 list(APPEND EXTRA_LIBS video_converter video_encoder)
 
-# SCReAM reference (Ericsson)
-add_library(scream_ref
-  scream/code/ScreamTx.cpp
-  scream/code/ScreamV2Tx.cpp
-  scream/code/ScreamV2TxStream.cpp
-  scream/code/RtpQueue.cpp
+file(GLOB TELEOP_MSG_FILES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "msg/*.msg")
+list(SORT TELEOP_MSG_FILES)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${TELEOP_MSG_FILES}
+  DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 
-target_include_directories(scream_ref PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/scream/code>
-)
-
-list(APPEND EXTRA_LIBS scream_ref)
-
-add_executable(${PROJECT_NAME}
+add_executable(${PROJECT_NAME}_node
   src/main_node.cpp
-  src/signaling_client.cpp
+  src/audio/audio_manager.cpp
+  src/audio/audio_module.cpp
+  src/audio/audio_receiver.cpp
+  src/grpc/grpc_manager.cpp
+  src/grpc/grpc_module.cpp
   src/utils/teleop_logger.cpp
   src/video/video_recorder.cpp
+  src/video/video_module.cpp
   src/video/video_stream_manager.cpp
+  ${VIDEO_ADVANCED_SOURCES}
   src/udp/udp_socket.cpp
-  src/udp/udp_packet.cpp
   src/udp/gf256.cpp
+  src/udp/packet_codec.cpp
+  src/udp/control_plane.cpp
+  src/udp/send_queue.cpp
+  src/udp/pacer.cpp
+  src/udp/fec_v2.cpp
+  src/udp/udp_manager.cpp
+  src/udp/udp_module.cpp
   src/udp/pose_udp_receiver.cpp
-  src/udp/scream_controller_ericsson.cpp
-  src/udp/udp_stream_manager.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PUBLIC
+set_target_properties(${PROJECT_NAME}_node PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
+
+target_include_directories(${PROJECT_NAME}_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<INSTALL_INTERFACE:include>
   "${PROTO_GENS_DIR}"
+  ${VIDEO_ADVANCED_INCLUDE_DIRS}
 )
 
-target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+target_compile_features(${PROJECT_NAME}_node PUBLIC cxx_std_17)
 
-ament_target_dependencies(${PROJECT_NAME}
+if(TRB_AUDIO_GSTREAMER_ENABLED)
+  target_compile_definitions(${PROJECT_NAME}_node PRIVATE TRB_HAS_GSTREAMER_AUDIO=1)
+else()
+  target_compile_definitions(${PROJECT_NAME}_node PRIVATE TRB_HAS_GSTREAMER_AUDIO=0)
+endif()
+
+ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
   rclpy
   std_msgs
   sensor_msgs
   geometry_msgs
+  ament_index_cpp
 )
 
-target_link_libraries(${PROJECT_NAME}
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
+if(TRB_AUDIO_GSTREAMER_ENABLED)
+  target_link_libraries(${PROJECT_NAME}_node PkgConfig::GSTREAMER_AUDIO)
+endif()
+
+target_link_libraries(${PROJECT_NAME}_node
   ${PROJECT_NAME}_grpc_proto
   v4l2
   Threads::Threads
   OpenSSL::SSL
   OpenSSL::Crypto
+  ${cpp_typesupport_target}
   ${EXTRA_LIBS}
+  ${VIDEO_ADVANCED_LIBS}
 )
 
-install(TARGETS ${PROJECT_NAME}
+install(TARGETS ${PROJECT_NAME}_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
 # Scoped header install: install under include/${PROJECT_NAME}
 install(FILES
   include/main_node.hpp
-  include/signaling_client.hpp
   DESTINATION include/${PROJECT_NAME}
 )
 
 install(DIRECTORY include/video
+  DESTINATION include/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/grpc
+  DESTINATION include/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/audio
+  DESTINATION include/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/udp
+  DESTINATION include/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/telemetry
   DESTINATION include/${PROJECT_NAME}
 )
 
@@ -303,5 +447,7 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()

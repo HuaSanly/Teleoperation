@@ -347,13 +347,14 @@ namespace trb::utils
                                      uint16_t total_frags,
                                      uint16_t payload_len,
                                      uint32_t frame_len,
-                                     uint8_t fec_table_id)
+                                     uint8_t fec_table_id,
+                                     uint8_t keyframe_flag)
     {
         if (idx < 8)
         {
             RCLCPP_INFO(
                 udp_logger(),
-                "UDP hdr[%lu]: type=0x%02X seq=%u ts=%lu frame=%u frag=%u/%u paylen=%u frame_len=%u fec(table=%u)",
+                "UDP hdr[%lu]: type=0x%02X seq=%u ts=%lu frame=%u frag=%u/%u paylen=%u frame_len=%u fec(table=%u) keyframe=%u",
                 static_cast<unsigned long>(idx),
                 static_cast<unsigned>(type),
                 static_cast<unsigned>(seq),
@@ -363,7 +364,8 @@ namespace trb::utils
                 static_cast<unsigned>(total_frags),
                 static_cast<unsigned>(payload_len),
                 static_cast<unsigned>(frame_len),
-                static_cast<unsigned>(fec_table_id));
+                static_cast<unsigned>(fec_table_id),
+                static_cast<unsigned>(keyframe_flag));
         }
 
         if (!shouldWrite(FileTopic::UdpHeaderOnce))
@@ -382,7 +384,8 @@ namespace trb::utils
             << " frag=" << frag_index << "/" << total_frags
             << " paylen=" << payload_len
             << " frame_len=" << frame_len
-            << " fec.table=" << static_cast<unsigned>(fec_table_id);
+            << " fec.table=" << static_cast<unsigned>(fec_table_id)
+            << " keyframe=" << static_cast<unsigned>(keyframe_flag);
         writeLineLocked(oss.str());
     }
 

@@ -1,0 +1,189 @@
+/teleop_robot_bridge:
+  ros__parameters:
+    subscribe_vr_pose_flag: false
+
+    debug:
+      direct_running_mode: false
+
+    pair:
+      mode: "passive"
+      auto_request: true
+      auto_accept: true
+      list_unpaired_on_start: false
+      peer_session_id: ""
+
+    grpc:
+      server_grpc_ip: "grpc-dev.eifuture.com"
+      server_grpc_port: 7777
+      use_ssl: true
+      device_id: "robot_876"
+      robot_generation: 2
+      token: "secure"
+      rpc_timeout_ms: 5000
+      register_retry_sec: 3.0
+      heartbeat_sec: 3.0
+
+    udp:
+      server_udp_ip: "192.168.3.55"
+      server_udp_port: 7778
+      bind_ip: "0.0.0.0"
+      bind_port: 0
+      enable_receive: true
+      recv_timeout_ms: 100
+      max_payload_bytes: 1200
+      send:
+        nonblocking: true
+        buffer_bytes: 8388608
+      pacing:
+        enabled: true
+        mode: "webrtc_like"
+        queue_max_bytes: 1200000
+        queue_max_packets: 2048
+        bps: 50000000
+        send_burst_interval_ms: 5
+        max_burst_bytes: 45000
+        max_debt_ms: 500
+        queue_time_limit_ms: 80
+        max_drain_multiplier: 2.0
+        account_audio: false
+        max_packets_per_batch: 64
+      fec:
+        enabled: false
+        table_id: 1
+        input_queue_max_frames: 2
+      handshake:
+        enabled: true
+        interval_sec: 1.0
+        ping_interval_sec: 5.0
+        peer_lost_timeout_sec: 0.0
+
+    pose_udp:
+      enabled: true
+      bind_ip: "0.0.0.0"
+      bind_port: 7780
+      allowed_remote_ip: ""
+      recv_timeout_ms: 100
+      qos:
+        depth: 10
+      frame_id:
+        waist: "vr_waist"
+        hmd: "vr_hmd"
+        left_controller: "vr_left_controller"
+        right_controller: "vr_right_controller"
+        left_foot: "vr_left_foot"
+        right_foot: "vr_right_foot"
+        left_aim: "vr_left_aim"
+        right_aim: "vr_right_aim"
+      publish_euler: true
+      publish_buttons: true
+      publish_aim: true
+
+    logging:
+      modules:
+        video_stats: true
+        period_sec: 1.0
+      file:
+        enabled: false
+        path: "/home/eierobot/dev_ws/src/teleop_robot_bridge/logs"
+        topics: ["udp_scream_rate"]
+
+    telemetry:
+      low_rate:
+        enabled: true
+        model: "super robot"
+      high_rate:
+        enabled: true
+        period_sec: 0.02
+        schema_id: 1
+        waist_topic: "/waist_joint_feedback"
+        arm_topic: "/arm_joint_feedback"
+
+    video:
+      profile: [3840, 1080, 30]
+      device: "/dev/video0"
+      pixel_format: "mjpeg"
+      sbs_crop:
+        enabled: false
+        margin_px: 0
+      v4l2:
+        buffer_count: 4
+        warmup_drop_frames: 0
+      converter:
+        compute: "vic"
+        dec_layout: "block"
+        out_layout: "pitch"
+      decoder:
+        buffer_pool_size: 4
+        output_plane_buffers: 6
+        capture_plane_buffers: 4
+        restart_on_bad_frames: true
+        consecutive_bad_frame_threshold: 5
+        restart_backoff_ms: 500
+      encoder:
+        codec: "h264"
+        bitrate: 30000000
+        i_frame_interval: 10
+        idr_interval_gops: 1
+        warmup_ms: 300
+        force_idr_every_n: 0
+        max_perf_mode: false
+        rate_control: "cbr"
+        peak_bitrate: 80000000
+        virtual_buffer_size: 2000000
+        hw_preset: "ultrafast"
+        num_reference_frames: 1
+        num_b_frames: 0
+        insert_sps_pps_at_idr: true
+        slice_level_encode: false
+        num_slices: 1
+        poc_type: -1
+        insert_aud: false
+        framerate_override: 0
+        output_plane_buffers: 6
+        capture_plane_buffers: 6
+        qp_range:
+          i_min: 0
+          i_max: 0
+          p_min: 0
+          p_max: 0
+        intra_refresh:
+          enabled: false
+          interval_slices: 1
+        low_freq_idr:
+          enabled: false
+          interval_sec: 3
+      eye_image:
+        enabled: false
+        output_width: 640
+        output_height: 360
+        max_fps: 10
+        left_topic: "data/left_eye_image"
+        right_topic: "data/right_eye_image"
+      undistort:
+        enabled: false
+        calib_file: "config/calibration_stereo.yaml"
+        require_calibration: true
+      recording:
+        enabled: false
+        output_dir: "/home/eierobot/dev_ws/src/teleop_robot_bridge/h264"
+
+    audio:
+      enabled: true
+      uplink_enabled: false
+      downlink_enabled: true
+      aec_enabled: false
+      capture_device: "plughw:2,0"
+      playback_device: "plughw:2,0"
+      playback_volume: 4.0
+      sample_rate: 48000
+      channels: 1
+      frame_duration_ms: 20
+      samples_per_channel: 960
+      bitrate_bps: 64000
+      opus_inband_fec_enabled: true
+      opus_dtx_enabled: false
+      receiver:
+        initial_buffer_ms: 60
+        max_buffer_ms: 200
+        max_sequence_gap: 1000
+        log_period_sec: 1.0

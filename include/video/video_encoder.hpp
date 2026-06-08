@@ -2,120 +2,151 @@
 
 #include <functional>
 #include <memory>
-#include <thread>
 #include <atomic>
+#include <deque>
 #include <queue>
 #include <mutex>
-#include <condition_variable>
 #include <vector>
-#include <deque>
 #include <map>
+#include <cstdint>
+#include <cstddef>
 
 #include "NvVideoEncoder.h"
 
 namespace trb::video
 {
 
+    /**
+     * Synchronous wrapper around NvVideoEncoder.
+     *
+     * Threading model: caller drives the encoder from a single thread via:
+     *   submit(fd, ts)       \u2192 push an NV12 DMA-BUF onto the output plane.
+     *   dequeueOne(pkt, ms)  \u2192 pull one encoded AU off the capture plane.
+     *   releaseCapture(pkt)  \u2192 requeue the capture buffer after consumption.
+     *   drainInputDone()     \u2192 non-blocking reap of finished output-plane
+     *                          buffers; invokes input_done_callback_ for each.
+     */
     class VideoEncoder
     {
     public:
+        // Future-proofing for H.265. Only kH264 is implemented today; constructing
+        // with kH265 logs and fails initialize().
+        enum class Codec
+        {
+            kH264 = 0,
+            kH265 = 1,
+        };
+
         struct Config
         {
+            Codec codec = Codec::kH264;
+
             uint32_t width;
             uint32_t height;
             uint32_t framerate;
             uint32_t bitrate; // bits per second
-            // GOP size in frames (distance between I-frames).
             uint32_t idr_interval = 30;
-
-            // IDR interval in frames (distance between two IDR frames).
-            // NOTE: This maps to NvVideoEncoder::setIDRInterval(interval_frames).
             uint32_t idr_interval_gops = 30;
-
-            // Slice intra-refresh ("I-frame smoothing"): gradually refreshes
-            // the picture using intra-coded slices instead of full I/IDR frames.
-            // 0 disables.
-            // NOTE: This maps to NvVideoEncoder::setSliceIntrarefresh(interval_slices).
             uint32_t slice_intra_refresh_interval_slices = 0;
-
-            // Debug/diagnostic knob: force an IDR every N input frames.
-            // 0 disables.
             uint32_t force_idr_every_n = 0;
             uint32_t qp_range_i_min = 10;
             uint32_t qp_range_i_max = 40;
             uint32_t qp_range_p_min = 10;
             uint32_t qp_range_p_max = 40;
 
-            // -------- Jetson NvVideoEncoder tuning knobs (optional) --------
-            // These map to Jetson Multimedia API (NvVideoEncoder) controls.
-            // Most of them MUST be set after setFormat on both planes and
-            // before requestBuffers/setupPlane.
-
-            // V4L2_CID_MPEG_VIDEO_MAX_PERFORMANCE
             bool max_perf_mode = false;
-
-            // V4L2_CID_MPEG_VIDEOENC_HW_PRESET_TYPE_PARAM
-            // -1 means "don't touch". Otherwise cast to enum v4l2_enc_hw_preset_type.
             int32_t hw_preset_type = -1;
-
-            // V4L2_CID_MPEG_VIDEO_BITRATE_MODE
-            // -1 means "don't touch". Otherwise cast to enum v4l2_mpeg_video_bitrate_mode.
             int32_t rate_control_mode = -1;
-
-            // V4L2_CID_MPEG_VIDEO_BITRATE_PEAK (optional)
-            // 0 means "don't touch".
             uint32_t peak_bitrate = 0;
-
-            // V4L2_CID_MPEG_VIDEOENC_VIRTUALBUFFER_SIZE (bytes).
-            // 0 means "don't touch". Smaller values generally reduce latency.
             uint32_t virtual_buffer_size = 0;
-
-            // V4L2_CID_MPEG_VIDEOENC_NUM_REFERENCE_FRAMES
-            // -1 means "don't touch".
             int32_t num_reference_frames = -1;
-
-            // V4L2_CID_MPEG_VIDEO_B_FRAMES
-            // -1 means "don't touch". For low latency, usually set to 0.
             int32_t num_b_frames = -1;
-
-            // V4L2_CID_MPEG_VIDEOENC_INSERT_SPS_PPS_AT_IDR
-            // -1 means "don't touch". 0 disable, 1 enable.
             int32_t insert_sps_pps_at_idr = -1;
+            bool slice_level_encode = true;
+            // Multi-slice per frame for low-latency emission. With
+            // slice_level_encode=true, NVENC emits each slice as a separate
+            // AU as soon as it is encoded, so encode latency drops roughly
+            // proportional to num_slices. 0 / 1 = single slice per frame.
+            uint32_t num_slices = 0;
+            int32_t poc_type = -1;
+            bool insert_aud = false;
 
-            // NvVideoEncoder plane buffer counts.
-            // Larger values can improve throughput but add buffering/latency.
             uint32_t output_plane_buffers = 10;
             uint32_t capture_plane_buffers = 10;
+
+            uint32_t encoder_framerate_override = 0;
         };
 
-        using EncodedPacketCallback = std::function<void(const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)>;
+        // One dequeued encoded access unit. Must be returned via releaseCapture().
+        // |data|/|size| reference memory owned by the encoder; valid only until
+        // releaseCapture() is called.
+        struct EncodedPacket
+        {
+            const uint8_t* data{nullptr};
+            size_t         size{0};
+            uint64_t       timestamp_us{0};
+            bool           keyframe{false};  // true for IDR
+            // Internal bookkeeping \u2013 do not modify.
+            uint32_t  _cap_buf_index{0};
+            NvBuffer* _nvbuf{nullptr};
+        };
+
         using InputDoneCallback = std::function<void(int dmabuf_fd)>;
+        // Called once when the codec parameter sets have been captured. NALs do
+        // NOT include start codes. For H.264 |vps| is empty; for H.265 |vps|,
+        // |sps| and |pps| are all populated.
+        using SpsPpsCallback = std::function<void(const std::vector<uint8_t>& sps,
+                                                  const std::vector<uint8_t>& pps,
+                                                  const std::vector<uint8_t>& vps)>;
 
         VideoEncoder();
         ~VideoEncoder();
 
-        bool initialize(const Config &config);
-        void setCallback(EncodedPacketCallback callback);
+        VideoEncoder(const VideoEncoder&) = delete;
+        VideoEncoder& operator=(const VideoEncoder&) = delete;
 
-        // Called when the encoder is finished consuming an input dmabuf.
-        // Useful to release dmabuf back to a pool.
+        bool initialize(const Config& config);
+        void shutdown();
+
         void setInputDoneCallback(InputDoneCallback callback);
+        void setSpsPpsCallback(SpsPpsCallback callback);
 
-        // Feed a frame to be encoded.
-        // dmabuf_fd: The DMA buffer file descriptor containing the raw frame (NV12).
-        // timestamp_us: Timestamp of the frame.
-        bool encodeFrame(int dmabuf_fd, uint64_t timestamp_us);
+        // Feed one NV12 DMA-BUF to the encoder. Returns false when the output
+        // plane queue is full (caller should drainInputDone() and retry later).
+        bool submit(int dmabuf_fd, uint64_t timestamp_us);
+
+        // Try to pull one encoded AU. timeout_ms=0 means non-blocking.
+        // Returns true and fills |out| on success; caller MUST call
+        // releaseCapture(out) before the next dequeueOne()/destruction.
+        bool dequeueOne(EncodedPacket& out, int timeout_ms);
+
+        // Return the capture buffer referenced by |pkt| to the encoder hardware.
+        void releaseCapture(EncodedPacket& pkt);
+
+        // Non-blocking: reap any finished output-plane buffers, invoking
+        // input_done_callback_ for each released input DMA-BUF.
+        void drainInputDone();
+
+        // Request a fresh IDR from NVENC. When insert_sps_pps_at_idr is
+        // enabled, this also gives the startup path another chance to capture
+        // SPS/PPS if the initial cold-start parameter set was missed.
+        bool forceIDR();
 
         // Update encoder bitrate at runtime (bps). Returns false on failure.
         bool setBitrate(uint32_t bitrate_bps);
 
     private:
-        static bool encoderCapturePlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg);
-        static bool encoderOutputPlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg);
+        void parseSpsPps_(const uint8_t* data, size_t size);
 
         Config config_;
-        EncodedPacketCallback callback_;
         InputDoneCallback input_done_callback_;
+        std::mutex input_done_callback_mutex_;
+        SpsPpsCallback sps_pps_callback_;
+        std::atomic<bool> sps_pps_sent_{false};
+        std::vector<uint8_t> cached_sps_;
+        std::vector<uint8_t> cached_pps_;
+        std::vector<uint8_t> cached_vps_;  // H.265 only
+        std::mutex sps_pps_mutex_;
         std::unique_ptr<NvVideoEncoder> encoder_;
 
         std::mutex input_mutex_;
@@ -125,10 +156,16 @@ namespace trb::video
 
         std::mutex map_mutex_;
         std::map<int, int> index_to_fd_;
-        std::map<int, uint64_t> index_to_timestamp_;
 
+        // Timestamps queued by submit(); one entry per input frame. With
+        // multi-slice encoding NVENC can emit multiple capture AUs per frame,
+        // so only the first AU consumes a queued timestamp and later slice AUs
+        // reuse |last_capture_ts_|.
         std::mutex ts_queue_mutex_;
-        std::queue<uint64_t> timestamp_queue_;
+        std::deque<uint64_t> timestamp_queue_;
+        uint64_t last_capture_ts_ = 0;
+        uint32_t effective_slices_per_frame_ = 1;
+        uint32_t remaining_slice_aus_ = 0;
 
         std::atomic<uint64_t> input_frame_count_{0};
     };

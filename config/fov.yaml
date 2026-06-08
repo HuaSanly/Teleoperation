@@ -1,0 +1,19 @@
+/teleop_robot_bridge:
+  ros__parameters:
+    video:
+      fov_table:
+        - width: 5184
+          height: 1944
+          hfov: 110.02
+          vfov: 94.09
+          dfov: 121.53
+        - width: 5120
+          height: 1440
+          hfov: 109.86
+          vfov: 82.46
+          dfov: 118.22
+        - width: 3840
+          height: 1080
+          hfov: 109.66
+          vfov: 82.27
+          dfov: 118.04

@@ -18,17 +18,17 @@ colcon build --packages-select teleop_robot_bridge
 ros2 launch teleop_robot_bridge bringup.launch.py
 ```
 ## 配置
-参数位于 config.yaml，主要包括：
+参数位于 config/params.yaml，主要包括：
 
-* 信令服务：server_ip/server_port/token/device_id
+* 信令服务：grpc.server_grpc_ip/grpc.server_grpc_port/grpc.token/grpc.device_id
 * 视频：分辨率/帧率、编码器参数、录像开关
-* UDP：目标 IP/端口、FEC、节流与队列策略
+* UDP：udp.server_udp_ip/udp.server_udp_port、FEC、节流与队列策略
 * 姿态接收：pose_udp.* 相关开关与话题参数
 ## 目录结构（核心）
 * main_node.cpp：主节点入口
 * signaling_client.cpp：gRPC 信令客户端
 * src/video/：视频采集/转换/编码/录制
 * src/udp/：UDP 传输与姿态解析
-* config.yaml：默认参数
+* config/params.yaml：默认参数
 ## 备注
 * Jetson 平台未安装 Multimedia API 时，转换/编码模块会以 stub 模式构建

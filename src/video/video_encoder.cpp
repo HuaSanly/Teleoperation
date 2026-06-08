@@ -1,4 +1,5 @@
 #include "video/video_encoder.hpp"
+#include "video/nvbuf_mutex.hpp"
 #include <iostream>
 #include <cstring>
 #include <string>
@@ -6,13 +7,14 @@
 #include <mutex>
 #include <map>
 #include <atomic>
-
-#include "utils/teleop_logger.hpp"
+#include <fcntl.h>
+#include <cerrno>
 
 #include <linux/v4l2-controls.h>
 
 #include "NvUtils.h"
 #include "nvbufsurface.h"
+#include "v4l2_nv_extensions.h"
 
 namespace trb::video
 {
@@ -284,6 +286,27 @@ namespace trb::video
             return found;
         }
 
+        // Detect IDR NAL units in an H.265 (HEVC) bytestream. The HEVC NAL
+        // header is 2 bytes; nal_unit_type lives in bits 1..6 of byte 0.
+        // IDR_W_RADL=19, IDR_N_LP=20 (both are IDR random-access points).
+        // CRA_NUT=21 is also a clean random-access point and treated as a
+        // keyframe for transport purposes.
+        static bool containsH265IdrNal(const uint8_t *data, size_t size)
+        {
+            const H264StreamFormat fmt = detectH264Format(data, size);
+            bool found = false;
+            forEachNal(data, size, fmt, [&](const uint8_t *nal, size_t nal_size)
+                       {
+                           if (nal_size < 2)
+                               return;
+                           const uint8_t nal_unit_type = static_cast<uint8_t>((nal[0] >> 1) & 0x3Fu);
+                           if (nal_unit_type == 19 || nal_unit_type == 20 || nal_unit_type == 21)
+                           {
+                               found = true;
+                           } });
+            return found;
+        }
+
         // Detect whether the bitstream contains any I-slice (IDR or non-IDR).
         // For nal_unit_type 1 or 5, parse slice_type and check if it's an I slice.
         static bool containsH264ISlice(const uint8_t *data, size_t size)
@@ -429,30 +452,7 @@ namespace trb::video
                                    << " sps_bytes=" << sps.size()
                                    << " pps_bytes=" << pps.size()
                                    << std::endl;
-                               std::cerr << "SPS.hex=" << bytesToHex(sps.data(), sps.size()) << std::endl;
-                               std::cerr << "SPS.b64=" << base64Encode(sps.data(), sps.size()) << std::endl;
-                               std::cerr << "PPS.hex=" << bytesToHex(pps.data(), pps.size()) << std::endl;
-                               std::cerr << "PPS.b64=" << base64Encode(pps.data(), pps.size()) << std::endl;
                            } });
-        }
-
-        static void logAllSpsPpsToFile(const uint8_t *data, size_t size, uint64_t capture_timestamp_us, uint32_t frame_id)
-        {
-            const H264StreamFormat fmt = detectH264Format(data, size);
-            forEachNal(data, size, fmt, [&](const uint8_t *nal, size_t nal_size)
-                       {
-                           if (nal_size < 1)
-                               return;
-                           const uint8_t nal_unit_type = static_cast<uint8_t>(nal[0] & 0x1Fu);
-                           if (nal_unit_type != 7 && nal_unit_type != 8)
-                               return;
-
-                           trb::utils::TeleopLogger::instance().h264SpsPps(
-                               capture_timestamp_us,
-                               frame_id,
-                               nal_unit_type,
-                               nal,
-                               nal_size); });
         }
     }
 
@@ -460,37 +460,75 @@ namespace trb::video
 
     VideoEncoder::~VideoEncoder()
     {
-        if (encoder_)
+        shutdown();
+    }
+
+    void VideoEncoder::shutdown()
+    {
+        if (!encoder_)
         {
-            encoder_->capture_plane.stopDQThread();
-            encoder_->output_plane.stopDQThread();
-            encoder_->capture_plane.waitForDQThread(2000);
-            encoder_->output_plane.waitForDQThread(2000);
-            encoder_.reset();
+            return;
         }
+
+        drainInputDone();
+
+        {
+            std::lock_guard<std::mutex> lk(input_done_callback_mutex_);
+            input_done_callback_ = nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sps_pps_mutex_);
+            sps_pps_callback_ = nullptr;
+        }
+
+        (void)encoder_->capture_plane.setStreamStatus(false);
+        (void)encoder_->output_plane.setStreamStatus(false);
+        encoder_->capture_plane.deinitPlane();
+        encoder_->output_plane.deinitPlane();
+
+        {
+            std::lock_guard<std::mutex> lk(map_mutex_);
+            index_to_fd_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(input_mutex_);
+            while (!free_output_indices_.empty())
+            {
+                free_output_indices_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(ts_queue_mutex_);
+            timestamp_queue_.clear();
+            last_capture_ts_ = 0;
+            remaining_slice_aus_ = 0;
+        }
+
+        encoder_.reset();
     }
 
     bool VideoEncoder::initialize(const Config &config)
     {
         config_ = config;
+        const bool is_h265 = (config_.codec == Codec::kH265);
 
-        encoder_.reset(NvVideoEncoder::createVideoEncoder("enc0"));
+        // O_NONBLOCK makes NvV4l2Element::dqBuffer's num_retries argument act as
+        // a millisecond timeout instead of a blocking retry counter.
+        encoder_.reset(NvVideoEncoder::createVideoEncoder("enc0", O_NONBLOCK));
         if (!encoder_)
         {
             std::cerr << "Failed to create NvVideoEncoder" << std::endl;
             return false;
         }
 
-        // Set capture plane format (Encoded output)
-        // 4MB buffer size for encoded frame should be enough
-        if (encoder_->setCapturePlaneFormat(V4L2_PIX_FMT_H264, config_.width, config_.height, 4 * 1024 * 1024) < 0)
+        const uint32_t capture_pixfmt = is_h265 ? V4L2_PIX_FMT_H265 : V4L2_PIX_FMT_H264;
+        if (encoder_->setCapturePlaneFormat(capture_pixfmt, config_.width, config_.height, 4 * 1024 * 1024) < 0)
         {
             std::cerr << "Failed to set capture plane format" << std::endl;
             return false;
         }
 
         // Set output plane format (Raw input)
-        // NV12 (multi-planar) matches NVBUF_COLOR_FORMAT_NV12 produced by VideoConverter.
         if (encoder_->setOutputPlaneFormat(V4L2_PIX_FMT_NV12M, config_.width, config_.height) < 0)
         {
             std::cerr << "Failed to set output plane format" << std::endl;
@@ -578,19 +616,99 @@ namespace trb::video
             }
         }
 
-        if (encoder_->setProfile(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH) < 0)
+        // Thor rejects V4L2_CID_MPEG_VIDEOENC_ENABLE_SLICE_LEVEL_ENCODE when
+        // asked to set it to 0. Only touch the control when explicitly enabled.
+        if (config_.slice_level_encode && encoder_->setSliceLevelEncode(true) < 0)
+        {
+            std::cerr << "WARN: Failed to set slice level encode" << std::endl;
+        }
+
+        // Multi-slice configuration: split each frame into N macroblock-equal
+        // slices. Combined with slice_level_encode, this lets the first slice
+        // be DQ'd while the rest of the frame is still encoding, cutting the
+        // submit→AU latency floor from ~frame_period/1 to ~frame_period/N.
+        if (config_.slice_level_encode && config_.num_slices > 1)
+        {
+            const uint32_t mbs_w = (config_.width  + 15u) / 16u;
+            const uint32_t mbs_h = (config_.height + 15u) / 16u;
+            const uint32_t total_mbs = mbs_w * mbs_h;
+            const uint32_t n = config_.num_slices;
+            const uint32_t per_slice_mbs = std::max(1u, (total_mbs + n - 1u) / n);
+            if (encoder_->setSliceLength(V4L2_ENC_SLICE_LENGTH_TYPE_MBLK,
+                                         per_slice_mbs) < 0)
+            {
+                std::cerr << "WARN: Failed to set slice length (MBLK="
+                          << per_slice_mbs << ", num_slices=" << n << ")"
+                          << std::endl;
+                effective_slices_per_frame_ = 1;
+            }
+            else
+            {
+                effective_slices_per_frame_ = n;
+            }
+        }
+        else
+        {
+            effective_slices_per_frame_ = 1;
+        }
+
+        if (config_.poc_type >= 0)
+        {
+            // POC type is an H.264-only concept (poc_type 0/1/2). HEVC has no
+            // equivalent control; silently skip when encoding HEVC.
+            if (!is_h265)
+            {
+                if (encoder_->setPocType(static_cast<uint32_t>(config_.poc_type)) < 0)
+                {
+                    std::cerr << "WARN: Failed to set POC type" << std::endl;
+                }
+            }
+        }
+
+        if (config_.insert_aud)
+        {
+            if (encoder_->setInsertAudEnabled(true) < 0)
+            {
+                std::cerr << "WARN: Failed to enable AUD insertion" << std::endl;
+            }
+        }
+
+        const uint32_t profile = is_h265
+                                     ? static_cast<uint32_t>(V4L2_MPEG_VIDEO_H265_PROFILE_MAIN)
+                                     : static_cast<uint32_t>(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
+        if (encoder_->setProfile(profile) < 0)
         {
             std::cerr << "Failed to set profile" << std::endl;
             return false;
         }
 
-        if (encoder_->setLevel(V4L2_MPEG_VIDEO_H264_LEVEL_5_1) < 0)
+        const uint32_t level = is_h265
+                                   ? static_cast<uint32_t>(V4L2_MPEG_VIDEO_H265_LEVEL_5_1_MAIN_TIER)
+                                   : static_cast<uint32_t>(V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+        if (encoder_->setLevel(level) < 0)
         {
             std::cerr << "Failed to set level" << std::endl;
             return false;
         }
 
-        if (encoder_->setFrameRate(config_.framerate, 1) < 0)
+        // Set QP range for quality control (lower QP = higher quality)
+        if (config_.qp_range_i_min > 0 || config_.qp_range_i_max > 0 ||
+            config_.qp_range_p_min > 0 || config_.qp_range_p_max > 0)
+        {
+            // B-frame uses P-frame QP range since we have num_b_frames=0
+            if (encoder_->setQpRange(config_.qp_range_i_min, config_.qp_range_i_max,
+                                     config_.qp_range_p_min, config_.qp_range_p_max,
+                                     config_.qp_range_p_min, config_.qp_range_p_max) < 0)
+            {
+                std::cerr << "WARN: Failed to set QP range (I: " << config_.qp_range_i_min << "-" << config_.qp_range_i_max
+                          << ", P: " << config_.qp_range_p_min << "-" << config_.qp_range_p_max << ")" << std::endl;
+            }
+        }
+
+        const uint32_t enc_fps_num = (config_.encoder_framerate_override > 0)
+                                         ? config_.encoder_framerate_override
+                                         : config_.framerate;
+        if (encoder_->setFrameRate(enc_fps_num, 1) < 0)
         {
             std::cerr << "Failed to set framerate" << std::endl;
             return false;
@@ -671,48 +789,58 @@ namespace trb::video
             }
         }
 
-        // Start DQ threads
-        encoder_->output_plane.setDQThreadCallback(encoderOutputPlaneDqCallback);
-        encoder_->capture_plane.setDQThreadCallback(encoderCapturePlaneDqCallback);
-
-        if (encoder_->output_plane.startDQThread(this) < 0)
-        {
-            std::cerr << "Failed to start output plane DQ thread" << std::endl;
-            return false;
-        }
-
-        if (encoder_->capture_plane.startDQThread(this) < 0)
-        {
-            std::cerr << "Failed to start capture plane DQ thread" << std::endl;
-            return false;
-        }
-
         return true;
-    }
-
-    void VideoEncoder::setCallback(EncodedPacketCallback callback)
-    {
-        callback_ = std::move(callback);
     }
 
     void VideoEncoder::setInputDoneCallback(InputDoneCallback callback)
     {
+        std::lock_guard<std::mutex> lk(input_done_callback_mutex_);
         input_done_callback_ = std::move(callback);
     }
 
-    bool VideoEncoder::encodeFrame(int dmabuf_fd, uint64_t timestamp_us)
+    void VideoEncoder::setSpsPpsCallback(SpsPpsCallback callback)
+    {
+        SpsPpsCallback callback_to_call;
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+        std::vector<uint8_t> vps;
+        {
+            std::lock_guard<std::mutex> lk(sps_pps_mutex_);
+            sps_pps_callback_ = std::move(callback);
+            const bool is_h265 = (config_.codec == Codec::kH265);
+            const bool ready = !cached_sps_.empty() && !cached_pps_.empty() &&
+                               (!is_h265 || !cached_vps_.empty());
+            if (ready && sps_pps_callback_)
+            {
+                callback_to_call = sps_pps_callback_;
+                sps = cached_sps_;
+                pps = cached_pps_;
+                vps = cached_vps_;
+                sps_pps_sent_.store(true, std::memory_order_relaxed);
+            }
+        }
+
+        if (callback_to_call)
+        {
+            callback_to_call(sps, pps, vps);
+        }
+    }
+
+    bool VideoEncoder::submit(int dmabuf_fd, uint64_t timestamp_us)
     {
         if (!encoder_)
             return false;
 
-        static std::atomic<bool> logged_input_info{false};
+        // NOTE: drainInputDone() is intentionally NOT called here. The
+        // VideoStreamManager encode loop already calls drainInputDone() once
+        // per iteration before submit; calling it again here doubled the
+        // dq lock-thrash with no benefit.
 
         int index = -1;
         {
             std::lock_guard<std::mutex> lock(input_mutex_);
             if (free_output_indices_.empty())
             {
-                // std::cerr << "VideoEncoder: No free output buffers" << std::endl;
                 return false;
             }
             index = free_output_indices_.front();
@@ -728,39 +856,15 @@ namespace trb::video
             return false;
         }
 
-        // Get plane layout from FD
         NvBufSurface *surf = nullptr;
-        if (NvBufSurfaceFromFd(dmabuf_fd, (void **)&surf) != 0 || surf == nullptr)
         {
-            std::cerr << "VideoEncoder: NvBufSurfaceFromFd failed" << std::endl;
-            std::lock_guard<std::mutex> lock(input_mutex_);
-            free_output_indices_.push(index);
-            return false;
-        }
-
-        if (!logged_input_info.exchange(true))
-        {
-            const auto &sp = surf->surfaceList[0];
-            const auto &pp = sp.planeParams;
-            std::cout << "VideoEncoder: input dmabuf info"
-                      << " w=" << sp.width
-                      << " h=" << sp.height
-                      << " pitch=" << sp.pitch
-                      << " colorFormat=" << (int)sp.colorFormat
-                      << " layout=" << (int)sp.layout
-                      << " planes=" << pp.num_planes
-                      << " enc_planes=" << encoder_->output_plane.getNumPlanes()
-                      << std::endl;
-
-            for (uint32_t i = 0; i < pp.num_planes; ++i)
+            std::lock_guard<std::mutex> lk(trb::video::getNvBufMutex());
+            if (NvBufSurfaceFromFd(dmabuf_fd, (void **)&surf) != 0 || surf == nullptr)
             {
-                std::cout << "  plane" << i
-                          << " w=" << pp.width[i]
-                          << " h=" << pp.height[i]
-                          << " pitch=" << pp.pitch[i]
-                          << " offset=" << pp.offset[i]
-                          << " psize=" << pp.psize[i]
-                          << std::endl;
+                std::cerr << "VideoEncoder: NvBufSurfaceFromFd failed" << std::endl;
+                std::lock_guard<std::mutex> lock(input_mutex_);
+                free_output_indices_.push(index);
+                return false;
             }
         }
 
@@ -790,11 +894,9 @@ namespace trb::video
         const uint64_t in_count = input_frame_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (config_.force_idr_every_n > 0 && (in_count % config_.force_idr_every_n) == 0)
         {
-            const int r = encoder_->forceIDR();
-            std::cerr << "VideoEncoder: forceIDR() requested at input_frame=" << in_count << " result=" << r << std::endl;
+            (void)encoder_->forceIDR();
         }
 
-        // Fill planes
         const auto &planeParams = surf->surfaceList[0].planeParams;
         for (uint32_t i = 0; i < v4l2_buf.length; ++i)
         {
@@ -811,17 +913,37 @@ namespace trb::video
             }
         }
 
-        // Track FD and timestamp
+        static std::atomic<bool> logged_input_planes{false};
+        if (!logged_input_planes.exchange(true, std::memory_order_relaxed))
+        {
+            std::cerr << "VideoEncoder input surface: fd=" << dmabuf_fd
+                      << " planes=" << planeParams.num_planes
+                      << " layout=" << static_cast<int>(surf->surfaceList[0].layout)
+                      << " color=" << static_cast<int>(surf->surfaceList[0].colorFormat);
+            for (uint32_t i = 0; i < planeParams.num_planes; ++i)
+            {
+                std::cerr << " p" << i
+                          << " pitch=" << planeParams.pitch[i]
+                          << " height=" << planeParams.height[i]
+                          << " psize=" << planeParams.psize[i]
+                          << " offset=" << planeParams.offset[i]
+                          << " bytesused=" << planes[i].bytesused;
+            }
+            std::cerr << std::endl;
+        }
+
         {
             std::lock_guard<std::mutex> lk(map_mutex_);
             index_to_fd_[index] = dmabuf_fd;
-            index_to_timestamp_[index] = timestamp_us;
         }
-
-        // Push timestamp to queue for Capture Plane retrieval
         {
+            // Push exactly one timestamp per submit. The first AU of this
+            // frame pops it; subsequent slice AUs reuse |last_capture_ts_|
+            // (set in dequeueOne after the first AU pops). NVENC zeroes the
+            // capture-plane v4l2 timestamp on non-first slices, so we cannot
+            // rely on it.
             std::lock_guard<std::mutex> lk(ts_queue_mutex_);
-            timestamp_queue_.push(timestamp_us);
+            timestamp_queue_.push_back(timestamp_us);
         }
 
         if (encoder_->output_plane.qBuffer(v4l2_buf, nullptr) < 0)
@@ -830,19 +952,11 @@ namespace trb::video
             {
                 std::lock_guard<std::mutex> lk(map_mutex_);
                 index_to_fd_.erase(index);
-                index_to_timestamp_.erase(index);
             }
             {
                 std::lock_guard<std::mutex> lk(ts_queue_mutex_);
-                // We just pushed it, so it should be at the back.
-                // But std::queue doesn't support pop_back.
-                // This is a rare error case. We might have a desync if we don't handle it.
-                // However, std::queue is not deque.
-                // Let's change queue to deque in header if we want to be perfect,
-                // or just accept that if qBuffer fails we are in trouble anyway.
-                // For now, let's assume qBuffer rarely fails if we checked buffer availability.
-                // Actually, let's use a deque in the implementation details if needed, but I declared queue.
-                // I'll just leave it for now, if qBuffer fails, the stream is likely broken.
+                if (!timestamp_queue_.empty())
+                    timestamp_queue_.pop_back();
             }
             std::lock_guard<std::mutex> lock(input_mutex_);
             free_output_indices_.push(index);
@@ -850,6 +964,274 @@ namespace trb::video
         }
 
         return true;
+    }
+
+    void VideoEncoder::drainInputDone()
+    {
+        if (!encoder_)
+            return;
+
+        while (true)
+        {
+            struct v4l2_buffer v4l2_buf;
+            struct v4l2_plane  planes[MAX_PLANES];
+            memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+            memset(planes, 0, sizeof(planes));
+            v4l2_buf.m.planes = planes;
+
+            NvBuffer *buf = nullptr;
+            // num_retries=0 in O_NONBLOCK mode => non-blocking single attempt.
+            if (encoder_->output_plane.dqBuffer(v4l2_buf, &buf, nullptr, 0) < 0)
+            {
+                break;  // EAGAIN or error: nothing pending.
+            }
+
+            int fd = -1;
+            {
+                std::lock_guard<std::mutex> lk(map_mutex_);
+                auto it = index_to_fd_.find(v4l2_buf.index);
+                if (it != index_to_fd_.end())
+                {
+                    fd = it->second;
+                    index_to_fd_.erase(it);
+                }
+            }
+
+            InputDoneCallback input_done_callback;
+            {
+                std::lock_guard<std::mutex> lk(input_done_callback_mutex_);
+                input_done_callback = input_done_callback_;
+            }
+
+            if (fd >= 0 && input_done_callback)
+            {
+                input_done_callback(fd);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(input_mutex_);
+                free_output_indices_.push(v4l2_buf.index);
+            }
+        }
+    }
+
+    bool VideoEncoder::dequeueOne(EncodedPacket &out, int timeout_ms)
+    {
+        if (!encoder_)
+            return false;
+
+        struct v4l2_buffer v4l2_buf;
+        struct v4l2_plane  planes[MAX_PLANES];
+        memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+        memset(planes, 0, sizeof(planes));
+        v4l2_buf.m.planes = planes;
+
+        const uint32_t retries = static_cast<uint32_t>(std::max(0, timeout_ms));
+        NvBuffer *buf = nullptr;
+        if (encoder_->capture_plane.dqBuffer(v4l2_buf, &buf, nullptr, retries) < 0)
+        {
+            if (errno != EAGAIN && errno != ETIMEDOUT)
+            {
+                std::cerr << "VideoEncoder: capture_plane.dqBuffer failed errno=" << errno << std::endl;
+            }
+            return false;
+        }
+
+        if (!buf)
+            return false;
+
+        // Empty capture buffer (EOS / drain) - requeue and report no packet.
+        if (buf->planes[0].bytesused == 0)
+        {
+            encoder_->capture_plane.qBuffer(v4l2_buf, nullptr);
+            return false;
+        }
+
+        // Capture plane timestamp is unreliable under multi-slice (NVENC can
+        // zero it for non-first slice AUs). Consume exactly one queued submit
+        // timestamp per input frame; later slice AUs reuse the previous value.
+        uint64_t ts = 0;
+        const uint64_t driver_ts = static_cast<uint64_t>(v4l2_buf.timestamp.tv_sec) * 1000000ULL +
+                                   static_cast<uint64_t>(v4l2_buf.timestamp.tv_usec);
+        {
+            std::lock_guard<std::mutex> lk(ts_queue_mutex_);
+            const uint32_t slices_per_frame = std::max<uint32_t>(1, effective_slices_per_frame_);
+            const bool expecting_more_slices = slices_per_frame > 1 && remaining_slice_aus_ > 0;
+            const bool driver_reports_new_frame = driver_ts > 0 && last_capture_ts_ > 0 && driver_ts != last_capture_ts_;
+            if (driver_reports_new_frame)
+            {
+                if (expecting_more_slices)
+                {
+                    static std::atomic<uint64_t> timestamp_resync_count{0};
+                    const uint64_t count = timestamp_resync_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (count <= 5 || (count % 300) == 0)
+                    {
+                        std::cerr << "VideoEncoder: timestamp resync from driver ts; expected remaining slice AUs="
+                                  << remaining_slice_aus_ << " last_ts=" << last_capture_ts_
+                                  << " driver_ts=" << driver_ts << " count=" << count << std::endl;
+                    }
+                }
+                if (!timestamp_queue_.empty())
+                {
+                    ts = timestamp_queue_.front();
+                    timestamp_queue_.pop_front();
+                }
+                else
+                {
+                    ts = driver_ts;
+                }
+                last_capture_ts_ = ts;
+                remaining_slice_aus_ = slices_per_frame > 1 ? slices_per_frame - 1 : 0;
+            }
+            else if (expecting_more_slices)
+            {
+                ts = last_capture_ts_;
+                --remaining_slice_aus_;
+            }
+            else if (!timestamp_queue_.empty())
+            {
+                ts = timestamp_queue_.front();
+                timestamp_queue_.pop_front();
+                last_capture_ts_ = ts;
+                remaining_slice_aus_ = slices_per_frame > 1 ? slices_per_frame - 1 : 0;
+            }
+            else if (driver_ts > 0)
+            {
+                ts = driver_ts;
+                last_capture_ts_ = ts;
+                remaining_slice_aus_ = slices_per_frame > 1 ? slices_per_frame - 1 : 0;
+            }
+            else
+            {
+                ts = last_capture_ts_;
+                if (remaining_slice_aus_ > 0)
+                {
+                    --remaining_slice_aus_;
+                }
+            }
+        }
+
+        const uint8_t *data = buf->planes[0].data;
+        const size_t   size = buf->planes[0].bytesused;
+
+        maybePrintSpsPpsOnce(data, size);
+        parseSpsPps_(data, size);
+
+        const bool keyframe = (config_.codec == Codec::kH265)
+                                  ? containsH265IdrNal(data, size)
+                                  : containsH264IdrNal(data, size);
+
+        out.data           = data;
+        out.size           = size;
+        out.timestamp_us   = ts;
+        out.keyframe       = keyframe;
+        out._cap_buf_index = v4l2_buf.index;
+        out._nvbuf         = buf;
+        return true;
+    }
+
+    void VideoEncoder::releaseCapture(EncodedPacket &pkt)
+    {
+        if (!encoder_ || !pkt._nvbuf)
+            return;
+
+        struct v4l2_buffer v4l2_buf;
+        struct v4l2_plane  planes[MAX_PLANES];
+        memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+        memset(planes, 0, sizeof(planes));
+        v4l2_buf.index    = pkt._cap_buf_index;
+        v4l2_buf.m.planes = planes;
+        v4l2_buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        v4l2_buf.memory   = V4L2_MEMORY_MMAP;
+        v4l2_buf.length   = encoder_->capture_plane.getNumPlanes();
+
+        encoder_->capture_plane.qBuffer(v4l2_buf, nullptr);
+
+        pkt.data   = nullptr;
+        pkt.size   = 0;
+        pkt._nvbuf = nullptr;
+    }
+
+    bool VideoEncoder::forceIDR()
+    {
+        if (!encoder_)
+        {
+            return false;
+        }
+        return encoder_->forceIDR() == 0;
+    }
+
+    void VideoEncoder::parseSpsPps_(const uint8_t *data, size_t size)
+    {
+        if (sps_pps_sent_.load(std::memory_order_relaxed))
+            return;
+
+        SpsPpsCallback callback_to_call;
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+        std::vector<uint8_t> vps;
+        {
+            std::lock_guard<std::mutex> lk(sps_pps_mutex_);
+            if (sps_pps_sent_.load(std::memory_order_relaxed))
+                return;
+
+            const H264StreamFormat fmt = detectH264Format(data, size);
+            const bool is_h265 = (config_.codec == Codec::kH265);
+            forEachNal(data, size, fmt, [this, is_h265](const uint8_t *nal, size_t nal_size) {
+                if (is_h265)
+                {
+                    if (nal_size < 2)
+                        return;
+                    // HEVC: 2-byte NAL header, type = bits 1..6 of byte 0.
+                    const uint8_t nal_unit_type = static_cast<uint8_t>((nal[0] >> 1) & 0x3Fu);
+                    if (nal_unit_type == 32 && cached_vps_.empty())  // VPS
+                    {
+                        cached_vps_.assign(nal, nal + nal_size);
+                    }
+                    else if (nal_unit_type == 33 && cached_sps_.empty())  // SPS
+                    {
+                        cached_sps_.assign(nal, nal + nal_size);
+                    }
+                    else if (nal_unit_type == 34 && cached_pps_.empty())  // PPS
+                    {
+                        cached_pps_.assign(nal, nal + nal_size);
+                    }
+                }
+                else
+                {
+                    if (nal_size < 1)
+                        return;
+                    const uint8_t nal_unit_type = static_cast<uint8_t>(nal[0] & 0x1Fu);
+                    if (nal_unit_type == 7 && cached_sps_.empty())
+                    {
+                        cached_sps_.assign(nal, nal + nal_size);
+                    }
+                    else if (nal_unit_type == 8 && cached_pps_.empty())
+                    {
+                        cached_pps_.assign(nal, nal + nal_size);
+                    }
+                }
+            });
+
+            const bool h265_ready = is_h265 && !cached_vps_.empty() && !cached_sps_.empty() && !cached_pps_.empty();
+            const bool h264_ready = !is_h265 && !cached_sps_.empty() && !cached_pps_.empty();
+            if (h265_ready || h264_ready)
+            {
+                sps_pps_sent_.store(true, std::memory_order_relaxed);
+                if (sps_pps_callback_)
+                {
+                    callback_to_call = sps_pps_callback_;
+                    sps = cached_sps_;
+                    pps = cached_pps_;
+                    vps = cached_vps_;
+                }
+            }
+        }
+
+        if (callback_to_call)
+        {
+            callback_to_call(sps, pps, vps);
+        }
     }
 
     bool VideoEncoder::setBitrate(uint32_t bitrate_bps)
@@ -865,119 +1247,6 @@ namespace trb::video
             return false;
         }
         config_.bitrate = bitrate_bps;
-        return true;
-    }
-
-    bool VideoEncoder::encoderOutputPlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg)
-    {
-        (void)buffer;
-        (void)shared_buffer;
-        VideoEncoder *enc = static_cast<VideoEncoder *>(arg);
-        if (!enc)
-            return false;
-
-        int fd = -1;
-        {
-            std::lock_guard<std::mutex> lk(enc->map_mutex_);
-            auto it = enc->index_to_fd_.find(v4l2_buf->index);
-            if (it != enc->index_to_fd_.end())
-            {
-                fd = it->second;
-                enc->index_to_fd_.erase(it);
-            }
-            enc->index_to_timestamp_.erase(v4l2_buf->index);
-        }
-
-        if (fd >= 0 && enc->input_done_callback_)
-        {
-            enc->input_done_callback_(fd);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(enc->input_mutex_);
-            enc->free_output_indices_.push(v4l2_buf->index);
-        }
-
-        return true;
-    }
-
-    bool VideoEncoder::encoderCapturePlaneDqCallback(struct v4l2_buffer *v4l2_buf, NvBuffer *buffer, NvBuffer *shared_buffer, void *arg)
-    {
-        (void)shared_buffer;
-        VideoEncoder *enc = static_cast<VideoEncoder *>(arg);
-        if (!enc)
-            return false;
-
-        if (buffer->planes[0].bytesused == 0)
-        {
-            if (enc->encoder_->capture_plane.qBuffer(*v4l2_buf, nullptr) < 0)
-            {
-                std::cerr << "VideoEncoder: Failed to re-queue empty capture buffer" << std::endl;
-                return false;
-            }
-            return true;
-        }
-
-        uint64_t timestamp_us = 0;
-
-        // Try to get timestamp from queue first (most reliable if driver drops it)
-        {
-            std::lock_guard<std::mutex> lk(enc->ts_queue_mutex_);
-            if (!enc->timestamp_queue_.empty())
-            {
-                timestamp_us = enc->timestamp_queue_.front();
-                enc->timestamp_queue_.pop();
-            }
-            else
-            {
-                // Fallback to v4l2 timestamp if queue is empty (shouldn't happen in normal flow)
-                timestamp_us = (uint64_t)v4l2_buf->timestamp.tv_sec * 1000000 + v4l2_buf->timestamp.tv_usec;
-            }
-        }
-
-        const H264StreamFormat fmt = detectH264Format(buffer->planes[0].data, buffer->planes[0].bytesused);
-        const bool keyframe_flag = (v4l2_buf->flags & V4L2_BUF_FLAG_KEYFRAME);
-        const bool idr_in_bitstream = containsH264IdrNal(buffer->planes[0].data, buffer->planes[0].bytesused);
-        const bool i_slice_in_bitstream = containsH264ISlice(buffer->planes[0].data, buffer->planes[0].bytesused);
-
-        // Dump all SPS/PPS NALs to per-run log file (when enabled via logging.file.topics).
-        logAllSpsPpsToFile(
-            buffer->planes[0].data,
-            buffer->planes[0].bytesused,
-            timestamp_us,
-            static_cast<uint32_t>(v4l2_buf->sequence));
-
-        maybePrintSpsPpsOnce(buffer->planes[0].data, buffer->planes[0].bytesused);
-
-        // For your logging purpose, treat any I-slice frame as "keyframe".
-        // This matches "I帧" more closely than "IDR only".
-        const bool keyframe = i_slice_in_bitstream;
-
-        static std::atomic<uint64_t> keyframe_diag_count{0};
-        const uint64_t diag_n = keyframe_diag_count.fetch_add(1, std::memory_order_relaxed);
-        if (diag_n < 5 || (diag_n % 120 == 0) || (keyframe_flag != idr_in_bitstream) || (idr_in_bitstream != i_slice_in_bitstream))
-        {
-            std::cerr
-                << "Encoder keyframe diag: bytes=" << static_cast<unsigned>(buffer->planes[0].bytesused)
-                << " format=" << h264FormatToString(fmt)
-                << " v4l2_flags=0x" << std::hex << static_cast<unsigned>(v4l2_buf->flags) << std::dec
-                << " flag_keyframe=" << (keyframe_flag ? 1 : 0)
-                << " idr_in_bitstream=" << (idr_in_bitstream ? 1 : 0)
-                << " i_slice_in_bitstream=" << (i_slice_in_bitstream ? 1 : 0)
-                << std::endl;
-        }
-
-        if (enc->callback_)
-        {
-            enc->callback_(buffer->planes[0].data, buffer->planes[0].bytesused, timestamp_us, keyframe);
-        }
-
-        if (enc->encoder_->capture_plane.qBuffer(*v4l2_buf, nullptr) < 0)
-        {
-            std::cerr << "VideoEncoder: Failed to re-queue capture buffer" << std::endl;
-            return false;
-        }
-
         return true;
     }
 

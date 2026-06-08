@@ -1,1104 +1,1942 @@
-#include <thread>
-#include <chrono>
+#include "include/main_node.hpp"
+
 #include <algorithm>
-#include <cctype>
-#include <cstring>
-#include <cinttypes>
-#include <cstdlib>
-#include <fstream>
-#include <filesystem>
-#include <mutex>
-#include <condition_variable>
+#include <array>
 #include <cmath>
+#include <chrono>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <vector>
-#include <functional>
-#include <unordered_map>
-#include <sstream>
 
-#include "rclcpp/rclcpp.hpp"
-#include "main_node.hpp"
 #include "utils/teleop_logger.hpp"
-#include "udp/scream_controller_ericsson.hpp"
-#include "video/video_v4l2_capturer.hpp"
-
-#include <linux/videodev2.h>
 
 namespace trb
 {
-
     namespace
     {
-        enum class H264StreamFormat
+        using AgvBatteryStateMsg = teleop_robot_bridge::msg::AgvBatteryState;
+        using AgvDeviceStateMsg = teleop_robot_bridge::msg::AgvDeviceState;
+        using TemperatureMsg = teleop_robot_bridge::msg::Temperature;
+        using ArmJointFeedbackMsg = teleop_robot_bridge::msg::ArmJointFeedback;
+        using WaistJointFeedbackMsg = teleop_robot_bridge::msg::WaistJointFeedback;
+
+        template <typename T>
+        T declareOrGet(rclcpp::Node &node, const std::string &name, const T &default_value)
         {
-            AnnexB,
-            Avcc,
-            Unknown,
+            if (!node.has_parameter(name))
+            {
+                return node.declare_parameter<T>(name, default_value);
+            }
+            T value{};
+            node.get_parameter(name, value);
+            return value;
+        }
+
+        bool hasValidContext(rclcpp::Node &node)
+        {
+            const auto base = node.get_node_base_interface();
+            const auto context = base ? base->get_context() : rclcpp::Context::SharedPtr{};
+            return context && context->is_valid();
+        }
+
+        bool canScheduleRosWork(rclcpp::Node &node, const std::atomic<bool> &shutting_down)
+        {
+            return !shutting_down.load(std::memory_order_acquire) && hasValidContext(node);
+        }
+
+        struct AtomicFlagClearGuard
+        {
+            explicit AtomicFlagClearGuard(std::atomic<bool> &flag_ref) : flag(flag_ref) {}
+            ~AtomicFlagClearGuard()
+            {
+                flag.store(false, std::memory_order_release);
+            }
+
+            std::atomic<bool> &flag;
         };
 
-        static bool hasAnnexBStartCode(const uint8_t *data, size_t size)
+        std::chrono::nanoseconds periodFromSeconds(double seconds)
         {
-            if (!data || size < 4)
-            {
-                return false;
-            }
-            for (size_t i = 0; i + 3 < size; ++i)
-            {
-                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
-                {
-                    return true;
-                }
-                if (i + 4 < size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
-                {
-                    return true;
-                }
-            }
-            return false;
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(std::max(0.1, seconds)));
         }
 
-        static bool looksLikeAvcc(const uint8_t *data, size_t size)
+        std::chrono::nanoseconds highRatePeriodFromSeconds(double seconds)
         {
-            if (!data || size < 8)
-            {
-                return false;
-            }
-            size_t off = 0;
-            int nal_count = 0;
-            while (off + 4 <= size && nal_count < 3)
-            {
-                const uint32_t n = (static_cast<uint32_t>(data[off]) << 24) |
-                                   (static_cast<uint32_t>(data[off + 1]) << 16) |
-                                   (static_cast<uint32_t>(data[off + 2]) << 8) |
-                                   (static_cast<uint32_t>(data[off + 3]));
-                off += 4;
-                if (n == 0 || off + n > size)
-                {
-                    return false;
-                }
-                if (n < 1)
-                {
-                    return false;
-                }
-                off += n;
-                ++nal_count;
-            }
-            return nal_count > 0;
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(std::max(0.005, seconds)));
         }
 
-        static H264StreamFormat detectH264Format(const uint8_t *data, size_t size)
+        uint64_t nowUnixMs()
         {
-            if (hasAnnexBStartCode(data, size))
-            {
-                return H264StreamFormat::AnnexB;
-            }
-            if (looksLikeAvcc(data, size))
-            {
-                return H264StreamFormat::Avcc;
-            }
-            return H264StreamFormat::Unknown;
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count());
         }
 
-        template <typename Fn>
-        static void forEachNal(const uint8_t *data, size_t size, H264StreamFormat fmt, Fn &&fn)
+        uint64_t stampToUnixMs(int32_t sec, uint32_t nanosec)
         {
-            if (!data || size < 1)
+            if (sec <= 0)
+            {
+                return nowUnixMs();
+            }
+            return static_cast<uint64_t>(sec) * 1000ULL + static_cast<uint64_t>(nanosec / 1000000U);
+        }
+
+        constexpr auto kVideoStartupKeyframeDelay = std::chrono::seconds(4);
+        constexpr auto kVideoStartupTimeout = std::chrono::seconds(8);
+        constexpr auto kVideoKeyframeRequestInterval = std::chrono::seconds(1);
+        constexpr uint64_t kVideoBackpressureKeyframeThreshold = 100;
+
+        constexpr uint16_t kFallbackBatteryVoltageMv = 48000;
+        constexpr int16_t kFallbackBatteryCurrentMa = -1200;
+        constexpr int16_t kFallbackBatteryTemperatureDeciC = 260;
+        constexpr const char *kFallbackFaultCode = "ERROR_NONE";
+        constexpr const char *kFallbackNetworkQuality = "uplink=good;q=0ms;blk=0;drop=0;tx=0.0/60.0";
+        constexpr const char *kFallbackModel = "teleop_robot_demo";
+        constexpr const char *kFallbackFirmwareVersion = "v0.0.0-demo";
+
+        constexpr size_t kRobotJointTelemetryJointCount = 17;
+        constexpr size_t kWaistJointCount = 3;
+        constexpr size_t kArmJointCount = 14;
+        constexpr size_t kArmJointOffset = kWaistJointCount;
+        constexpr std::array<const char *, kRobotJointTelemetryJointCount> kRobotJointTelemetryJointNames{
+            "Waist01_Joint",
+            "Waist02_Joint",
+            "Body0422_Joint",
+            "openarm_left_joint1",
+            "openarm_left_joint2",
+            "openarm_left_joint3",
+            "openarm_left_joint4",
+            "openarm_left_joint5",
+            "openarm_left_joint6",
+            "openarm_left_joint7",
+            "openarm_right_joint1",
+            "openarm_right_joint2",
+            "openarm_right_joint3",
+            "openarm_right_joint4",
+            "openarm_right_joint5",
+            "openarm_right_joint6",
+            "openarm_right_joint7",
+        };
+
+        constexpr std::array<const char *, kWaistJointCount> kWaistFeedbackJointNames{
+            "waist_1",
+            "waist_2",
+            "waist_3",
+        };
+
+        constexpr std::array<const char *, kArmJointCount> kArmFeedbackJointNames{
+            "joint_1",
+            "joint_2",
+            "joint_3",
+            "joint_4",
+            "joint_5",
+            "joint_6",
+            "joint_7",
+            "joint_8",
+            "joint_9",
+            "joint_10",
+            "joint_11",
+            "joint_12",
+            "joint_13",
+            "joint_14",
+        };
+
+        std::optional<size_t> exactRobotJointIndex(const std::string &name)
+        {
+            for (size_t joint_index = 0; joint_index < kRobotJointTelemetryJointNames.size(); ++joint_index)
+            {
+                if (name == kRobotJointTelemetryJointNames[joint_index])
+                {
+                    return joint_index;
+                }
+            }
+            return std::nullopt;
+        }
+
+        std::optional<size_t> waistJointIndexFromFeedbackName(const std::string &name, size_t source_index)
+        {
+            if (const auto exact_index = exactRobotJointIndex(name))
+            {
+                return *exact_index < kWaistJointCount ? exact_index : std::nullopt;
+            }
+            for (size_t joint_index = 0; joint_index < kWaistFeedbackJointNames.size(); ++joint_index)
+            {
+                if (name == kWaistFeedbackJointNames[joint_index])
+                {
+                    return joint_index;
+                }
+            }
+            if (name.empty() && source_index < kWaistJointCount)
+            {
+                return source_index;
+            }
+            return std::nullopt;
+        }
+
+        std::optional<size_t> armJointIndexFromFeedbackName(const std::string &name, size_t source_index)
+        {
+            if (const auto exact_index = exactRobotJointIndex(name))
+            {
+                return *exact_index >= kArmJointOffset ? exact_index : std::nullopt;
+            }
+            for (size_t joint_index = 0; joint_index < kArmFeedbackJointNames.size(); ++joint_index)
+            {
+                if (name == kArmFeedbackJointNames[joint_index])
+                {
+                    return kArmJointOffset + joint_index;
+                }
+            }
+            if (name.empty() && source_index < kArmJointCount)
+            {
+                return kArmJointOffset + source_index;
+            }
+            return std::nullopt;
+        }
+
+        float finiteOrZero(double value)
+        {
+            return std::isfinite(value) ? static_cast<float>(value) : 0.0f;
+        }
+
+        void setJointSample(telemetry::RobotJointTelemetrySnapshot &snapshot,
+                            size_t joint_index,
+                            double position,
+                            double velocity,
+                            double effort)
+        {
+            if (joint_index >= snapshot.joints.size())
             {
                 return;
             }
+            auto &joint = snapshot.joints[joint_index];
+            joint.position_rad = finiteOrZero(position);
+            joint.velocity_rad_s = finiteOrZero(velocity);
+            joint.effort_nm = finiteOrZero(effort);
+            joint.valid = std::isfinite(position);
+        }
 
-            if (fmt == H264StreamFormat::AnnexB)
+        uint16_t encodeVoltageMv(double voltage_v)
+        {
+            if (!std::isfinite(voltage_v))
             {
-                auto is_start_code = [&](size_t i, size_t &sc_len) -> bool
-                {
-                    if (i + 3 <= size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
-                    {
-                        sc_len = 3;
-                        return true;
-                    }
-                    if (i + 4 <= size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
-                    {
-                        sc_len = 4;
-                        return true;
-                    }
-                    return false;
-                };
-
-                size_t i = 0;
-                while (i + 3 < size)
-                {
-                    size_t sc_len = 0;
-                    if (!is_start_code(i, sc_len))
-                    {
-                        ++i;
-                        continue;
-                    }
-                    i += sc_len;
-                    const size_t nal_start = i;
-
-                    while (i + 3 < size)
-                    {
-                        size_t next_sc = 0;
-                        if (is_start_code(i, next_sc))
-                        {
-                            break;
-                        }
-                        ++i;
-                    }
-
-                    const size_t nal_end = i;
-                    if (nal_end > nal_start)
-                    {
-                        fn(data + nal_start, nal_end - nal_start);
-                    }
-                }
+                return 0xFFFFu;
             }
-            else if (fmt == H264StreamFormat::Avcc)
+            const auto scaled_mv = static_cast<long long>(std::llround(voltage_v * 1000.0));
+            return static_cast<uint16_t>(std::clamp<long long>(scaled_mv, 0, std::numeric_limits<uint16_t>::max()));
+        }
+
+        int16_t encodeCurrentMa(double current_a)
+        {
+            if (!std::isfinite(current_a))
             {
-                size_t off = 0;
-                while (off + 4 <= size)
-                {
-                    const uint32_t n = (static_cast<uint32_t>(data[off]) << 24) |
-                                       (static_cast<uint32_t>(data[off + 1]) << 16) |
-                                       (static_cast<uint32_t>(data[off + 2]) << 8) |
-                                       (static_cast<uint32_t>(data[off + 3]));
-                    off += 4;
-                    if (n == 0 || off + n > size)
-                    {
-                        break;
-                    }
-                    fn(data + off, n);
-                    off += n;
-                }
+                return std::numeric_limits<int16_t>::min();
+            }
+            const auto scaled_ma = static_cast<long long>(std::llround(current_a * 1000.0));
+            return static_cast<int16_t>(std::clamp<long long>(
+                scaled_ma,
+                static_cast<long long>(std::numeric_limits<int16_t>::min()),
+                static_cast<long long>(std::numeric_limits<int16_t>::max())));
+        }
+
+        int16_t encodeTemperatureDeciC(double temperature_c)
+        {
+            if (!std::isfinite(temperature_c))
+            {
+                return std::numeric_limits<int16_t>::min();
+            }
+            const auto scaled_deci_c = static_cast<long long>(std::llround(temperature_c * 10.0));
+            return static_cast<int16_t>(std::clamp<long long>(
+                scaled_deci_c,
+                static_cast<long long>(std::numeric_limits<int16_t>::min()),
+                static_cast<long long>(std::numeric_limits<int16_t>::max())));
+        }
+
+        std::string agvErrorDomainToString(uint8_t error_domain)
+        {
+            switch (error_domain)
+            {
+            case AgvDeviceStateMsg::ERROR_NONE:
+                return "ERROR_NONE";
+            case AgvDeviceStateMsg::ERROR_UNKNOWN:
+                return "ERROR_UNKNOWN";
+            case AgvDeviceStateMsg::ERROR_HW:
+                return "ERROR_HW";
+            case AgvDeviceStateMsg::ERROR_SW:
+                return "ERROR_SW";
+            case AgvDeviceStateMsg::ERROR_OVER_TRAVEL:
+                return "ERROR_OVER_TRAVEL";
+            case AgvDeviceStateMsg::EMERGENCY_STOP_HW:
+                return "EMERGENCY_STOP_HW";
+            case AgvDeviceStateMsg::EMERGENCY_STOP_SW:
+                return "EMERGENCY_STOP_SW";
+            case AgvDeviceStateMsg::PROTECTIVE_STOP_HW:
+                return "PROTECTIVE_STOP_HW";
+            case AgvDeviceStateMsg::PROTECTIVE_STOP_SW:
+                return "PROTECTIVE_STOP_SW";
+            case AgvDeviceStateMsg::SAFETY_STOP:
+                return "SAFETY_STOP";
+            case AgvDeviceStateMsg::CALIBRATION_REQUIRED:
+                return "CALIBRATION_REQUIRED";
+            default:
+                return "UNKNOWN_" + std::to_string(static_cast<unsigned int>(error_domain));
             }
         }
-    }
+    } // namespace
 
     MainNode::MainNode() : Node("main_node")
     {
-        if (!selfCheckCamera())
+        configureLogging();
+        direct_running_mode_ = declareOrGet<bool>(*this, "debug.direct_running_mode", false);
+        loadPairingParams();
+        loadRobotTelemetryParams();
+
+        telemetry_battery_sub_ = this->create_subscription<AgvBatteryStateMsg>(
+            "/agv_battery_state", 10,
+            [this](const AgvBatteryStateMsg::SharedPtr msg) { onTelemetryBatteryState(msg); });
+        telemetry_temperature_sub_ = this->create_subscription<TemperatureMsg>(
+            "/temperature", 10,
+            [this](const TemperatureMsg::SharedPtr msg) { onTelemetryTemperature(msg); });
+        telemetry_device_state_sub_ = this->create_subscription<AgvDeviceStateMsg>(
+            "/agv_device_state", 10,
+            [this](const AgvDeviceStateMsg::SharedPtr msg) { onTelemetryDeviceState(msg); });
+        if (joint_telemetry_config_.enabled)
         {
-            RCLCPP_ERROR(this->get_logger(), "Camera self-check failed. Skip gRPC registration and streaming startup.");
-            return;
+            waist_joint_feedback_sub_ = this->create_subscription<WaistJointFeedbackMsg>(
+                joint_telemetry_config_.waist_topic, 10,
+                [this](const WaistJointFeedbackMsg::SharedPtr msg) { onWaistJointFeedback(msg); });
+            arm_joint_feedback_sub_ = this->create_subscription<ArmJointFeedbackMsg>(
+                joint_telemetry_config_.arm_topic, 10,
+                [this](const ArmJointFeedbackMsg::SharedPtr msg) { onArmJointFeedback(msg); });
         }
 
-        this->initGrpc();
-        if (this->signaling_client_->connect() != 0)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Failed to connect gRPC signaling server");
-            return;
-        }
-        if (this->signaling_client_->registerRobot() != 0)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Failed to register to gRPC signaling server");
-            return;
-        }
-
-        bool paired_ok = false;
-        if (pair_mode_ == "active")
-        {
-            paired_ok = runActivePairing();
-        }
-        else
-        {
-            paired_ok = waitForPairing();
-        }
-
-        if (!paired_ok)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Pairing not completed. Skip UDP/video startup.");
-            return;
-        }
-
-        this->initUdp();
-        this->initPoseUdp();
-        this->initVideo();
-
-        if (this->udp_stream_manager_ && this->signaling_client_)
-        {
-            this->udp_stream_manager_->setSessionId(this->signaling_client_->sessionId());
-        }
-    }
-    // -----------------thread handles------------------
-
-    // ------------------init methods-------------------
-
-    void MainNode::initVideo()
-    {
-        if (!video_stream_manager_)
-        {
-            video_stream_manager_ = std::make_unique<trb::video::VideoStreamManager>(*this);
-        }
-
-        video_stream_manager_->setEncodedFrameCallback(
-            [this](const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)
-            {
-                if (!this->video_config_acked_.load(std::memory_order_relaxed))
-                {
-                    this->updateSpsPpsFromEncodedFrame(data, size);
-                    return;
-                }
-                if (this->udp_stream_manager_)
-                {
-                    this->udp_stream_manager_->sendH264Frame(data, size, timestamp_us, keyframe);
-                }
+        video_module_ = std::make_unique<trb::video::VideoModule>(*this, trb::video::VideoModule::Config::configFromRosParam(*this));
+        video_module_->setEncodedFrameCallback(
+            [this](const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe) {
+                onEncodedVideoFrame(data, size, timestamp_us, keyframe);
+            });
+        video_module_->setSpsPpsCallback(
+            [this](const std::vector<uint8_t> &sps, const std::vector<uint8_t> &pps, const std::vector<uint8_t> &vps) {
+                onSpsPpsCaptured(sps, pps, vps);
             });
 
-        if (!video_stream_manager_->start())
-        {
-            RCLCPP_ERROR(this->get_logger(), "VideoStreamManager start failed");
-        }
-        else
-        {
-            startVideoConfigPublisher();
-        }
-    }
-
-    void MainNode::initUdp()
-    {
-        std::string udp_ip = this->declare_parameter<std::string>("udp_ip", "192.168.3.2");
-        int udp_port = this->declare_parameter<int>("udp_port", 7778);
-
-        // Optional: unified logging file sink (selective topics).
-        const bool log_file_enabled = this->declare_parameter<bool>("logging.file.enabled", false);
-        const std::string log_file_path = this->declare_parameter<std::string>("logging.file.path", "/tmp/teleop_robot_bridge.log");
-        const std::vector<std::string> log_file_topics = this->declare_parameter<std::vector<std::string>>("logging.file.topics", std::vector<std::string>{});
-        const uint32_t log_topic_mask = trb::utils::TeleopLogger::fileTopicsFromStrings(log_file_topics, this->get_logger());
-        trb::utils::TeleopLogger::instance().configureFileLogging(log_file_enabled, log_file_path, log_topic_mask);
-
-        const bool stop_after_frames_enabled = this->declare_parameter<bool>("udp.stop_after_frames.enabled", false);
-        const int stop_after_frames_max_frames_param = this->declare_parameter<int>("udp.stop_after_frames.max_frames", 0);
-        const uint32_t stop_after_frames_max_frames = static_cast<uint32_t>(std::max(0, stop_after_frames_max_frames_param));
-
-        const int header_log_max_packets_param = this->declare_parameter<int>("udp.header_log.max_packets", 8);
-        const uint64_t header_log_max_packets = static_cast<uint64_t>(std::max(0, header_log_max_packets_param));
-
-        // FEC (V2): selected by FecTableId only. Current sender supports only table_id=1.
-        const bool fec_enabled = this->declare_parameter<bool>("udp.fec.enabled", true);
-        const int fec_table_id_param = this->declare_parameter<int>("udp.fec.table_id", 1);
-
-        uint8_t fec_table_id = static_cast<uint8_t>(fec_table_id_param & 0xFF);
-
-        // Validate table_id.
-        if (fec_enabled)
-        {
-            if (fec_table_id == 1)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "FEC enabled: table_id=%u (V2 implicit grouping)",
-                    static_cast<unsigned>(fec_table_id));
-            }
-            else
-            {
-                RCLCPP_WARN(
-                    this->get_logger(),
-                    "FEC enabled but unsupported table_id=%u; disabling FEC (only table_id=1 supported)",
-                    static_cast<unsigned>(fec_table_id));
-                fec_table_id = 0;
-            }
-        }
-        else
-        {
-            fec_table_id = 0;
-        }
-
-        // UDP pacing (smooth sending) defaults.
-        // If video.encoder.bitrate is available, use it to derive a reasonable on-wire pacing rate.
-        int64_t encoder_bitrate_bps = 20000000;
-        this->get_parameter_or("video.encoder.bitrate", encoder_bitrate_bps, encoder_bitrate_bps);
-
-        double overhead = 1.0;
-        if (fec_table_id != 0)
-        {
-            // Conservative overhead estimate for pacing: assume a worst-case redundancy.
-            // Roughly 1.25x payload.
-            overhead *= 1.25;
-        }
-        // Add header overhead (V2 header is 26 bytes over a 1200B payload).
-        overhead *= ((1200.0 + 26.0) / 1200.0);
-        // Small safety margin for variability.
-        overhead *= 1.05;
-
-        const uint64_t default_pacing_bps = static_cast<uint64_t>(std::llround(static_cast<double>(encoder_bitrate_bps) * overhead));
-        const bool pacing_enabled = this->declare_parameter<bool>("udp.pacing.enabled", true);
-        const int64_t pacing_bps = this->declare_parameter<int64_t>("udp.pacing.bps", static_cast<int64_t>(default_pacing_bps));
-        const int pacing_queue_max_packets = this->declare_parameter<int>("udp.pacing.queue_max_packets", 1024);
-        const int pacing_queue_max_bytes = this->declare_parameter<int>("udp.pacing.queue_max_bytes", 1024 * 1024);
-
-        const bool udp_send_nonblocking = this->declare_parameter<bool>("udp.send.nonblocking", true);
-        const int udp_send_sndbuf_bytes = this->declare_parameter<int>("udp.send.sndbuf_bytes", 0);
-
-        udp_stream_manager_ = std::make_unique<trb::udp::UdpStreamManager>(udp_ip, udp_port);
-        if (!udp_stream_manager_->start())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Failed to start UDP stream manager");
-        }
-        else
-        {
-            RCLCPP_INFO(this->get_logger(), "UDP stream manager started on %s:%d", udp_ip.c_str(), udp_port);
-        }
-
-        if (udp_stream_manager_)
-        {
-            udp_stream_manager_->setPacingEnabled(pacing_enabled);
-            udp_stream_manager_->setPacingRateBps(pacing_bps > 0 ? static_cast<uint64_t>(pacing_bps) : 0ULL);
-            udp_stream_manager_->setQueueLimits(
-                pacing_queue_max_packets > 0 ? static_cast<size_t>(pacing_queue_max_packets) : 0ULL,
-                pacing_queue_max_bytes > 0 ? static_cast<size_t>(pacing_queue_max_bytes) : 0ULL);
-
-            udp_stream_manager_->setSendNonBlocking(udp_send_nonblocking);
-            if (udp_send_sndbuf_bytes > 0)
-            {
-                udp_stream_manager_->setSendBufferBytes(udp_send_sndbuf_bytes);
-            }
-
-            udp_stream_manager_->setStopAfterFramesMaxFrames(stop_after_frames_max_frames);
-            udp_stream_manager_->setStopAfterFramesEnabled(stop_after_frames_enabled);
-
-            udp_stream_manager_->setHeaderLogMaxPackets(header_log_max_packets);
-        }
-
-        if (udp_stream_manager_)
-        {
-            const bool scream_enabled = this->declare_parameter<bool>("udp.scream.enabled", false);
-            const int64_t scream_fallback_bps = this->declare_parameter<int64_t>(
-                "udp.scream.fallback_pacing_bps",
-                pacing_bps > 0 ? pacing_bps : static_cast<int64_t>(0));
-            const int64_t scream_min_pacing_bps = this->declare_parameter<int64_t>("udp.scream.min_pacing_bps", 0);
-            const int64_t scream_max_pacing_bps = this->declare_parameter<int64_t>("udp.scream.max_pacing_bps", 0);
-            const int64_t scream_min_target_bps = this->declare_parameter<int64_t>("udp.scream.min_target_bitrate_bps", 0);
-            const int64_t scream_max_target_bps = this->declare_parameter<int64_t>("udp.scream.max_target_bitrate_bps", 0);
-
-            std::unique_ptr<trb::udp::IScreamController> scream;
-            if (scream_enabled)
-            {
-                scream = std::make_unique<trb::udp::ScreamControllerEricsson>();
-            }
-            else
-            {
-                scream.reset();
-            }
-            trb::udp::ScreamControllerConfig cfg;
-            cfg.enabled = scream_enabled;
-            cfg.fallback_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_fallback_bps));
-            cfg.min_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_min_pacing_bps));
-            cfg.max_pacing_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_pacing_bps));
-            cfg.min_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_min_target_bps));
-            cfg.max_target_bitrate_bps = static_cast<uint64_t>(std::max<int64_t>(0, scream_max_target_bps));
-            if (scream)
-            {
-                scream->setConfig(cfg);
-                udp_stream_manager_->setScreamController(std::move(scream));
-            }
-            udp_stream_manager_->setScreamEnabled(scream_enabled);
-
-            udp_stream_manager_->setTargetBitrateCallback(
-                [this](uint64_t bps)
+        udp_module_ = std::make_unique<trb::udp::UdpModule>(*this, trb::udp::UdpModule::Config::configFromRosParam(*this));
+        udp_module_->setAudioDatagramCallback(
+            [this](uint16_t seq, const uint8_t *data, size_t size, uint64_t timestamp_ntp) {
+                if (audio_module_)
                 {
-                    if (this->video_stream_manager_)
-                    {
-                        this->video_stream_manager_->setTargetBitrate(static_cast<uint32_t>(bps));
-                    }
-                });
-        }
-
-        if (udp_stream_manager_)
-        {
-            udp_stream_manager_->setFecTableId(fec_table_id);
-        }
-    }
-
-    void MainNode::initPoseUdp()
-    {
-        const bool enabled = this->declare_parameter<bool>("pose_udp.enabled", false);
-        if (!enabled)
-        {
-            RCLCPP_INFO(this->get_logger(), "Pose UDP receiver disabled (pose_udp.enabled=false)");
-            return;
-        }
-
-        if (!udp_stream_manager_)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Pose UDP receiver enabled but udp_stream_manager_ is null");
-            return;
-        }
-
-        trb::udp::PoseUdpReceiverConfig cfg;
-        // NOTE: We reuse UdpStreamManager's socket/recv thread; these bind/timeout settings are kept
-        // for backward compatibility with standalone mode, but are not used in shared-socket mode.
-        cfg.bind_ip = this->declare_parameter<std::string>("pose_udp.bind_ip", cfg.bind_ip);
-        cfg.bind_port = this->declare_parameter<int>("pose_udp.bind_port", cfg.bind_port);
-        cfg.allowed_remote_ip = this->declare_parameter<std::string>("pose_udp.allowed_remote_ip", cfg.allowed_remote_ip);
-        cfg.recv_timeout_ms = this->declare_parameter<int>("pose_udp.recv_timeout_ms", cfg.recv_timeout_ms);
-        cfg.qos_depth = this->declare_parameter<int>("pose_udp.qos.depth", cfg.qos_depth);
-
-        cfg.frame_id_hmd = this->declare_parameter<std::string>("pose_udp.frame_id.hmd", cfg.frame_id_hmd);
-        cfg.frame_id_left_controller = this->declare_parameter<std::string>("pose_udp.frame_id.left_controller", cfg.frame_id_left_controller);
-        cfg.frame_id_right_controller = this->declare_parameter<std::string>("pose_udp.frame_id.right_controller", cfg.frame_id_right_controller);
-        cfg.frame_id_left_aim = this->declare_parameter<std::string>("pose_udp.frame_id.left_aim", cfg.frame_id_left_aim);
-        cfg.frame_id_right_aim = this->declare_parameter<std::string>("pose_udp.frame_id.right_aim", cfg.frame_id_right_aim);
-
-        cfg.publish_euler = this->declare_parameter<bool>("pose_udp.publish_euler", true);
-        cfg.publish_buttons = this->declare_parameter<bool>("pose_udp.publish_buttons", true);
-        cfg.publish_aim = this->declare_parameter<bool>("pose_udp.publish_aim", true);
-
-        pose_udp_receiver_ = std::make_unique<trb::udp::PoseUdpReceiver>(*this, cfg);
-
-        // Hook into the existing UDP receive loop.
-        udp_stream_manager_->setPoseDatagramCallback(
-            [this](const uint8_t *data, size_t size)
-            {
-                if (this->pose_udp_receiver_)
-                {
-                    this->pose_udp_receiver_->handleDatagram(data, size);
+                    (void)audio_module_->receiveRemotePacket(seq, data, size, timestamp_ntp);
                 }
             });
+        udp_module_->setHandshakeReadyCallback([this]() { onUdpHandshakeReady(); });
+        udp_module_->setPeerLostCallback([this]() { onUdpPeerLost(); });
 
-        RCLCPP_INFO(this->get_logger(), "Pose UDP receiver enabled (shared socket via UdpStreamManager)");
-    }
-
-    void MainNode::initGrpc()
-    {
-        // Get parameters
-        std::string server_ip = this->declare_parameter<std::string>("server_ip", "127.0.0.1");
-        int server_port = this->declare_parameter<int>("server_port", 8000);
-        bool use_ssl = this->declare_parameter<bool>("use_ssl", false);
-        std::string device_id = this->declare_parameter<std::string>("device_id", "robot_001");
-        std::string token = this->declare_parameter<std::string>("token", "default_token");
-        subscribe_vr_pose_flag_ = this->declare_parameter<bool>("subscribe_vr_pose_flag", false);
-
-        // Pairing parameters
-        pair_mode_ = this->declare_parameter<std::string>("pair.mode", "passive");
+        audio_module_ = std::make_unique<trb::audio::AudioModule>(*this, trb::audio::AudioModule::configFromRosParam(*this));
+        audio_module_->setEncodedPacketCallback(
+            [this](const uint8_t *data, size_t size, uint64_t timestamp_ntp) {
+                onEncodedAudioPacket(data, size, timestamp_ntp);
+            });
+        const bool audio_initialized = audio_module_->initialize();
+        if (audio_module_->config().enabled && !audio_initialized)
         {
-            std::transform(pair_mode_.begin(), pair_mode_.end(), pair_mode_.begin(), [](unsigned char c)
-                           { return static_cast<char>(std::tolower(c)); });
-            if (pair_mode_ != "active" && pair_mode_ != "passive")
+            RCLCPP_WARN(this->get_logger(), "AudioModule initialization failed; audio will stay disabled for this process");
+        }
+
+        const bool video_stats_enabled = declareOrGet<bool>(*this, "logging.modules.video_stats", true);
+        const double stats_period_sec = std::max(0.1, declareOrGet<double>(*this, "logging.modules.period_sec", 1.0));
+        if (video_stats_enabled)
+        {
+            last_video_stats_time_ = std::chrono::steady_clock::now();
+            video_stats_timer_ = this->create_wall_timer(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(stats_period_sec)),
+                [this]() { videoStatsTimerCallback(); });
+            RCLCPP_INFO(this->get_logger(), "Video stats logging enabled: period=%.2fs", stats_period_sec);
+        }
+
+        if (direct_running_mode_)
+        {
+            if (!udp_module_->start(std::string{}))
             {
-                RCLCPP_WARN(this->get_logger(), "Invalid pair.mode='%s', falling back to 'passive'", pair_mode_.c_str());
-                pair_mode_ = "passive";
-            }
-        }
-        desired_peer_session_id_ = this->declare_parameter<std::string>("pair.peer_session_id", "");
-        pair_auto_accept_ = this->declare_parameter<bool>("pair.auto_accept", true);
-        pair_auto_request_ = this->declare_parameter<bool>("pair.auto_request", true);
-        pair_list_unpaired_on_start_ = this->declare_parameter<bool>("pair.list_unpaired_on_start", false);
-
-        RCLCPP_INFO(this->get_logger(), "Initializing SignalingClient with IP: %s, Port: %d, SSL: %s, DeviceID: %s",
-                    server_ip.c_str(), server_port, use_ssl ? "true" : "false", device_id.c_str());
-
-        // Initialize signaling client
-        signaling_client_ = std::make_shared<SignalingClient>(
-            this->get_logger(),
-            server_ip,
-            server_port,
-            token,
-            device_id,
-            use_ssl);
-
-        // Create heartbeat timer (1 second interval)
-        heartbeat_timer_ = this->create_wall_timer(
-            std::chrono::seconds(15),
-            std::bind(&MainNode::heartbeatTimerCallback, this));
-
-        // Start event stream
-        signaling_client_->startEventStream(std::bind(&MainNode::onSignalingEvent, this, std::placeholders::_1));
-    }
-
-    bool MainNode::selfCheckCamera()
-    {
-        // Unified profile: [width, height, framerate]
-        std::vector<int64_t> profile = {3840, 1520, 30};
-        this->get_parameter_or("video.profile", profile, profile);
-        uint32_t width = 3840;
-        uint32_t height = 1520;
-        uint32_t framerate = 30;
-        if (profile.size() == 3 && profile[0] > 0 && profile[1] > 0 && profile[2] > 0)
-        {
-            width = static_cast<uint32_t>(profile[0]);
-            height = static_cast<uint32_t>(profile[1]);
-            framerate = static_cast<uint32_t>(profile[2]);
-        }
-
-        video_width_ = width;
-        video_height_ = height;
-        video_fps_ = framerate;
-
-        std::string video_device = "/dev/video0";
-        std::string pixel_format_str = "mjpeg";
-        int64_t v4l2_buffer_count_param = 8;
-        this->get_parameter_or("video.device", video_device, video_device);
-        this->get_parameter_or("video.pixel_format", pixel_format_str, pixel_format_str);
-        this->get_parameter_or("video.v4l2.buffer_count", v4l2_buffer_count_param, v4l2_buffer_count_param);
-        const uint32_t v4l2_buffer_count = (v4l2_buffer_count_param > 0) ? static_cast<uint32_t>(v4l2_buffer_count_param) : 8;
-
-        trb::video::VideoV4L2Capturer::Config cap_cfg;
-        cap_cfg.width = width;
-        cap_cfg.height = height;
-        cap_cfg.framerate = framerate;
-        cap_cfg.device_path = video_device;
-        cap_cfg.buffer_count = v4l2_buffer_count;
-
-        std::string fmt = pixel_format_str;
-        std::transform(fmt.begin(), fmt.end(), fmt.begin(), [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        if (fmt == "mjpeg" || fmt == "mjpg")
-        {
-            cap_cfg.pixel_format = V4L2_PIX_FMT_MJPEG;
-        }
-        else if (fmt == "yuyv" || fmt == "yuy2")
-        {
-            cap_cfg.pixel_format = V4L2_PIX_FMT_YUYV;
-        }
-        else
-        {
-            RCLCPP_WARN(this->get_logger(), "Unknown video.pixel_format='%s', falling back to mjpeg", pixel_format_str.c_str());
-            cap_cfg.pixel_format = V4L2_PIX_FMT_MJPEG;
-        }
-
-        trb::video::VideoV4L2Capturer capturer;
-        if (!capturer.initialize(cap_cfg))
-        {
-            RCLCPP_ERROR(this->get_logger(), "Camera self-check: failed to initialize V4L2 capturer (%s)", video_device.c_str());
-            return false;
-        }
-
-        if (!capturer.start())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Camera self-check: failed to start V4L2 capturer (%s)", video_device.c_str());
-            return false;
-        }
-
-        bool got_frame = false;
-        for (int i = 0; i < 3; ++i)
-        {
-            trb::video::VideoV4L2Capturer::Frame frame;
-            if (capturer.dequeue(frame, 500))
-            {
-                capturer.requeue(frame.v4l2_buf);
-                got_frame = true;
-                break;
-            }
-        }
-
-        capturer.stop();
-
-        if (!got_frame)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Camera self-check: no frame received from %s", video_device.c_str());
-        }
-        else
-        {
-            RCLCPP_INFO(this->get_logger(), "Camera self-check passed (%s)", video_device.c_str());
-        }
-
-        return got_frame;
-    }
-
-    bool MainNode::runActivePairing()
-    {
-        if (!signaling_client_)
-        {
-            return false;
-        }
-
-        if (!pair_auto_request_)
-        {
-            RCLCPP_WARN(this->get_logger(), "pair.auto_request is false; switching to passive wait");
-            return waitForPairing();
-        }
-
-        while (rclcpp::ok())
-        {
-            auto list = signaling_client_->listUnpaired(signaling::RegisterRequest::VR);
-
-            if (list.empty())
-            {
-                RCLCPP_WARN(this->get_logger(), "No unpaired VR endpoints found. Retrying in 2s...");
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
-
-            std::cout << "\nUnpaired VR endpoints:" << std::endl;
-            for (size_t i = 0; i < list.size(); ++i)
-            {
-                std::cout << "  [" << (i + 1) << "] session=" << list[i].session_id()
-                          << " device=" << list[i].device_id() << std::endl;
-            }
-            std::cout << "Select index (1-" << list.size() << ", 0 to refresh): " << std::flush;
-
-            std::string line;
-            if (!std::getline(std::cin, line))
-            {
-                RCLCPP_ERROR(this->get_logger(), "Failed to read selection from stdin");
-                return false;
-            }
-
-            int choice = 0;
-            try
-            {
-                choice = std::stoi(line);
-            }
-            catch (...)
-            {
-                RCLCPP_WARN(this->get_logger(), "Invalid input. Please enter a number.");
-                continue;
-            }
-
-            if (choice == 0)
-            {
-                continue;
-            }
-
-            if (choice < 1 || static_cast<size_t>(choice) > list.size())
-            {
-                RCLCPP_WARN(this->get_logger(), "Invalid selection index: %d", choice);
-                continue;
-            }
-
-            const auto &peer_session_id = list[static_cast<size_t>(choice - 1)].session_id();
-            RCLCPP_INFO(this->get_logger(), "Requesting pair with %s", peer_session_id.c_str());
-            signaling_client_->requestPair(peer_session_id);
-
-            std::unique_lock<std::mutex> lk(pair_mutex_);
-            const bool ok = pair_cv_.wait_for(lk, std::chrono::seconds(20), [this]()
-                                              { return paired_ready_; });
-            if (ok)
-            {
-                return true;
-            }
-
-            RCLCPP_WARN(this->get_logger(), "Pairing timeout. Please select again.");
-        }
-
-        return false;
-    }
-
-    bool MainNode::waitForPairing()
-    {
-        RCLCPP_INFO(this->get_logger(), "Waiting for pairing (passive mode)...");
-        std::unique_lock<std::mutex> lk(pair_mutex_);
-        while (!paired_ready_ && rclcpp::ok() && !shutting_down_.load())
-        {
-            pair_cv_.wait_for(lk, std::chrono::milliseconds(200));
-        }
-        return paired_ready_ && !shutting_down_.load();
-    }
-
-    void MainNode::startVideoConfigPublisher()
-    {
-        if (video_config_running_.exchange(true))
-        {
-            return;
-        }
-        video_config_acked_.store(false, std::memory_order_relaxed);
-        video_config_thread_ = std::thread(&MainNode::videoConfigPublisherLoop, this);
-    }
-
-    void MainNode::stopVideoConfigPublisher()
-    {
-        video_config_running_.store(false, std::memory_order_relaxed);
-        video_config_cv_.notify_all();
-        if (video_config_thread_.joinable())
-        {
-            if (std::this_thread::get_id() != video_config_thread_.get_id())
-            {
-                video_config_thread_.join();
-            }
-        }
-    }
-
-    void MainNode::resetVideoConfigState()
-    {
-        std::lock_guard<std::mutex> lk(video_config_mutex_);
-        video_sps_.clear();
-        video_pps_.clear();
-        video_vps_.clear();
-        last_video_config_id_.clear();
-        video_config_acked_.store(false, std::memory_order_relaxed);
-        video_config_cv_.notify_all();
-    }
-
-    std::string MainNode::makeVideoConfigId()
-    {
-        const uint64_t seq = video_config_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        const std::string sid = (signaling_client_ && !signaling_client_->sessionId().empty())
-                                    ? signaling_client_->sessionId()
-                                    : "unknown";
-        std::ostringstream oss;
-        oss << sid << "-" << now_ms << "-" << seq;
-        return oss.str();
-    }
-
-    void MainNode::updateSpsPpsFromEncodedFrame(const uint8_t *data, size_t size)
-    {
-        if (!data || size == 0)
-        {
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(video_config_mutex_);
-            if (!video_sps_.empty() && !video_pps_.empty())
-            {
+                RCLCPP_ERROR(this->get_logger(), "Direct running mode failed: UdpModule start failed");
                 return;
             }
-        }
-
-        const H264StreamFormat fmt = detectH264Format(data, size);
-        if (fmt == H264StreamFormat::Unknown)
-        {
+            enterDirectRunningMode();
+            RCLCPP_INFO(this->get_logger(), "teleop_robot_bridge node initialized in direct running mode");
             return;
         }
 
-        bool ready = false;
-        forEachNal(data, size, fmt, [&](const uint8_t *nal, size_t nal_size)
-                   {
-                       if (nal_size < 1)
-                           return;
-                       const uint8_t nal_unit_type = static_cast<uint8_t>(nal[0] & 0x1Fu);
-                       if (nal_unit_type != 7 && nal_unit_type != 8)
-                           return;
+        grpc_module_ = std::make_unique<GrpcModule>(*this, GrpcModule::configFromRosParam(*this));
+        grpc_module_->setRegisteredCallback([this]() { onGrpcRegistered(); });
+        grpc_module_->setHeartbeatFailCallback([this]() { onGrpcHeartbeatFail(); });
+        grpc_module_->setStreamEndCallback([this]() { onGrpcStreamEnd(); });
+        grpc_module_->setSignalingEventCallback([this](const signaling::EventMessage &message) { onSignalingEvent(message); });
+        grpc_module_->start();
 
-                       std::lock_guard<std::mutex> lk(video_config_mutex_);
-                       if (nal_unit_type == 7 && video_sps_.empty())
-                       {
-                           video_sps_.assign(nal, nal + nal_size);
-                       }
-                       else if (nal_unit_type == 8 && video_pps_.empty())
-                       {
-                           video_pps_.assign(nal, nal + nal_size);
-                       }
-
-                       if (!video_sps_.empty() && !video_pps_.empty())
-                       {
-                           ready = true;
-                       } });
-
-        if (ready)
-        {
-            video_config_cv_.notify_all();
-        }
-    }
-
-    void MainNode::videoConfigPublisherLoop()
-    {
-        while (video_config_running_.load(std::memory_order_relaxed) && rclcpp::ok() && !shutting_down_.load())
-        {
-            std::unique_lock<std::mutex> lk(video_config_mutex_);
-            video_config_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]()
-                                      { return !video_config_running_.load(std::memory_order_relaxed) ||
-                                               (paired_ready_ && !video_sps_.empty() && !video_pps_.empty()); });
-
-            if (!video_config_running_.load(std::memory_order_relaxed))
-            {
-                break;
-            }
-
-            if (!paired_ready_ || video_sps_.empty() || video_pps_.empty())
-            {
-                continue;
-            }
-
-            if (!signaling_client_)
-            {
-                lk.unlock();
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
-            }
-
-            signaling::VideoConfig config;
-            config.set_codec(signaling::VideoConfig::H264);
-            config.set_width(static_cast<int32_t>(video_width_));
-            config.set_height(static_cast<int32_t>(video_height_));
-            config.set_fps(static_cast<int32_t>(video_fps_));
-            config.set_sps(video_sps_.data(), video_sps_.size());
-            config.set_pps(video_pps_.data(), video_pps_.size());
-            const std::string config_id = makeVideoConfigId();
-            config.set_config_id(config_id);
-            last_video_config_id_ = config_id;
-
-            lk.unlock();
-
-            while (video_config_running_.load(std::memory_order_relaxed))
-            {
-                if (!paired_ready_)
-                {
-                    break;
-                }
-                if (signaling_client_->publishVideoConfig(config) == 0)
-                {
-                    video_config_acked_.store(true, std::memory_order_relaxed);
-                    RCLCPP_INFO(this->get_logger(), "VideoConfig ACK received, start streaming video");
-                    break;
-                }
-                RCLCPP_WARN(this->get_logger(), "PublishVideoConfig no-ack, retrying in 3s...");
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-            }
-
-            if (video_config_acked_.load(std::memory_order_relaxed))
-            {
-                break;
-            }
-        }
-    }
-
-    bool MainNode::reRegisterAndWaitForPairing()
-    {
-        if (reconnecting_.exchange(true))
-        {
-            RCLCPP_WARN(this->get_logger(), "Reconnect already in progress; skipping");
-            return false;
-        }
-
-        if (!signaling_client_)
-        {
-            reconnecting_.store(false, std::memory_order_relaxed);
-            return false;
-        }
-
-        stopVideoConfigPublisher();
-
-        {
-            std::lock_guard<std::mutex> lk(pair_mutex_);
-            paired_ready_ = false;
-            paired_peer_session_id_.clear();
-        }
-        pair_cv_.notify_all();
-
-        signaling_client_->stopEventStream();
-        resetVideoConfigState();
-
-        bool registered = false;
-        while (rclcpp::ok() && !shutting_down_.load())
-        {
-            if (signaling_client_->connect() == 0 && signaling_client_->registerRobot() == 0)
-            {
-                registered = true;
-                break;
-            }
-            RCLCPP_WARN(this->get_logger(), "Re-register failed. Retrying in 3s...");
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-        }
-
-        if (!registered)
-        {
-            reconnecting_.store(false, std::memory_order_relaxed);
-            return false;
-        }
-
-        signaling_client_->startEventStream(std::bind(&MainNode::onSignalingEvent, this, std::placeholders::_1));
-
-        bool paired_ok = false;
-        if (pair_mode_ == "active")
-        {
-            paired_ok = runActivePairing();
-        }
-        else
-        {
-            paired_ok = waitForPairing();
-        }
-
-        if (paired_ok && udp_stream_manager_)
-        {
-            udp_stream_manager_->setSessionId(signaling_client_->sessionId());
-        }
-
-        if (paired_ok)
-        {
-            startVideoConfigPublisher();
-        }
-
-        reconnecting_.store(false, std::memory_order_relaxed);
-        return paired_ok;
-    }
-
-    void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
-    {
-        RCLCPP_INFO(this->get_logger(), "Received EventMessage from %s", msg.sender_session_id().c_str());
-
-        if (msg.has_pair())
-        {
-            const auto &pair_event = msg.pair();
-            switch (pair_event.op())
-            {
-            case signaling::PairEvent::REQUEST:
-            {
-                const auto &peer = pair_event.peer_session_id();
-                const bool peer_matches = desired_peer_session_id_.empty() || (peer == desired_peer_session_id_);
-                if (pair_auto_accept_ && peer_matches)
-                {
-                    RCLCPP_INFO(this->get_logger(), "Pair Request from %s. Auto-accepting...", peer.c_str());
-                    signaling_client_->acceptPair(peer);
-                    paired_peer_session_id_ = peer;
-
-                    {
-                        std::lock_guard<std::mutex> lk(pair_mutex_);
-                        paired_ready_ = true;
-                    }
-                    pair_cv_.notify_all();
-
-                    video_config_acked_.store(false, std::memory_order_relaxed);
-                    startVideoConfigPublisher();
-
-                    if (subscribe_vr_pose_flag_)
-                    {
-                        signaling_client_->subscribeVrPose(peer);
-                    }
-                }
-                else
-                {
-                    RCLCPP_WARN(this->get_logger(), "Pair Request from %s rejected (auto_accept=%s, desired_peer=%s)",
-                                peer.c_str(), pair_auto_accept_ ? "true" : "false", desired_peer_session_id_.c_str());
-                    signaling_client_->rejectPair(peer);
-                }
-                break;
-            }
-            case signaling::PairEvent::ACCEPT:
-            {
-                const auto &peer = pair_event.peer_session_id();
-                RCLCPP_INFO(this->get_logger(), "Pair Accepted by %s", peer.c_str());
-                paired_peer_session_id_ = peer;
-                {
-                    std::lock_guard<std::mutex> lk(pair_mutex_);
-                    paired_ready_ = true;
-                }
-                pair_cv_.notify_all();
-                video_config_acked_.store(false, std::memory_order_relaxed);
-                startVideoConfigPublisher();
-                if (subscribe_vr_pose_flag_)
-                {
-                    signaling_client_->subscribeVrPose(peer);
-                }
-                break;
-            }
-            case signaling::PairEvent::REJECT:
-            {
-                const auto &peer = pair_event.peer_session_id();
-                RCLCPP_WARN(this->get_logger(), "Pair Rejected by %s", peer.c_str());
-                if (paired_peer_session_id_ == peer)
-                {
-                    paired_peer_session_id_.clear();
-                }
-                {
-                    std::lock_guard<std::mutex> lk(pair_mutex_);
-                    paired_ready_ = false;
-                }
-                pair_cv_.notify_all();
-                stopVideoConfigPublisher();
-                break;
-            }
-            case signaling::PairEvent::UNPAIR:
-            {
-                const auto &peer = pair_event.peer_session_id();
-                RCLCPP_INFO(this->get_logger(), "Unpaired by %s", peer.c_str());
-                if (paired_peer_session_id_ == peer)
-                {
-                    paired_peer_session_id_.clear();
-                }
-                {
-                    std::lock_guard<std::mutex> lk(pair_mutex_);
-                    paired_ready_ = false;
-                }
-                pair_cv_.notify_all();
-                stopVideoConfigPublisher();
-                if (subscribe_vr_pose_flag_)
-                {
-                    signaling_client_->unsubscribe(peer);
-                }
-                break;
-            }
-            default:
-                break;
-            }
-        }
-        else if (msg.has_system())
-        {
-            const auto &sys_cmd = msg.system();
-            switch (sys_cmd.action())
-            {
-            case signaling::SystemCommand::REQUEST_UDP_HELLO:
-                RCLCPP_WARN(this->get_logger(), "Server requested UDP HELLO resend");
-                // TODO: Trigger UDP HELLO resend in UdpStreamManager
-                // if (udp_stream_manager_) udp_stream_manager_->forceSendHello();
-                break;
-            default:
-                RCLCPP_INFO(this->get_logger(), "Received SystemCommand: %d", sys_cmd.action());
-                break;
-            }
-        }
-    }
-
-    void MainNode::heartbeatTimerCallback()
-    {
-        if (signaling_client_)
-        {
-            signaling_client_->tickHeartbeat();
-        }
+        RCLCPP_INFO(this->get_logger(), "teleop_robot_bridge node initialized");
     }
 
     MainNode::~MainNode()
     {
         RCLCPP_INFO(this->get_logger(), "Shutting down MainNode...");
+        shutting_down_.store(true, std::memory_order_release);
 
+        if (grpc_module_)
         {
-            std::lock_guard<std::mutex> lk(pair_mutex_);
-            shutting_down_.store(true);
-            paired_ready_ = false;
+            grpc_module_->setRegisteredCallback({});
+            grpc_module_->setHeartbeatFailCallback({});
+            grpc_module_->setStreamEndCallback({});
+            grpc_module_->setSignalingEventCallback({});
         }
-        pair_cv_.notify_all();
-
-        // 1. Cancel timers
-        if (heartbeat_timer_)
+        if (video_module_)
         {
-            heartbeat_timer_->cancel();
-            heartbeat_timer_.reset();
+            video_module_->setEncodedFrameCallback({});
+            video_module_->setSpsPpsCallback({});
+        }
+        if (audio_module_)
+        {
+            audio_module_->setEncodedPacketCallback({});
+        }
+        if (udp_module_)
+        {
+            udp_module_->setHandshakeReadyCallback({});
+            udp_module_->setPeerLostCallback({});
+            udp_module_->setAudioDatagramCallback({});
         }
 
-        stopVideoConfigPublisher();
+        stopNegotiationRetryTimer();
+        stopPairingRetryTimer();
+        if (session_work_timer_)
+        {
+            session_work_timer_->cancel();
+            session_work_timer_.reset();
+        }
+        {
+            std::lock_guard<std::mutex> lock(session_work_mutex_);
+            session_work_queue_.clear();
+        }
+        if (video_stats_timer_)
+        {
+            video_stats_timer_->cancel();
+            video_stats_timer_.reset();
+        }
+        stopRobotTelemetry();
+        if (telemetry_timer_)
+        {
+            telemetry_timer_.reset();
+        }
+        if (joint_telemetry_timer_)
+        {
+            joint_telemetry_timer_.reset();
+        }
 
-        // 2. Stop Video Pipeline (Producers)
-        // This ensures no new frames are sent to UDP manager
+        if (grpc_module_)
+        {
+            grpc_module_->stop();
+            grpc_module_.reset();
+        }
         stopVideo();
-
-        // 2.5 Stop Pose UDP receiver (input)
-        if (udp_stream_manager_)
+        if (audio_module_)
         {
-            udp_stream_manager_->setPoseDatagramCallback(nullptr);
+            audio_module_->stop();
+            audio_module_.reset();
         }
-        if (pose_udp_receiver_)
+        if (udp_module_)
         {
-            pose_udp_receiver_->stop();
-            pose_udp_receiver_.reset();
-        }
-
-        // 3. Stop UDP Manager (Transport)
-        if (udp_stream_manager_)
-        {
-            udp_stream_manager_->stop();
-            udp_stream_manager_.reset();
-        }
-
-        // 4. Stop Signaling Client (Control/Events)
-        if (signaling_client_)
-        {
-            signaling_client_->stopEventStream();
-            signaling_client_.reset();
+            udp_module_->stop();
+            udp_module_.reset();
         }
 
         RCLCPP_INFO(this->get_logger(), "MainNode shutdown complete.");
     }
 
-    void MainNode::stopVideo()
+    void MainNode::configureLogging()
     {
-        if (video_stream_manager_)
+        const bool log_file_enabled = declareOrGet<bool>(*this, "logging.file.enabled", false);
+        const std::string log_file_path = declareOrGet<std::string>(*this, "logging.file.path", "/tmp/teleop_robot_bridge.log");
+        const auto log_file_topics = declareOrGet<std::vector<std::string>>(*this, "logging.file.topics", std::vector<std::string>{});
+        const uint32_t log_topic_mask = trb::utils::TeleopLogger::fileTopicsFromStrings(log_file_topics, this->get_logger());
+        trb::utils::TeleopLogger::instance().configureFileLogging(log_file_enabled, log_file_path, log_topic_mask);
+    }
+
+    void MainNode::loadPairingParams()
+    {
+        subscribe_vr_pose_flag_ = declareOrGet<bool>(*this, "subscribe_vr_pose_flag", false);
+        pair_mode_ = declareOrGet<std::string>(*this, "pair.mode", "passive");
+        std::transform(pair_mode_.begin(), pair_mode_.end(), pair_mode_.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        if (pair_mode_ != "active" && pair_mode_ != "passive")
         {
-            video_stream_manager_->stop();
-            video_stream_manager_.reset();
+            RCLCPP_WARN(this->get_logger(), "Invalid pair.mode='%s', falling back to passive", pair_mode_.c_str());
+            pair_mode_ = "passive";
+        }
+
+        desired_peer_session_id_ = declareOrGet<std::string>(*this, "pair.peer_session_id", "");
+        pair_auto_accept_ = declareOrGet<bool>(*this, "pair.auto_accept", true);
+        pair_auto_request_ = declareOrGet<bool>(*this, "pair.auto_request", true);
+        pair_list_unpaired_on_start_ = declareOrGet<bool>(*this, "pair.list_unpaired_on_start", false);
+    }
+
+    void MainNode::loadRobotTelemetryParams()
+    {
+        telemetry_config_.enabled = declareOrGet<bool>(*this, "telemetry.low_rate.enabled", false);
+        telemetry_config_.period_sec = std::max(0.1, declareOrGet<double>(*this, "telemetry.low_rate.period_sec", 1.0));
+        telemetry_config_.snapshot = telemetry::RobotTelemetrySnapshot{};
+        telemetry_config_.snapshot.version = telemetry::kRobotTelemetryPayloadVersion;
+        telemetry_config_.snapshot.battery_voltage_mv = kFallbackBatteryVoltageMv;
+        telemetry_config_.snapshot.battery_current_ma = kFallbackBatteryCurrentMa;
+        telemetry_config_.snapshot.battery_temperature_deci_c = kFallbackBatteryTemperatureDeciC;
+        telemetry_config_.snapshot.fault_code = kFallbackFaultCode;
+        telemetry_config_.snapshot.network_quality = kFallbackNetworkQuality;
+        telemetry_config_.snapshot.model = declareOrGet<std::string>(*this, "telemetry.low_rate.model", kFallbackModel);
+        if (telemetry_config_.snapshot.model.empty())
+        {
+            telemetry_config_.snapshot.model = kFallbackModel;
+        }
+        telemetry_config_.snapshot.firmware_version = kFallbackFirmwareVersion;
+
+        joint_telemetry_config_.enabled = declareOrGet<bool>(*this, "telemetry.high_rate.enabled", true);
+        joint_telemetry_config_.period_sec = std::max(0.005, declareOrGet<double>(*this, "telemetry.high_rate.period_sec", 0.02));
+        joint_telemetry_config_.waist_topic = declareOrGet<std::string>(*this, "telemetry.high_rate.waist_topic", "/waist_joint_feedback");
+        joint_telemetry_config_.arm_topic = declareOrGet<std::string>(*this, "telemetry.high_rate.arm_topic", "/arm_joint_feedback");
+        const int joint_schema_id = declareOrGet<int>(*this, "telemetry.high_rate.schema_id", telemetry::kRobotJointTelemetrySchemaId);
+        joint_telemetry_config_.snapshot = telemetry::RobotJointTelemetrySnapshot{};
+        joint_telemetry_config_.snapshot.version = telemetry::kRobotJointTelemetryPayloadVersion;
+        joint_telemetry_config_.snapshot.schema_id = static_cast<uint16_t>(std::clamp(joint_schema_id, 0, 0xFFFF));
+        joint_telemetry_config_.snapshot.sample_timestamp_ms = nowUnixMs();
+        joint_telemetry_config_.snapshot.joints.assign(kRobotJointTelemetryJointCount, telemetry::RobotJointStateSample{});
+    }
+
+    void MainNode::onTelemetryBatteryState(const AgvBatteryStateMsg::SharedPtr msg)
+    {
+        if (!msg)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(telemetry_snapshot_mutex_);
+        telemetry_config_.snapshot.battery_voltage_mv = encodeVoltageMv(msg->battery_state.voltage);
+        telemetry_config_.snapshot.battery_current_ma = encodeCurrentMa(msg->battery_state.current);
+    }
+
+    void MainNode::onTelemetryTemperature(const TemperatureMsg::SharedPtr msg)
+    {
+        if (!msg)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(telemetry_snapshot_mutex_);
+        telemetry_config_.snapshot.battery_temperature_deci_c = encodeTemperatureDeciC(msg->temperature.temperature);
+    }
+
+    void MainNode::onTelemetryDeviceState(const AgvDeviceStateMsg::SharedPtr msg)
+    {
+        if (!msg)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(telemetry_snapshot_mutex_);
+        telemetry_config_.snapshot.fault_code = agvErrorDomainToString(msg->error_domain);
+        telemetry_config_.snapshot.firmware_version = msg->firmware_version;
+    }
+
+    void MainNode::onWaistJointFeedback(const WaistJointFeedbackMsg::SharedPtr msg)
+    {
+        if (!msg)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(joint_telemetry_snapshot_mutex_);
+        joint_telemetry_config_.snapshot.sample_timestamp_ms = stampToUnixMs(msg->header.stamp.sec, msg->header.stamp.nanosec);
+        for (size_t source_index = 0; source_index < kWaistJointCount; ++source_index)
+        {
+            const auto joint_index = waistJointIndexFromFeedbackName(msg->name[source_index], source_index);
+            if (!joint_index)
+            {
+                continue;
+            }
+            setJointSample(joint_telemetry_config_.snapshot,
+                           *joint_index,
+                           msg->position[source_index],
+                           msg->velocity[source_index],
+                           msg->effort[source_index]);
         }
     }
-}
+
+    void MainNode::onArmJointFeedback(const ArmJointFeedbackMsg::SharedPtr msg)
+    {
+        if (!msg)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(joint_telemetry_snapshot_mutex_);
+        joint_telemetry_config_.snapshot.sample_timestamp_ms = stampToUnixMs(msg->header.stamp.sec, msg->header.stamp.nanosec);
+        for (size_t source_index = 0; source_index < kArmJointCount; ++source_index)
+        {
+            const auto joint_index = armJointIndexFromFeedbackName(msg->name[source_index], source_index);
+            if (!joint_index)
+            {
+                continue;
+            }
+            setJointSample(joint_telemetry_config_.snapshot,
+                           *joint_index,
+                           msg->position[source_index],
+                           msg->velocity[source_index],
+                           msg->effort[source_index]);
+        }
+    }
+
+    void MainNode::enterDirectRunningMode()
+    {
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_config_sent_ = true;
+        }
+        if (audio_module_)
+        {
+            audio_module_->markConfigPublished();
+            if (audio_module_->isEnabled())
+            {
+                (void)audio_module_->applyRemoteConfig(audio_module_->config(), "direct");
+            }
+        }
+        setState(State::kRunning, "direct running mode");
+        startVideoAndNegotiate();
+        if (audio_module_)
+        {
+            audio_module_->start();
+        }
+    }
+
+    void MainNode::onGrpcRegistered()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        stopNegotiationRetryTimer();
+        stopPairingRetryTimer();
+        setState(State::kRegistered, "grpc registered");
+
+        if (!udp_module_ || !grpc_module_)
+        {
+            return;
+        }
+        if (!udp_module_->start(grpc_module_->sessionId()))
+        {
+            RCLCPP_WARN(this->get_logger(), "UdpModule failed to start; staying in registered state");
+        }
+        updateRobotTelemetryLifecycle();
+    }
+
+    void MainNode::onGrpcHeartbeatFail()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        teardownActiveSession("heartbeat failed", State::kConnecting);
+    }
+
+    void MainNode::onGrpcStreamEnd()
+    {
+        postSessionWork(
+            [this]() {
+                if (shutting_down_.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+                teardownActiveSession("grpc stream ended", State::kRegistered);
+                if (!shutting_down_.load(std::memory_order_acquire) && grpc_module_ && grpc_module_->isRegistered())
+                {
+                    enterPairingState();
+                }
+            },
+            "gRPC stream-end recovery");
+    }
+
+    void MainNode::onUdpHandshakeReady()
+    {
+        if (direct_running_mode_ || shutting_down_.load())
+        {
+            return;
+        }
+        updateRobotTelemetryLifecycle();
+        enterPairingState();
+    }
+
+    void MainNode::onUdpPeerLost()
+    {
+        postSessionWork([this]() { handleUdpPeerLost(); }, "UDP peer-lost recovery");
+    }
+
+    void MainNode::handleUdpPeerLost()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        const State current = state_.load();
+        if (current != State::kNegotiating && current != State::kRunning)
+        {
+            updateRobotTelemetryLifecycle();
+            return;
+        }
+        teardownActiveSession("udp peer lost", State::kPairing);
+    }
+
+    void MainNode::postSessionWork(std::function<void()> work, const char *label)
+    {
+        if (!work || !canScheduleRosWork(*this, shutting_down_))
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(session_work_mutex_);
+            session_work_queue_.push_back(std::move(work));
+        }
+
+        try
+        {
+            std::lock_guard<std::mutex> lock(session_work_mutex_);
+            if (!session_work_timer_)
+            {
+                session_work_timer_ = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { drainSessionWork(); });
+            }
+            else
+            {
+                session_work_timer_->reset();
+            }
+        }
+        catch (const rclcpp::exceptions::RCLError &ex)
+        {
+            if (!shutting_down_.load(std::memory_order_acquire))
+            {
+                RCLCPP_WARN(this->get_logger(), "Skip %s scheduling: %s", label ? label : "session work", ex.what());
+            }
+        }
+    }
+
+    void MainNode::drainSessionWork()
+    {
+        while (!shutting_down_.load(std::memory_order_acquire))
+        {
+            std::function<void()> work;
+            {
+                std::lock_guard<std::mutex> lock(session_work_mutex_);
+                if (session_work_queue_.empty())
+                {
+                    if (session_work_timer_)
+                    {
+                        session_work_timer_->cancel();
+                    }
+                    return;
+                }
+                work = std::move(session_work_queue_.front());
+                session_work_queue_.pop_front();
+            }
+
+            if (work)
+            {
+                work();
+            }
+        }
+    }
+
+    void MainNode::startRobotTelemetry()
+    {
+        if (!canScheduleRosWork(*this, shutting_down_))
+        {
+            return;
+        }
+
+        if (telemetry_config_.enabled && !telemetry_active_.load(std::memory_order_acquire))
+        {
+            telemetry_active_.store(true, std::memory_order_release);
+            if (!telemetry_timer_)
+            {
+                try
+                {
+                    telemetry_timer_ = this->create_wall_timer(periodFromSeconds(telemetry_config_.period_sec),
+                                                               [this]() { telemetryTimerCallback(); });
+                }
+                catch (const rclcpp::exceptions::RCLError &ex)
+                {
+                    telemetry_active_.store(false, std::memory_order_release);
+                    if (!shutting_down_.load(std::memory_order_acquire))
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Skip telemetry timer creation: %s", ex.what());
+                    }
+                }
+            }
+            else
+            {
+                try
+                {
+                    telemetry_timer_->reset();
+                }
+                catch (const rclcpp::exceptions::RCLError &ex)
+                {
+                    telemetry_active_.store(false, std::memory_order_release);
+                    if (!shutting_down_.load(std::memory_order_acquire))
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Skip telemetry timer reset: %s", ex.what());
+                    }
+                }
+            }
+
+            publishRobotTelemetrySnapshot();
+        }
+
+        if (joint_telemetry_config_.enabled && !joint_telemetry_active_.load(std::memory_order_acquire))
+        {
+            joint_telemetry_active_.store(true, std::memory_order_release);
+            if (!joint_telemetry_timer_)
+            {
+                try
+                {
+                    joint_telemetry_timer_ = this->create_wall_timer(highRatePeriodFromSeconds(joint_telemetry_config_.period_sec),
+                                                                     [this]() { jointTelemetryTimerCallback(); });
+                }
+                catch (const rclcpp::exceptions::RCLError &ex)
+                {
+                    joint_telemetry_active_.store(false, std::memory_order_release);
+                    if (!shutting_down_.load(std::memory_order_acquire))
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Skip joint telemetry timer creation: %s", ex.what());
+                    }
+                }
+            }
+            else
+            {
+                try
+                {
+                    joint_telemetry_timer_->reset();
+                }
+                catch (const rclcpp::exceptions::RCLError &ex)
+                {
+                    joint_telemetry_active_.store(false, std::memory_order_release);
+                    if (!shutting_down_.load(std::memory_order_acquire))
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Skip joint telemetry timer reset: %s", ex.what());
+                    }
+                }
+            }
+
+            publishRobotJointTelemetrySnapshot();
+        }
+    }
+
+    void MainNode::stopRobotTelemetry()
+    {
+        telemetry_active_.store(false, std::memory_order_release);
+        joint_telemetry_active_.store(false, std::memory_order_release);
+        if (telemetry_timer_)
+        {
+            telemetry_timer_->cancel();
+        }
+        if (joint_telemetry_timer_)
+        {
+            joint_telemetry_timer_->cancel();
+        }
+    }
+
+    bool MainNode::isRobotTelemetryOnline() const
+    {
+        const bool any_telemetry_enabled = telemetry_config_.enabled || joint_telemetry_config_.enabled;
+        if (shutting_down_.load(std::memory_order_acquire) || !any_telemetry_enabled)
+        {
+            return false;
+        }
+        if (direct_running_mode_)
+        {
+            return false;
+        }
+        if (!grpc_module_ || !grpc_module_->isRegistered())
+        {
+            return false;
+        }
+        if (!udp_module_ || !udp_module_->isRunning())
+        {
+            return false;
+        }
+        if (udp_module_->controlEnabled() && !udp_module_->isHandshakeReady())
+        {
+            return false;
+        }
+        return true;
+    }
+
+    void MainNode::updateRobotTelemetryLifecycle()
+    {
+        if (isRobotTelemetryOnline())
+        {
+            startRobotTelemetry();
+            return;
+        }
+        stopRobotTelemetry();
+    }
+
+    void MainNode::telemetryTimerCallback()
+    {
+        if (!telemetry_active_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+        if (!isRobotTelemetryOnline())
+        {
+            stopRobotTelemetry();
+            return;
+        }
+        publishRobotTelemetrySnapshot();
+    }
+
+    void MainNode::jointTelemetryTimerCallback()
+    {
+        if (!joint_telemetry_active_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+        if (!isRobotTelemetryOnline())
+        {
+            stopRobotTelemetry();
+            return;
+        }
+        publishRobotJointTelemetrySnapshot();
+    }
+
+    void MainNode::publishRobotTelemetrySnapshot()
+    {
+        if (!telemetry_active_.load(std::memory_order_acquire) || !udp_module_)
+        {
+            return;
+        }
+
+        telemetry::RobotTelemetrySnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(telemetry_snapshot_mutex_);
+            snapshot = telemetry_config_.snapshot;
+        }
+
+        udp_module_->sendRobotTelemetry(snapshot);
+    }
+
+    void MainNode::publishRobotJointTelemetrySnapshot()
+    {
+        if (!joint_telemetry_active_.load(std::memory_order_acquire) || !udp_module_)
+        {
+            return;
+        }
+
+        telemetry::RobotJointTelemetrySnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(joint_telemetry_snapshot_mutex_);
+            snapshot = joint_telemetry_config_.snapshot;
+        }
+
+        udp_module_->sendRobotJointTelemetry(snapshot);
+    }
+
+    void MainNode::enterPairingState()
+    {
+        if (!grpc_module_ || shutting_down_.load())
+        {
+            return;
+        }
+        setState(State::kPairing, "waiting for pair request");
+        grpc_module_->startEventStream();
+
+        if (pair_mode_ == "active")
+        {
+            (void)tryActivePairing();
+            ensurePairingRetryTimer();
+        }
+        else
+        {
+            stopPairingRetryTimer();
+        }
+    }
+
+    bool MainNode::tryActivePairing()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        if (!grpc_module_ || !grpc_module_->isRegistered() || state_.load() != State::kPairing)
+        {
+            return false;
+        }
+        if (!pair_auto_request_)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "pair.mode=active but pair.auto_request=false; waiting for incoming pair request");
+            return false;
+        }
+
+        std::string peer_session_id = desired_peer_session_id_;
+        if (peer_session_id.empty())
+        {
+            const auto endpoints = grpc_module_->listUnpaired(signaling::RegisterRequest::VR);
+            if (endpoints.empty())
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "No unpaired VR endpoints found; active pairing will retry");
+                return false;
+            }
+            if (pair_list_unpaired_on_start_)
+            {
+                RCLCPP_INFO(this->get_logger(), "Found %zu unpaired VR endpoint(s); requesting the first one", endpoints.size());
+            }
+            peer_session_id = endpoints.front().session_id();
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Requesting pair with %s", peer_session_id.c_str());
+        if (!grpc_module_->requestPair(peer_session_id))
+        {
+            RCLCPP_WARN(this->get_logger(), "Pair request failed for %s", peer_session_id.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    void MainNode::pairingRetryTimerCallback()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            stopPairingRetryTimer();
+            return;
+        }
+
+        if (state_.load() != State::kPairing || pair_mode_ != "active")
+        {
+            stopPairingRetryTimer();
+            return;
+        }
+        (void)tryActivePairing();
+    }
+
+    void MainNode::ensurePairingRetryTimer()
+    {
+        if (!canScheduleRosWork(*this, shutting_down_))
+        {
+            return;
+        }
+
+        if (!pairing_retry_timer_)
+        {
+            try
+            {
+                pairing_retry_timer_ = this->create_wall_timer(std::chrono::seconds(2), [this]() { pairingRetryTimerCallback(); });
+            }
+            catch (const rclcpp::exceptions::RCLError &ex)
+            {
+                if (!shutting_down_.load(std::memory_order_acquire))
+                {
+                    RCLCPP_WARN(this->get_logger(), "Skip pairing retry timer creation: %s", ex.what());
+                }
+            }
+            return;
+        }
+        try
+        {
+            pairing_retry_timer_->reset();
+        }
+        catch (const rclcpp::exceptions::RCLError &ex)
+        {
+            if (!shutting_down_.load(std::memory_order_acquire))
+            {
+                RCLCPP_WARN(this->get_logger(), "Skip pairing retry timer reset: %s", ex.what());
+            }
+        }
+    }
+
+    void MainNode::stopPairingRetryTimer()
+    {
+        if (pairing_retry_timer_)
+        {
+            pairing_retry_timer_->cancel();
+        }
+    }
+
+    void MainNode::onSignalingEvent(const signaling::EventMessage &msg)
+    {
+        signaling::EventMessage copied_msg = msg;
+        postSessionWork([this, copied_msg]() { handleSignalingEvent(copied_msg); }, "signaling event");
+    }
+
+    void MainNode::handleSignalingEvent(const signaling::EventMessage &msg)
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        if (msg.has_audio_config())
+        {
+            handleRemoteAudioConfig(msg.audio_config());
+            return;
+        }
+
+        if (!msg.has_pair())
+        {
+            if (msg.has_system() && msg.system().action() == signaling::SystemCommand::REQUEST_UDP_HELLO)
+            {
+                RCLCPP_WARN(this->get_logger(), "Server requested UDP HELLO resend; resetting UDP session");
+                if (udp_module_)
+                {
+                    udp_module_->resetSession();
+                }
+            }
+            return;
+        }
+
+        const auto &pair_event = msg.pair();
+        if (!pair_event.has_peer())
+        {
+            RCLCPP_WARN(this->get_logger(), "Received PairEvent without peer info");
+            return;
+        }
+
+        const auto &peer_info = pair_event.peer();
+        const std::string peer = peer_info.session_id();
+        const std::string vr_version = peer_info.vr_version();
+        const bool peer_matches = desired_peer_session_id_.empty() || peer == desired_peer_session_id_;
+
+        switch (pair_event.op())
+        {
+        case signaling::PairEvent::REQUEST:
+            if (pair_auto_accept_ && peer_matches && grpc_module_ && grpc_module_->acceptPair(peer))
+            {
+                RCLCPP_INFO(this->get_logger(), "Pair request from %s accepted", peer.c_str());
+                paired_peer_session_id_ = peer;
+                paired_vr_version_ = vr_version;
+                stopPairingRetryTimer();
+                if (subscribe_vr_pose_flag_ || wantsRemoteAudio())
+                {
+                    (void)grpc_module_->subscribe(peer, false, subscribe_vr_pose_flag_, wantsRemoteAudio());
+                }
+                setState(State::kNegotiating, "pair accepted");
+                startVideoAndNegotiate();
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(), "Pair request from %s rejected", peer.c_str());
+                if (grpc_module_)
+                {
+                    (void)grpc_module_->rejectPair(peer);
+                }
+            }
+            break;
+
+        case signaling::PairEvent::ACCEPT:
+            RCLCPP_INFO(this->get_logger(), "Pair accepted by %s", peer.c_str());
+            paired_peer_session_id_ = peer;
+            paired_vr_version_ = vr_version;
+            stopPairingRetryTimer();
+            if ((subscribe_vr_pose_flag_ || wantsRemoteAudio()) && grpc_module_)
+            {
+                (void)grpc_module_->subscribe(peer, false, subscribe_vr_pose_flag_, wantsRemoteAudio());
+            }
+            setState(State::kNegotiating, "paired");
+            startVideoAndNegotiate();
+            break;
+
+        case signaling::PairEvent::REJECT:
+            RCLCPP_WARN(this->get_logger(), "Pair rejected by %s", peer.c_str());
+            if (paired_peer_session_id_ == peer)
+            {
+                paired_peer_session_id_.clear();
+                paired_vr_version_.clear();
+            }
+            setState(State::kPairing, "pair rejected");
+            if (pair_mode_ == "active")
+            {
+                ensurePairingRetryTimer();
+            }
+            break;
+
+        case signaling::PairEvent::UNPAIR:
+            RCLCPP_INFO(this->get_logger(), "Unpaired by %s", peer.c_str());
+            if ((subscribe_vr_pose_flag_ || wantsRemoteAudio()) && grpc_module_)
+            {
+                (void)grpc_module_->unsubscribe(peer);
+            }
+            if (paired_peer_session_id_ == peer)
+            {
+                paired_peer_session_id_.clear();
+                paired_vr_version_.clear();
+            }
+            teardownActiveSession("unpaired by peer", State::kPairing);
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    void MainNode::handleRemoteAudioConfig(const signaling::AudioConfig &config)
+    {
+        std::string message;
+        trb::audio::AudioModule::Config remote_config;
+        const bool valid = validateRemoteAudioConfig(config, remote_config, message);
+        bool accepted = false;
+        if (valid && audio_module_)
+        {
+            accepted = audio_module_->applyRemoteConfig(remote_config, config.config_id());
+            if (!accepted && message.empty())
+            {
+                message = "failed to apply remote AudioConfig";
+            }
+            if (accepted && state_.load() == State::kRunning && !audio_module_->isRunning())
+            {
+                (void)audio_module_->start();
+            }
+        }
+        if (accepted)
+        {
+            message = "accepted";
+        }
+        else if (message.empty())
+        {
+            message = "rejected";
+        }
+
+        if (grpc_module_)
+        {
+            (void)grpc_module_->ackAudioConfig(accepted, message, config.config_id());
+        }
+        RCLCPP_INFO(this->get_logger(),
+                    "Remote AudioConfig %s: config_id=%s message=%s",
+                    accepted ? "accepted" : "rejected",
+                    config.config_id().empty() ? "<empty>" : config.config_id().c_str(),
+                    message.c_str());
+    }
+
+    bool MainNode::validateRemoteAudioConfig(const signaling::AudioConfig &config,
+                                             trb::audio::AudioModule::Config &remote_config,
+                                             std::string &message) const
+    {
+        if (!audio_module_ || !audio_module_->isEnabled())
+        {
+            message = "audio module is disabled";
+            return false;
+        }
+        const auto &local_config = audio_module_->config();
+        if (!local_config.downlink_enabled)
+        {
+            message = "audio downlink is disabled";
+            return false;
+        }
+        if (config.codec() != signaling::AudioConfig::OPUS)
+        {
+            message = "unsupported audio codec";
+            return false;
+        }
+        if (config.sample_rate() <= 0 || config.channels() <= 0 || config.frame_duration_ms() <= 0 ||
+            config.samples_per_channel() <= 0 || config.bitrate_bps() <= 0)
+        {
+            message = "invalid non-positive audio config field";
+            return false;
+        }
+
+        remote_config = local_config;
+        remote_config.sample_rate = static_cast<uint32_t>(config.sample_rate());
+        remote_config.channels = static_cast<uint32_t>(config.channels());
+        remote_config.frame_duration_ms = static_cast<uint32_t>(config.frame_duration_ms());
+        remote_config.samples_per_channel = static_cast<uint32_t>(config.samples_per_channel());
+        remote_config.bitrate_bps = static_cast<uint32_t>(config.bitrate_bps());
+        remote_config.opus_inband_fec_enabled = config.opus_inband_fec_enabled();
+        remote_config.opus_dtx_enabled = config.opus_dtx_enabled();
+
+        if (remote_config.sample_rate != local_config.sample_rate ||
+            remote_config.channels != local_config.channels ||
+            remote_config.frame_duration_ms != local_config.frame_duration_ms ||
+            remote_config.samples_per_channel != local_config.samples_per_channel ||
+            remote_config.bitrate_bps != local_config.bitrate_bps ||
+            remote_config.opus_inband_fec_enabled != local_config.opus_inband_fec_enabled ||
+            remote_config.opus_dtx_enabled != local_config.opus_dtx_enabled)
+        {
+            message = "remote AudioConfig does not match local audio parameters";
+            return false;
+        }
+        message = "accepted";
+        return true;
+    }
+
+    bool MainNode::wantsRemoteAudio() const
+    {
+        return audio_module_ && audio_module_->config().enabled && audio_module_->config().downlink_enabled;
+    }
+
+    void MainNode::startVideoAndNegotiate()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        if (!video_module_)
+        {
+            RCLCPP_ERROR(this->get_logger(), "VideoModule is not available");
+            return;
+        }
+
+        if (video_started_ && video_module_->isRunning())
+        {
+            ensureNegotiationRetryTimer();
+            if (state_.load() == State::kNegotiating && video_module_->hasSpsPps())
+            {
+                tryAdvanceNegotiation();
+            }
+            return;
+        }
+
+        if (!video_module_->start())
+        {
+            RCLCPP_ERROR(this->get_logger(), "VideoModule start failed");
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_started_ = true;
+        }
+        video_start_time_ = std::chrono::steady_clock::now();
+        last_video_keyframe_request_time_ = std::chrono::steady_clock::time_point{};
+        ensureNegotiationRetryTimer();
+
+        if (state_.load() == State::kNegotiating && video_module_->hasSpsPps())
+        {
+            tryAdvanceNegotiation();
+        }
+    }
+
+    void MainNode::onEncodedVideoFrame(const uint8_t *data, size_t size, uint64_t timestamp_us, bool keyframe)
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        const State current = state_.load();
+        if (current != State::kRunning)
+        {
+            const uint64_t dropped = dropped_video_before_running_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((dropped % 30) == 0)
+            {
+                RCLCPP_WARN(this->get_logger(), "Dropping encoded video frame before running state: dropped=%lu state=%s",
+                            static_cast<unsigned long>(dropped), stateToString(current));
+            }
+            return;
+        }
+
+        if (udp_module_)
+        {
+            udp_module_->sendH264Frame(data, size, timestamp_us, keyframe);
+        }
+    }
+
+    void MainNode::onEncodedAudioPacket(const uint8_t *data, size_t size, uint64_t timestamp_ntp)
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+        if (state_.load() != State::kRunning)
+        {
+            return;
+        }
+        if (!audio_module_ || !audio_module_->isConfigPublished())
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "Dropping audio packet because AudioConfig is not published");
+            return;
+        }
+        if (udp_module_)
+        {
+            udp_module_->sendAudioPacket(data, size, timestamp_ntp);
+        }
+    }
+
+    void MainNode::onSpsPpsCaptured(const std::vector<uint8_t> &sps,
+                                    const std::vector<uint8_t> &pps,
+                                    const std::vector<uint8_t> &vps)
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Video parameter sets ready: sps=%zu bytes pps=%zu bytes vps=%zu bytes",
+                    sps.size(), pps.size(), vps.size());
+        if (state_.load() == State::kNegotiating)
+        {
+            tryAdvanceNegotiation();
+        }
+    }
+
+    void MainNode::requestVideoKeyframeRecovery(const char *reason, std::chrono::steady_clock::time_point now)
+    {
+        if (shutting_down_.load(std::memory_order_acquire) || state_.load() != State::kRunning || !video_module_)
+        {
+            return;
+        }
+
+        if (last_video_keyframe_request_time_.time_since_epoch().count() != 0 &&
+            (now - last_video_keyframe_request_time_) < kVideoKeyframeRequestInterval)
+        {
+            return;
+        }
+
+        last_video_keyframe_request_time_ = now;
+        const bool requested = video_module_->requestKeyframe();
+        RCLCPP_WARN(this->get_logger(),
+                    requested
+                        ? "Video transport loss detected (%s): requested fresh IDR"
+                        : "Video transport loss detected (%s): fresh IDR request not ready yet",
+                    reason ? reason : "unknown");
+    }
+
+    bool MainNode::publishVideoConfig()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        if (direct_running_mode_)
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_config_sent_ = true;
+            return true;
+        }
+        if (!grpc_module_)
+        {
+            RCLCPP_WARN(this->get_logger(), "GrpcModule not available, cannot publish VideoConfig");
+            return false;
+        }
+        if (!video_module_)
+        {
+            RCLCPP_WARN(this->get_logger(), "VideoModule not available, cannot publish VideoConfig");
+            return false;
+        }
+
+        std::vector<uint8_t> sps;
+        std::vector<uint8_t> pps;
+        std::vector<uint8_t> vps;
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            if (video_config_sent_)
+            {
+                return true;
+            }
+        }
+
+        if (!video_module_->getSpsPps(sps, pps, vps))
+        {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "VideoConfig not ready: waiting for cached SPS/PPS");
+            return false;
+        }
+
+        const auto &video_config = video_module_->config();
+        const GrpcModule::Codec codec = video_config.codec == trb::video::VideoModule::Config::Codec::kH265
+                                           ? GrpcModule::Codec::kH265
+                                           : GrpcModule::Codec::kH264;
+
+        if (!grpc_module_->publishVideoConfig(video_config.width, video_config.height, video_config.fps, codec,
+                                              sps, pps, vps, false, 0.0f, 0.0f, 0.0f))
+        {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_config_sent_ = true;
+        }
+        return true;
+    }
+
+    bool MainNode::publishAudioConfig()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        if (direct_running_mode_)
+        {
+            if (audio_module_)
+            {
+                audio_module_->markConfigPublished();
+            }
+            return true;
+        }
+        if (!audio_module_ || !audio_module_->isEnabled() || !grpc_module_)
+        {
+            return false;
+        }
+        if (audio_module_->isConfigPublished())
+        {
+            return true;
+        }
+
+        const auto &config = audio_module_->config();
+        GrpcModule::AudioConfig audio_config;
+        audio_config.sample_rate = config.sample_rate;
+        audio_config.channels = config.channels;
+        audio_config.frame_duration_ms = config.frame_duration_ms;
+        audio_config.samples_per_channel = config.samples_per_channel;
+        audio_config.bitrate_bps = config.bitrate_bps;
+        audio_config.opus_inband_fec_enabled = config.opus_inband_fec_enabled;
+        audio_config.opus_dtx_enabled = config.opus_dtx_enabled;
+        if (!grpc_module_->publishAudioConfig(audio_config))
+        {
+            return false;
+        }
+
+        audio_module_->markConfigPublished();
+        return true;
+    }
+
+    void MainNode::tryAdvanceNegotiation()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        if (state_.load() != State::kNegotiating)
+        {
+            return;
+        }
+        if (!publishVideoConfig())
+        {
+            ensureNegotiationRetryTimer();
+            return;
+        }
+
+        const bool audio_enabled = audio_module_ && audio_module_->isEnabled();
+        if (audio_enabled && !audio_module_->isConfigPublished() && !publishAudioConfig())
+        {
+            ensureNegotiationRetryTimer();
+            return;
+        }
+
+        stopNegotiationRetryTimer();
+        setState(State::kRunning, audio_enabled ? "VideoConfig and AudioConfig ACK received" : "VideoConfig ACK received");
+        if (audio_module_)
+        {
+            audio_module_->start();
+        }
+    }
+
+    void MainNode::negotiationRetryTimerCallback()
+    {
+        static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            stopNegotiationRetryTimer();
+            return;
+        }
+
+        if (state_.load() != State::kNegotiating)
+        {
+            stopNegotiationRetryTimer();
+            return;
+        }
+
+        if (!video_module_)
+        {
+            return;
+        }
+
+        if (!video_started_ || !video_module_->isRunning())
+        {
+            startVideoAndNegotiate();
+            return;
+        }
+
+        if (video_module_->hasSpsPps())
+        {
+            tryAdvanceNegotiation();
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (video_start_time_.time_since_epoch().count() != 0)
+        {
+            const auto startup_elapsed = now - video_start_time_;
+            if (startup_elapsed >= kVideoStartupTimeout)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Video startup stalled before SPS/PPS became ready; restarting video pipeline");
+                stopVideo();
+                resetVideoConfigState();
+                startVideoAndNegotiate();
+                return;
+            }
+
+            const bool should_request_keyframe =
+                startup_elapsed >= kVideoStartupKeyframeDelay &&
+                (last_video_keyframe_request_time_.time_since_epoch().count() == 0 ||
+                 (now - last_video_keyframe_request_time_) >= kVideoKeyframeRequestInterval);
+            if (should_request_keyframe)
+            {
+                last_video_keyframe_request_time_ = now;
+                const bool requested = video_module_->requestKeyframe();
+                RCLCPP_INFO_THROTTLE(this->get_logger(), steady_clock, 5000,
+                                     requested
+                                         ? "Video startup waiting for SPS/PPS: requested fresh IDR"
+                                         : "Video startup waiting for SPS/PPS: fresh IDR request not ready yet");
+            }
+        }
+
+        tryAdvanceNegotiation();
+    }
+
+    void MainNode::videoStatsTimerCallback()
+    {
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        double elapsed_sec = 1.0;
+        if (last_video_stats_time_.time_since_epoch().count() != 0)
+        {
+            elapsed_sec = std::max(0.001, std::chrono::duration<double>(now - last_video_stats_time_).count());
+        }
+        last_video_stats_time_ = now;
+
+        uint64_t capture_frames = 0;
+        uint64_t decode_frames = 0;
+        uint64_t convert_frames = 0;
+        uint64_t encode_frames = 0;
+        uint64_t decoder_drops = 0;
+        uint64_t converter_pool_drops = 0;
+        uint64_t converter_failures = 0;
+        uint64_t encoder_submit_failures = 0;
+        uint64_t undistort_frames = 0;
+        uint64_t undistort_pool_drops = 0;
+        uint64_t undistort_failures = 0;
+        uint64_t decode_us_total = 0;
+        uint64_t transform_us_total = 0;
+        uint64_t undistort_us_total = 0;
+        uint64_t encode_us_total = 0;
+        trb::udp::UdpManager::VideoStatsSnapshot udp_stats;
+        bool have_video_module = false;
+        bool have_udp_module = false;
+
+        if (video_module_)
+        {
+            const auto video_stats = video_module_->consumeStats();
+            have_video_module = true;
+            capture_frames = video_stats.capture_frames;
+            decode_frames = video_stats.decode_frames;
+            convert_frames = video_stats.convert_frames;
+            encode_frames = video_stats.encode_frames;
+            decoder_drops = video_stats.decoder_drops;
+            converter_pool_drops = video_stats.converter_pool_drops;
+            converter_failures = video_stats.converter_failures;
+            encoder_submit_failures = video_stats.encoder_submit_failures;
+            decode_us_total = video_stats.decode_us_total;
+            transform_us_total = video_stats.transform_us_total;
+            encode_us_total = video_stats.encode_us_total;
+            undistort_frames = video_stats.undistort_frames;
+            undistort_pool_drops = video_stats.undistort_pool_drops;
+            undistort_failures = video_stats.undistort_failures;
+            undistort_us_total = video_stats.undistort_us_total;
+        }
+        if (udp_module_ && udp_module_->isRunning())
+        {
+            udp_stats = udp_module_->consumeVideoStats();
+            have_udp_module = true;
+        }
+
+        if (!have_video_module && !have_udp_module)
+        {
+            return;
+        }
+
+        const uint64_t conv_drop_total = converter_pool_drops + converter_failures;
+        const uint64_t und_drop_total = undistort_pool_drops + undistort_failures;
+        const uint64_t udp_drop_total = udp_stats.input_drops + udp_stats.queue_drops;
+        const uint64_t udp_sockblk_total = udp_stats.send_block_events;
+        const uint64_t udp_sockdrop_total = udp_stats.send_drop_packets;
+        const bool has_activity =
+            capture_frames > 0 ||
+            decode_frames > 0 ||
+            convert_frames > 0 ||
+            undistort_frames > 0 ||
+            encode_frames > 0 ||
+            udp_stats.input_frames > 0 ||
+            udp_stats.sent_frames > 0 ||
+            udp_stats.queue_packets > 0 ||
+            decoder_drops > 0 ||
+            conv_drop_total > 0 ||
+            und_drop_total > 0 ||
+            encoder_submit_failures > 0 ||
+            udp_drop_total > 0 ||
+            udp_sockblk_total > 0 ||
+            udp_sockdrop_total > 0;
+        if (!has_activity)
+        {
+            return;
+        }
+
+        const double cap_fps = static_cast<double>(capture_frames) / elapsed_sec;
+        const double dec_fps = static_cast<double>(decode_frames) / elapsed_sec;
+        const double conv_fps = static_cast<double>(convert_frames) / elapsed_sec;
+        const double und_fps = static_cast<double>(undistort_frames) / elapsed_sec;
+        const double enc_fps = static_cast<double>(encode_frames) / elapsed_sec;
+        const double udp_in_fps = static_cast<double>(udp_stats.input_frames) / elapsed_sec;
+        const double tx_fps = static_cast<double>(udp_stats.sent_frames) / elapsed_sec;
+        const double fec_pps = static_cast<double>(udp_stats.fec_output_packets) / elapsed_sec;
+        const double tx_pps = static_cast<double>(udp_stats.sent_packets) / elapsed_sec;
+        const double tx_mbps = (static_cast<double>(udp_stats.sent_bytes) * 8.0 / 1000000.0) / elapsed_sec;
+
+        const double dec_ms = decode_frames > 0
+                                  ? static_cast<double>(decode_us_total) / static_cast<double>(decode_frames) / 1000.0
+                                  : 0.0;
+        const double conv_ms = convert_frames > 0
+                                   ? static_cast<double>(transform_us_total) / static_cast<double>(convert_frames) / 1000.0
+                                   : 0.0;
+        const double und_ms = undistort_frames > 0
+                                  ? static_cast<double>(undistort_us_total) / static_cast<double>(undistort_frames) / 1000.0
+                                  : 0.0;
+        const double enc_ms = encode_frames > 0
+                                  ? static_cast<double>(encode_us_total) / static_cast<double>(encode_frames) / 1000.0
+                                  : 0.0;
+        const double cap2fec_ms = udp_stats.cap_to_fec_samples > 0
+                                      ? static_cast<double>(udp_stats.cap_to_fec_us_total) / static_cast<double>(udp_stats.cap_to_fec_samples) / 1000.0
+                                      : 0.0;
+        const double fec_wait_ms = udp_stats.fec_internal_wait_samples > 0
+                                       ? static_cast<double>(udp_stats.fec_internal_wait_us_total) / static_cast<double>(udp_stats.fec_internal_wait_samples) / 1000.0
+                                       : 0.0;
+        const double send_q_ms = udp_stats.send_queue_delay_samples > 0
+                                     ? static_cast<double>(udp_stats.send_queue_delay_us_total) / static_cast<double>(udp_stats.send_queue_delay_samples) / 1000.0
+                                     : 0.0;
+        const double send_us = udp_stats.sent_packets > 0
+                                   ? static_cast<double>(udp_stats.send_syscall_us_total) / static_cast<double>(udp_stats.sent_packets)
+                                   : 0.0;
+        const double e2e_ms = udp_stats.end_to_end_samples > 0
+                                  ? static_cast<double>(udp_stats.end_to_end_us_total) / static_cast<double>(udp_stats.end_to_end_samples) / 1000.0
+                                  : 0.0;
+        const double pacer_debt_ms = static_cast<double>(udp_stats.pacer_debt_us) / 1000.0;
+        const double pacer_q_ms = static_cast<double>(udp_stats.pacer_expected_queue_us) / 1000.0;
+        const double pacer_mbps = static_cast<double>(udp_stats.pacer_adjusted_bps) / 1000000.0;
+        const int running = video_module_ && video_module_->isRunning() ? 1 : 0;
+
+        if (udp_drop_total > 0 || udp_sockdrop_total > 0)
+        {
+            requestVideoKeyframeRecovery("udp_drop", now);
+        }
+        else if (udp_sockblk_total >= kVideoBackpressureKeyframeThreshold)
+        {
+            requestVideoKeyframeRecovery("udp_backpressure", now);
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "[VIDEO] cap=%.1ffps dec=%.1ffps conv=%.1ffps und=%.1ffps enc=%.1ffps udp_in=%.1ffps tx=%.1ffps %.1fMbps fec=%.0fpps txpkt=%.0fpps drop=dec%lu conv%lu und%lu enc%lu udp%lu sockblk%lu sockdrop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f und%.2f enc%.2f cap2fec%.2f fecwait%.2f sendq%.2f send%.1fus e2e%.2fms pacer=debt%.2f q%.2f rate%.1fMbps running=%d",
+                    cap_fps,
+                    dec_fps,
+                    conv_fps,
+                    und_fps,
+                    enc_fps,
+                    udp_in_fps,
+                    tx_fps,
+                    tx_mbps,
+                    fec_pps,
+                    tx_pps,
+                    static_cast<unsigned long>(decoder_drops),
+                    static_cast<unsigned long>(conv_drop_total),
+                    static_cast<unsigned long>(und_drop_total),
+                    static_cast<unsigned long>(encoder_submit_failures),
+                    static_cast<unsigned long>(udp_drop_total),
+                    static_cast<unsigned long>(udp_sockblk_total),
+                    static_cast<unsigned long>(udp_sockdrop_total),
+                    udp_stats.queue_packets,
+                    static_cast<double>(udp_stats.queue_bytes) / 1024.0,
+                    dec_ms,
+                    conv_ms,
+                    und_ms,
+                    enc_ms,
+                    cap2fec_ms,
+                    fec_wait_ms,
+                    send_q_ms,
+                    send_us,
+                    e2e_ms,
+                    pacer_debt_ms,
+                    pacer_q_ms,
+                    pacer_mbps,
+                    running);
+    }
+
+    void MainNode::ensureNegotiationRetryTimer()
+    {
+        if (!canScheduleRosWork(*this, shutting_down_))
+        {
+            return;
+        }
+
+        if (!negotiation_retry_timer_)
+        {
+            try
+            {
+                negotiation_retry_timer_ = this->create_wall_timer(std::chrono::seconds(1), [this]() { negotiationRetryTimerCallback(); });
+            }
+            catch (const rclcpp::exceptions::RCLError &ex)
+            {
+                if (!shutting_down_.load(std::memory_order_acquire))
+                {
+                    RCLCPP_WARN(this->get_logger(), "Skip negotiation retry timer creation: %s", ex.what());
+                }
+            }
+            return;
+        }
+        try
+        {
+            negotiation_retry_timer_->reset();
+        }
+        catch (const rclcpp::exceptions::RCLError &ex)
+        {
+            if (!shutting_down_.load(std::memory_order_acquire))
+            {
+                RCLCPP_WARN(this->get_logger(), "Skip negotiation retry timer reset: %s", ex.what());
+            }
+        }
+    }
+
+    void MainNode::stopNegotiationRetryTimer()
+    {
+        if (negotiation_retry_timer_)
+        {
+            negotiation_retry_timer_->cancel();
+        }
+    }
+
+    void MainNode::resetVideoConfigState()
+    {
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_config_sent_ = false;
+            video_started_ = false;
+        }
+        video_start_time_ = std::chrono::steady_clock::time_point{};
+        last_video_keyframe_request_time_ = std::chrono::steady_clock::time_point{};
+        if (video_module_)
+        {
+            video_module_->clearSpsPps();
+        }
+    }
+
+    void MainNode::stopVideo()
+    {
+        if (video_module_)
+        {
+            video_module_->stop();
+        }
+        {
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            video_started_ = false;
+        }
+    }
+
+    void MainNode::teardownActiveSession(const std::string &reason, State target_state)
+    {
+        if (shutting_down_.load(std::memory_order_acquire) && target_state != State::kConnecting)
+        {
+            return;
+        }
+        if (session_teardown_in_progress_.exchange(true, std::memory_order_acq_rel))
+        {
+            RCLCPP_INFO(this->get_logger(), "Session teardown already in progress; skip duplicate request (%s)", reason.c_str());
+            return;
+        }
+        AtomicFlagClearGuard teardown_guard(session_teardown_in_progress_);
+
+        setState(target_state, reason);
+
+        stopRobotTelemetry();
+        stopNegotiationRetryTimer();
+        stopPairingRetryTimer();
+        stopVideo();
+        resetVideoConfigState();
+        if (audio_module_)
+        {
+            audio_module_->stop();
+            audio_module_->resetConfigPublished();
+            audio_module_->resetRemoteConfig(reason);
+        }
+        paired_peer_session_id_.clear();
+        paired_vr_version_.clear();
+
+        if (udp_module_)
+        {
+            switch (target_state)
+            {
+            case State::kPairing:
+            case State::kRegistered:
+                udp_module_->resetSession();
+                break;
+            case State::kConnecting:
+                udp_module_->stop();
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (target_state == State::kPairing)
+        {
+            enterPairingState();
+        }
+        updateRobotTelemetryLifecycle();
+    }
+
+    void MainNode::setState(State next, const std::string &reason)
+    {
+        const State previous = state_.exchange(next);
+        if (previous == next)
+        {
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "State transition: %s -> %s (%s)",
+                    stateToString(previous), stateToString(next), reason.c_str());
+    }
+
+    const char *MainNode::stateToString(State state)
+    {
+        switch (state)
+        {
+        case State::kConnecting:
+            return "connecting";
+        case State::kRegistered:
+            return "registered";
+        case State::kPairing:
+            return "pairing";
+        case State::kNegotiating:
+            return "negotiating";
+        case State::kRunning:
+            return "running";
+        default:
+            return "unknown";
+        }
+    }
+} // namespace trb
+
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
