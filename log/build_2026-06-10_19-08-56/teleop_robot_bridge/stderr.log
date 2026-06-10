@@ -1,9 +1,0 @@
-/home/eierobot/ROS/teleop_ws/src/teleop_robot_bridge/src/video/video_encoder.cpp:398:28: warning: ‘std::string trb::video::{anonymous}::base64Encode(const uint8_t*, size_t)’ defined but not used [-Wunused-function]
-  398 |         static std::string base64Encode(const uint8_t *data, size_t size)
-      |                            ^~~~~~~~~~~~
-/home/eierobot/ROS/teleop_ws/src/teleop_robot_bridge/src/video/video_encoder.cpp:384:28: warning: ‘std::string trb::video::{anonymous}::bytesToHex(const uint8_t*, size_t)’ defined but not used [-Wunused-function]
-  384 |         static std::string bytesToHex(const uint8_t *data, size_t size)
-      |                            ^~~~~~~~~~
-/home/eierobot/ROS/teleop_ws/src/teleop_robot_bridge/src/video/video_encoder.cpp:337:21: warning: ‘bool trb::video::{anonymous}::containsH264ISlice(const uint8_t*, size_t)’ defined but not used [-Wunused-function]
-  337 |         static bool containsH264ISlice(const uint8_t *data, size_t size)
-      |                     ^~~~~~~~~~~~~~~~~~
