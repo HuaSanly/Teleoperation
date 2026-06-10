@@ -10,8 +10,13 @@
 #include <unordered_map>
 #include <atomic>
 
+#ifndef TRB_HAS_CUDA_CONVERTER
+#define TRB_HAS_CUDA_CONVERTER 0
+#endif
+
 namespace trb::video
 {
+    class CudaYuv422Converter;
 
     class VideoConverter
     {
@@ -106,6 +111,9 @@ namespace trb::video
         // Using void* to avoid including nvbufsurface.h in header
         std::vector<void *> surfaces_;
         std::vector<int> dmabuf_fds_;
+#if TRB_HAS_CUDA_CONVERTER
+        std::unique_ptr<CudaYuv422Converter> cuda_converter_;
+#endif
 
         std::mutex pool_mutex_;
         std::queue<size_t> free_indices_;

@@ -452,13 +452,22 @@ int main(int argc, char **argv)
     TimingStats cuda_stats;
     if (options.src_layout == NVBUF_LAYOUT_PITCH && options.dst_layout == NVBUF_LAYOUT_PITCH)
     {
+        trb::video::CudaYuv422Converter cuda_converter;
         cuda_ran = true;
-        cuda_ok = runTimed(
-            "CUDA converter", options.warmup, options.iterations,
-            [&] {
-                return trb::video::cudaYuv422PlanarToNv12(src, dst_cuda, &cuda_result);
-            },
-            cuda_stats);
+        if (!cuda_converter.prepareOutput(dst_cuda, &cuda_result))
+        {
+            std::cerr << "CUDA converter prepare failed stage=" << cuda_result.error_stage
+                      << " err=" << cuda_result.error_code << '\n';
+        }
+        else
+        {
+            cuda_ok = runTimed(
+                "CUDA converter", options.warmup, options.iterations,
+                [&] {
+                    return cuda_converter.convert(src, dst_cuda, &cuda_result);
+                },
+                cuda_stats);
+        }
     }
     else
     {

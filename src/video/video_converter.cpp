@@ -268,6 +268,32 @@ bool VideoConverter::initialize(const Config &config)
         fd_to_index_.emplace(dmabuf_fds_[i], i);
     }
 
+#if TRB_HAS_CUDA_CONVERTER
+    if (useCudaConverter(config_))
+    {
+        cuda_converter_ = std::make_unique<CudaYuv422Converter>();
+        for (void *surface : surfaces_)
+        {
+            auto *dst = reinterpret_cast<NvBufSurface *>(surface);
+            if (dst)
+            {
+                dst->numFilled = 1;
+                CudaYuv422ConverterResult cuda_result;
+                if (!cuda_converter_->prepareOutput(dst, &cuda_result))
+                {
+                    logCudaFailureOnce(cuda_result, dst->surfaceList[0].bufferDesc, config_.width, config_.height);
+                    RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                "VideoConverter: failed to prepare CUDA output pool; falling back will not be automatic");
+                    return false;
+                }
+            }
+        }
+        RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                    "VideoConverter: CUDA output pool prepared with %zu cached EGL frame(s)",
+                    surfaces_.size());
+    }
+#endif
+
     logged_mode_.store(true, std::memory_order_relaxed);
 
     return true;
@@ -275,6 +301,12 @@ bool VideoConverter::initialize(const Config &config)
 
 void VideoConverter::destroyBuffers()
 {
+    if (cuda_converter_)
+    {
+        cuda_converter_->reset();
+        cuda_converter_.reset();
+    }
+
     {
         std::lock_guard<std::mutex> lk(pool_mutex_);
         while (!free_indices_.empty())
@@ -434,7 +466,16 @@ bool VideoConverter::transformSync(int yuv_dmabuf_fd,
     {
         call_start = std::chrono::steady_clock::now();
 #if TRB_HAS_CUDA_CONVERTER
-        tret = cudaYuv422PlanarToNv12(src_surf, dst, &cuda_result) ? 0 : -1;
+        if (cuda_converter_)
+        {
+            tret = cuda_converter_->convert(src_surf, dst, &cuda_result) ? 0 : -1;
+        }
+        else
+        {
+            cuda_result.error_stage = "cuda-converter-not-initialized";
+            cuda_result.error_code = -101;
+            tret = -1;
+        }
 #else
         cuda_result.error_stage = "cuda-not-built";
         cuda_result.error_code = -100;
