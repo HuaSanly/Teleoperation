@@ -1,0 +1,47 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/SingleGripperStatus.msg
+// generated code does not contain a copyright notice
+
+
+module teleop_robot_bridge {
+  module msg {
+    @verbatim (language="comment", text=
+      "单个抓手状态消息")
+    struct SingleGripperStatus {
+      @verbatim (language="comment", text=
+        "状态标志" "\n"
+        "是否就绪")
+      boolean is_ready;
+
+      @verbatim (language="comment", text=
+        "是否复位")
+      boolean is_reset;
+
+      @verbatim (language="comment", text=
+        "是否运动中")
+      boolean is_moving;
+
+      @verbatim (language="comment", text=
+        "是否检测到物体")
+      boolean obj_detected;
+
+      @verbatim (language="comment", text=
+        "故障状态码")
+      uint8 fault_status;
+
+      @verbatim (language="comment", text=
+        "位置信息" "\n"
+        "当前位置")
+      int32 position;
+
+      @verbatim (language="comment", text=
+        "目标位置")
+      int32 requested_position;
+
+      @verbatim (language="comment", text=
+        "电流信息" "\n"
+        "电流 (A)")
+      float current;
+    };
+  };
+};

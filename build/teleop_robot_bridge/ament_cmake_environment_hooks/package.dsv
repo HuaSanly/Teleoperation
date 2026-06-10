@@ -1,0 +1,4 @@
+source;share/teleop_robot_bridge/local_setup.bash
+source;share/teleop_robot_bridge/local_setup.dsv
+source;share/teleop_robot_bridge/local_setup.sh
+source;share/teleop_robot_bridge/local_setup.zsh

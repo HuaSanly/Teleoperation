@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O2 -g -DNDEBUG  -Wl,--no-undefined -shared -Wl,-soname,libvideo_v4l2_capturer.so -o libvideo_v4l2_capturer.so CMakeFiles/video_v4l2_capturer.dir/src/video/video_v4l2_capturer.cpp.o  -lv4l2 

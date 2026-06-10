@@ -13,6 +13,7 @@
 #include <linux/v4l2-controls.h>
 
 #include "NvUtils.h"
+#include "rclcpp/rclcpp.hpp"
 #include "nvbufsurface.h"
 #include "v4l2_nv_extensions.h"
 
@@ -21,6 +22,30 @@ namespace trb::video
 
     namespace
     {
+        const char *inputFormatName(VideoEncoder::InputFormat format)
+        {
+            switch (format)
+            {
+            case VideoEncoder::InputFormat::kYuv420:
+                return "yuv420";
+            case VideoEncoder::InputFormat::kNv12:
+            default:
+                return "nv12";
+            }
+        }
+
+        uint32_t inputFormatFourcc(VideoEncoder::InputFormat format)
+        {
+            switch (format)
+            {
+            case VideoEncoder::InputFormat::kYuv420:
+                return V4L2_PIX_FMT_YUV420M;
+            case VideoEncoder::InputFormat::kNv12:
+            default:
+                return V4L2_PIX_FMT_NV12M;
+            }
+        }
+
         enum class H264StreamFormat
         {
             AnnexB,
@@ -528,10 +553,18 @@ namespace trb::video
             return false;
         }
 
-        // Set output plane format (Raw input)
-        if (encoder_->setOutputPlaneFormat(V4L2_PIX_FMT_NV12M, config_.width, config_.height) < 0)
+        const uint32_t input_pixfmt = inputFormatFourcc(config_.input_format);
+        RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                    "VideoEncoder: input_format=%s size=%ux%u",
+                    inputFormatName(config_.input_format),
+                    config_.width,
+                    config_.height);
+
+        // Set output plane format (raw input to NVENC).
+        if (encoder_->setOutputPlaneFormat(input_pixfmt, config_.width, config_.height) < 0)
         {
-            std::cerr << "Failed to set output plane format" << std::endl;
+            std::cerr << "Failed to set output plane format input_format="
+                      << inputFormatName(config_.input_format) << std::endl;
             return false;
         }
 

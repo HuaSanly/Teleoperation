@@ -1,0 +1,26 @@
+{
+  "type_description_msg": {
+    "type_description": {
+      "type_name": "teleop_robot_bridge/msg/ArmMotionCtrl",
+      "fields": [
+        {
+          "name": "enable_states",
+          "type": {
+            "type_id": 63,
+            "capacity": 15,
+            "string_capacity": 0,
+            "nested_type_name": ""
+          },
+          "default_value": ""
+        }
+      ]
+    },
+    "referenced_type_descriptions": []
+  },
+  "type_hashes": [
+    {
+      "type_name": "teleop_robot_bridge/msg/ArmMotionCtrl",
+      "hash_string": "RIHS01_f3dbae8e3a3fca6fd34cc1c5abb066b9f1505d28a6d5882c7dcb067f0b21d2b0"
+    }
+  ]
+}

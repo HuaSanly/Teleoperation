@@ -1,0 +1,24 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/AgvVel.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Vector3.idl"
+#include "std_msgs/msg/Header.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    @verbatim (language="comment", text=
+      "AGV速度消息")
+    struct AgvVel {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "线速度 (m/s)")
+      geometry_msgs::msg::Vector3 linear;
+
+      @verbatim (language="comment", text=
+        "角速度 (rad/s)")
+      geometry_msgs::msg::Vector3 angular;
+    };
+  };
+};

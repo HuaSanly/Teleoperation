@@ -1,0 +1,16 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/ArmMotionCtrl.msg
+// generated code does not contain a copyright notice
+
+
+module teleop_robot_bridge {
+  module msg {
+    typedef boolean boolean__15[15];
+    @verbatim (language="comment", text=
+      "控制14个电机的使能/失能状态" "\n"
+      "每个元素对应一个电机（索引0~13），true表示使能，false表示失能,14为true表示全部使能,false表示全部失能")
+    struct ArmMotionCtrl {
+      boolean__15 enable_states;
+    };
+  };
+};

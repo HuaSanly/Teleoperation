@@ -1,0 +1,33 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/HeadJointFeedback.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    typedef string string__2[2];
+    typedef double double__2[2];
+    @verbatim (language="comment", text=
+      "头部2个电机反馈")
+    struct HeadJointFeedback {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "关节名称")
+      string__2 name;
+
+      @verbatim (language="comment", text=
+        "位置")
+      double__2 position;
+
+      @verbatim (language="comment", text=
+        "速度")
+      double__2 velocity;
+
+      @verbatim (language="comment", text=
+        "力矩")
+      double__2 effort;
+    };
+  };
+};

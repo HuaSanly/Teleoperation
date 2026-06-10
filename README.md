@@ -32,3 +32,7 @@ ros2 launch teleop_robot_bridge bringup.launch.py
 * config/params.yaml：默认参数
 ## 备注
 * Jetson 平台未安装 Multimedia API 时，转换/编码模块会以 stub 模式构建
+
+git switch main
+git switch feature/video-codec-overhaul
+git push -u origin feature/video-codec-overhaul

@@ -1,0 +1,27 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/ArmJointStatus.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+#include "teleop_robot_bridge/msg/JointStatus.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    typedef string string__14[14];
+    typedef teleop_robot_bridge::msg::JointStatus teleop_robot_bridge__msg__JointStatus;
+    typedef teleop_robot_bridge__msg__JointStatus teleop_robot_bridge__msg__JointStatus__14[14];
+    @verbatim (language="comment", text=
+      "Arm关节状态消息（14个执行器）")
+    struct ArmJointStatus {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "关节名称")
+      string__14 name;
+
+      @verbatim (language="comment", text=
+        "14个关节的状态数组")
+      teleop_robot_bridge__msg__JointStatus__14 joint_status;
+    };
+  };
+};

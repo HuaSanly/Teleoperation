@@ -1,0 +1,24 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/GripperTactile.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+#include "teleop_robot_bridge/msg/HandTactile.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    @verbatim (language="comment", text=
+      "抓手触觉传感器消息（左右手）")
+    struct GripperTactile {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "左手触觉数据")
+      teleop_robot_bridge::msg::HandTactile left;
+
+      @verbatim (language="comment", text=
+        "右手触觉数据")
+      teleop_robot_bridge::msg::HandTactile right;
+    };
+  };
+};

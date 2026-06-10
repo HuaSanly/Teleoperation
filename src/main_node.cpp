@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "utils/teleop_logger.hpp"
@@ -1633,8 +1634,12 @@ namespace trb
         uint64_t undistort_failures = 0;
         uint64_t decode_us_total = 0;
         uint64_t transform_us_total = 0;
+        uint64_t transform_map_us_total = 0;
+        uint64_t transform_wait_us_total = 0;
+        uint64_t transform_call_us_total = 0;
         uint64_t undistort_us_total = 0;
         uint64_t encode_us_total = 0;
+        std::string converter_output_format = "unknown";
         trb::udp::UdpManager::VideoStatsSnapshot udp_stats;
         bool have_video_module = false;
         bool have_udp_module = false;
@@ -1653,6 +1658,13 @@ namespace trb
             encoder_submit_failures = video_stats.encoder_submit_failures;
             decode_us_total = video_stats.decode_us_total;
             transform_us_total = video_stats.transform_us_total;
+            transform_map_us_total = video_stats.transform_map_us_total;
+            transform_wait_us_total = video_stats.transform_wait_us_total;
+            transform_call_us_total = video_stats.transform_call_us_total;
+            if (!video_stats.converter_output_format.empty())
+            {
+                converter_output_format = video_stats.converter_output_format;
+            }
             encode_us_total = video_stats.encode_us_total;
             undistort_frames = video_stats.undistort_frames;
             undistort_pool_drops = video_stats.undistort_pool_drops;
@@ -1713,6 +1725,15 @@ namespace trb
         const double conv_ms = convert_frames > 0
                                    ? static_cast<double>(transform_us_total) / static_cast<double>(convert_frames) / 1000.0
                                    : 0.0;
+        const double conv_map_ms = convert_frames > 0
+                                       ? static_cast<double>(transform_map_us_total) / static_cast<double>(convert_frames) / 1000.0
+                                       : 0.0;
+        const double conv_wait_ms = convert_frames > 0
+                                        ? static_cast<double>(transform_wait_us_total) / static_cast<double>(convert_frames) / 1000.0
+                                        : 0.0;
+        const double conv_call_ms = convert_frames > 0
+                                        ? static_cast<double>(transform_call_us_total) / static_cast<double>(convert_frames) / 1000.0
+                                        : 0.0;
         const double und_ms = undistort_frames > 0
                                   ? static_cast<double>(undistort_us_total) / static_cast<double>(undistort_frames) / 1000.0
                                   : 0.0;
@@ -1749,7 +1770,8 @@ namespace trb
         }
 
         RCLCPP_INFO(this->get_logger(),
-                    "[VIDEO] cap=%.1ffps dec=%.1ffps conv=%.1ffps und=%.1ffps enc=%.1ffps udp_in=%.1ffps tx=%.1ffps %.1fMbps fec=%.0fpps txpkt=%.0fpps drop=dec%lu conv%lu und%lu enc%lu udp%lu sockblk%lu sockdrop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f und%.2f enc%.2f cap2fec%.2f fecwait%.2f sendq%.2f send%.1fus e2e%.2fms pacer=debt%.2f q%.2f rate%.1fMbps running=%d",
+                    "[VIDEO] fmt=%s cap=%.1ffps dec=%.1ffps conv=%.1ffps und=%.1ffps enc=%.1ffps udp_in=%.1ffps tx=%.1ffps %.1fMbps fec=%.0fpps txpkt=%.0fpps drop=dec%lu conv%lu und%lu enc%lu udp%lu sockblk%lu sockdrop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f conv_map%.2f conv_wait%.2f conv_call%.2f und%.2f enc%.2f cap2fec%.2f fecwait%.2f sendq%.2f send%.1fus e2e=%.2fms pacer=debt%.2f q%.2f rate%.1fMbps running=%d",
+                    converter_output_format.c_str(),
                     cap_fps,
                     dec_fps,
                     conv_fps,
@@ -1771,6 +1793,9 @@ namespace trb
                     static_cast<double>(udp_stats.queue_bytes) / 1024.0,
                     dec_ms,
                     conv_ms,
+                    conv_map_ms,
+                    conv_wait_ms,
+                    conv_call_ms,
                     und_ms,
                     enc_ms,
                     cap2fec_ms,

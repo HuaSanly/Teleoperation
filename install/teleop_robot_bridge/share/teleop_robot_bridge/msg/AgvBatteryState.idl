@@ -1,0 +1,17 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/AgvBatteryState.msg
+// generated code does not contain a copyright notice
+
+#include "sensor_msgs/msg/BatteryState.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    @verbatim (language="comment", text=
+      "AGV电池状态消息")
+    struct AgvBatteryState {
+      @verbatim (language="comment", text=
+        "电池状态（使用标准 BatteryState）")
+      sensor_msgs::msg::BatteryState battery_state;
+    };
+  };
+};

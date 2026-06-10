@@ -1,0 +1,19 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/AgvUltrasonic.msg
+// generated code does not contain a copyright notice
+
+#include "sensor_msgs/msg/Range.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    typedef sensor_msgs::msg::Range sensor_msgs__msg__Range;
+    typedef sensor_msgs__msg__Range sensor_msgs__msg__Range__8[8];
+    @verbatim (language="comment", text=
+      "AGV 超声波传感器消息（多个传感器）")
+    struct AgvUltrasonic {
+      @verbatim (language="comment", text=
+        "超声波传感器数据数组（8个传感器，固定长度）")
+      sensor_msgs__msg__Range__8 ranges;
+    };
+  };
+};

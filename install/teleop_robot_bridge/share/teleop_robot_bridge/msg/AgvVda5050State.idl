@@ -1,0 +1,85 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from teleop_robot_bridge/msg/AgvVda5050State.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/Header.idl"
+
+module teleop_robot_bridge {
+  module msg {
+    module AgvVda5050State_Constants {
+      @verbatim (language="comment", text=
+        "--- Action Status Constants ---------------------------------------" "\n"        " action execution states" "\n"        "Action is waiting to be executed")
+      const string ACTION_WAITING = "WAITING";
+      @verbatim (language="comment", text=
+        "Action is being initialized")
+      const string ACTION_INITIALIZING = "INITIALIZING";
+      @verbatim (language="comment", text=
+        "Action is currently executing")
+      const string ACTION_RUNNING = "RUNNING";
+      @verbatim (language="comment", text=
+        "Action execution is paused")
+      const string ACTION_PAUSED = "PAUSED";
+      @verbatim (language="comment", text=
+        "Action completed successfully")
+      const string ACTION_FINISHED = "FINISHED";
+      @verbatim (language="comment", text=
+        "Action execution failed")
+      const string ACTION_FAILED = "FAILED";
+      @verbatim (language="comment", text=
+        "--- Operating Mode Constants -------------------------------------" "\n"        " vehicle operating modes" "\n"        "Vehicle operates autonomously")
+      const string MODE_AUTOMATIC = "AUTOMATIC";
+      @verbatim (language="comment", text=
+        "Vehicle requires operator confirmation")
+      const string MODE_SEMI_AUTOMATIC = "SEMIAUTOMATIC";
+      @verbatim (language="comment", text=
+        "Vehicle is under manual control")
+      const string MODE_MANUAL = "MANUAL";
+      @verbatim (language="comment", text=
+        "Vehicle is in service/maintenance mode")
+      const string MODE_SERVICE = "SERVICE";
+      @verbatim (language="comment", text=
+        "Vehicle is in emergency mode")
+      const string MODE_EMERGENCY = "EMERGENCY";
+      @verbatim (language="comment", text=
+        "Vehicle is in teach-in mode for route learning")
+      const string MODE_TEACHIN = "TEACHIN";
+    };
+    @verbatim (language="comment", text=
+      "AGV设备状态消息")
+    struct AgvVda5050State {
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "命令ID")
+      string order_id;
+
+      @verbatim (language="comment", text=
+        "动作状态")
+      string action_status;
+
+      @verbatim (language="comment", text=
+        "最后节点ID")
+      int32 last_node_id;
+
+      @verbatim (language="comment", text=
+        "是否正在行驶")
+      boolean driving;
+
+      @verbatim (language="comment", text=
+        "电池电量 (%)")
+      float battery_charge;
+
+      @verbatim (language="comment", text=
+        "操作模式")
+      string operating_mode;
+
+      @verbatim (language="comment", text=
+        "错误类型")
+      string error_type;
+
+      @verbatim (language="comment", text=
+        "错误描述")
+      string error_description;
+    };
+  };
+};
