@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -828,14 +829,14 @@ namespace trb::video
             }
 
             joinThread(capture_thread_, "capture");
-            if (decoder_)
-            {
-                // The capture thread can be inside decoder_->submitDetailed()
-                // during teardown. Join it before shutdown so NvJPEG state is not
-                // touched concurrently by stop.
-                decoder_->shutdown();
-            }
             joinThread(encode_thread_, "encode");
+            if (capturer_)
+            {
+                // encode_thread_ owns pipeline startup and may have spawned the
+                // capture thread after the first join attempt during a fast stop.
+                capturer_->interrupt();
+            }
+            joinThread(capture_thread_, "capture");
             joinThread(encoder_dq_thread_, "encoder_dq");
             joinThread(eye_image_thread_, "eye_image");
 
@@ -846,26 +847,31 @@ namespace trb::video
                 eye_image_inflight_.store(false, std::memory_order_relaxed);
             }
 
-            if (capturer_)
-            {
-                capturer_->stop();
-            }
-
-            {
-                // Clear encoder_ under callback_mutex_ so a concurrent caller of
-                // setTargetBitrate / setSpsPpsCallback cannot observe the pointer
-                // mid-destruction.
-                std::lock_guard<std::mutex> lk(callback_mutex_);
-                if (encoder_)
+            auto leak_shared = [](auto &ptr) {
+                using SharedPtr = std::decay_t<decltype(ptr)>;
+                if (ptr)
                 {
-                    encoder_->shutdown();
+                    (void)new SharedPtr(std::move(ptr));
                 }
-                encoder_.reset();
+            };
+            const bool leak_gpu_objects = !rclcpp::ok();
+
+            std::shared_ptr<trb::video::VideoEncoder> encoder_to_stop;
+            {
+                // Hide encoder_ before shutdown so late external keyframe/bitrate
+                // requests cannot observe a half-stopped NVENC instance.
+                std::lock_guard<std::mutex> lk(callback_mutex_);
+                encoder_to_stop = std::move(encoder_);
+            }
+            if (encoder_to_stop)
+            {
+                encoder_to_stop->shutdown();
+                encoder_to_stop.reset();
             }
 
             {
                 std::lock_guard<std::mutex> lk(encoder_pending_mutex_);
-                if (!rclcpp::ok())
+                if (leak_gpu_objects)
                 {
                     for (auto &entry : encoder_pending_frames_by_fd_)
                     {
@@ -878,45 +884,64 @@ namespace trb::video
                 encoder_pending_frames_by_fd_.clear();
             }
 
-            if (!rclcpp::ok())
             {
-                auto leak_shared = [](auto &ptr) {
-                    using SharedPtr = std::decay_t<decltype(ptr)>;
-                    if (ptr)
-                    {
-                        (void)new SharedPtr(std::move(ptr));
-                    }
-                };
-
-                // Jetson NVBUF-backed destructors still race during process
-                // shutdown even after orderly thread stop. Leak the remaining
-                // GPU/video objects only on global ROS shutdown so Ctrl+C can
-                // exit cleanly without affecting normal in-process restarts.
-                leak_shared(decoder_);
+                std::shared_ptr<trb::video::VideoV4L2Capturer> capturer_to_stop;
+                capturer_to_stop = std::move(capturer_);
+                if (capturer_to_stop)
                 {
-                    std::lock_guard<std::mutex> component_lk(pipeline_component_mutex_);
-                    leak_shared(undistorter_);
-                    leak_shared(converter_);
+                    capturer_to_stop->stop();
+                    if (leak_gpu_objects)
+                    {
+                        leak_shared(capturer_to_stop);
+                    }
                 }
-                leak_shared(capturer_);
-                leak_shared(eye_image_publisher_);
             }
-            else
+
             {
+                // Jetson NVBUF-backed destructors still race during global ROS
+                // shutdown. For ordinary in-process stops (unpair/re-pair), all
+                // worker threads have exited, so release in a deterministic order.
+                std::shared_ptr<trb::video::VideoDecoder> decoder_to_release;
+                std::shared_ptr<trb::video::VideoUndistorter> undistorter_to_release;
+                std::shared_ptr<trb::video::VideoConverter> converter_to_release;
+
                 {
                     std::lock_guard<std::mutex> lk(getNvBufMutex());
-                    decoder_.reset();
+                    decoder_to_release = std::move(decoder_);
                     {
                         std::lock_guard<std::mutex> component_lk(pipeline_component_mutex_);
-                        undistorter_.reset();
-                        converter_.reset();
+                        undistorter_to_release = std::move(undistorter_);
+                        converter_to_release = std::move(converter_);
+                    }
+
+                    if (leak_gpu_objects)
+                    {
+                        leak_shared(decoder_to_release);
+                        leak_shared(undistorter_to_release);
+                        leak_shared(converter_to_release);
+                    }
+                    else
+                    {
+                        decoder_to_release.reset();
+                        undistorter_to_release.reset();
+                        converter_to_release.reset();
                     }
                 }
-                capturer_.reset();
-                eye_image_publisher_.reset();
             }
 
-            recorder_.reset();
+            {
+                std::shared_ptr<trb::video::EyeImagePublisher> eye_image_publisher_to_release;
+                eye_image_publisher_to_release = std::move(eye_image_publisher_);
+                if (leak_gpu_objects)
+                {
+                    leak_shared(eye_image_publisher_to_release);
+                }
+            }
+
+            {
+                std::shared_ptr<trb::video::VideoRecorder> recorder_to_release;
+                recorder_to_release = std::move(recorder_);
+            }
             eye_image_publisher_ready_.store(false, std::memory_order_relaxed);
             eye_image_has_subscribers_.store(false, std::memory_order_relaxed);
             consecutive_bad_decode_frames_.store(0, std::memory_order_relaxed);
@@ -1465,13 +1490,20 @@ namespace trb::video
             if (!released)
             {
                 RCLCPP_WARN_THROTTLE(rclcpp::get_logger("teleop_robot_bridge.video"), *rclcpp::Clock::make_shared(), static_cast<uint64_t>((5.0) * 1000.0), "VideoStreamManager: input done for unknown fd=%d; releasing directly", dmabuf_fd);
-                if (undistorter_)
+                std::shared_ptr<trb::video::VideoUndistorter> undistorter;
+                std::shared_ptr<trb::video::VideoConverter> converter;
                 {
-                    undistorter_->releaseFd(dmabuf_fd);
+                    std::lock_guard<std::mutex> component_lk(pipeline_component_mutex_);
+                    undistorter = undistorter_;
+                    converter = converter_;
                 }
-                else if (converter_)
+                if (undistorter)
                 {
-                    converter_->releaseFd(dmabuf_fd);
+                    undistorter->releaseFd(dmabuf_fd);
+                }
+                else if (converter)
+                {
+                    converter->releaseFd(dmabuf_fd);
                 }
             }
         }
@@ -1616,9 +1648,17 @@ namespace trb::video
 
         std::shared_ptr<SharedNv12Frame> makeSharedNv12Frame(int dmabuf_fd, uint64_t timestamp_us)
         {
+            std::shared_ptr<trb::video::VideoUndistorter> undistorter_owner;
+            std::shared_ptr<trb::video::VideoConverter> converter_owner;
+            {
+                std::lock_guard<std::mutex> component_lk(pipeline_component_mutex_);
+                undistorter_owner = undistorter_;
+                converter_owner = converter_;
+            }
+
             return std::shared_ptr<SharedNv12Frame>(
                 new SharedNv12Frame{dmabuf_fd, timestamp_us},
-                [this](SharedNv12Frame* frame) {
+                [undistorter_owner, converter_owner](SharedNv12Frame* frame) {
                     if (frame)
                     {
                         if (frame->fd >= 0)
@@ -1627,13 +1667,13 @@ namespace trb::video
                             // we forwarded to the encoder/eye_image. When
                             // undistortion is on, that fd belongs to the
                             // undistorter pool; otherwise to the converter.
-                            if (undistorter_)
+                            if (undistorter_owner)
                             {
-                                undistorter_->releaseFd(frame->fd);
+                                undistorter_owner->releaseFd(frame->fd);
                             }
-                            else if (converter_)
+                            else if (converter_owner)
                             {
-                                converter_->releaseFd(frame->fd);
+                                converter_owner->releaseFd(frame->fd);
                             }
                         }
                         delete frame;
