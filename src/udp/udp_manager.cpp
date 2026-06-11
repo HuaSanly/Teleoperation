@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -538,6 +539,11 @@ namespace trb::udp
         uint8_t groups = 0;
         uint8_t r_per_group = 0;
         const bool fec_enabled = fec_encoder_ && fec_encoder_->getParams(config_.fec_table_id, total_fragments, groups, r_per_group);
+        const size_t parity_count = fec_enabled ? static_cast<size_t>(groups) * static_cast<size_t>(r_per_group) : 0;
+        const uint64_t enqueue_steady_us = nowSteadyUs();
+
+        std::vector<QueueItem> packet_batch;
+        packet_batch.reserve(static_cast<size_t>(total_fragments) + parity_count + 1);
 
         auto enqueue_source = [&](uint16_t fragment_index) {
             const size_t offset = static_cast<size_t>(fragment_index) * max_payload;
@@ -565,34 +571,25 @@ namespace trb::udp
             item.pacing_accounted = true;
             item.is_keyframe = frame.keyframe;
             item.is_fec_parity = false;
-            item.enqueue_steady_us = nowSteadyUs();
+            item.enqueue_steady_us = enqueue_steady_us;
             item.frame_capture_steady_us = frame.capture_timestamp_us;
             packet_codec_.buildVideoPacket(header, data + offset, chunk_size, item.bytes);
             item.wire_bytes = item.bytes.size();
-            send_queue_.push(std::move(item));
+            packet_batch.push_back(std::move(item));
         };
 
-        if (!fec_enabled)
+        for (uint16_t index = 0; index < total_fragments; ++index)
         {
-            for (uint16_t index = 0; index < total_fragments; ++index)
-            {
-                enqueue_source(index);
-            }
+            enqueue_source(index);
         }
-        else
+
+        if (fec_enabled)
         {
             const size_t symbol_bytes = max_payload;
-            std::vector<std::vector<uint8_t>> parity_buffers;
-            fec_encoder_->buildParity(data, size, total_fragments, groups, r_per_group, symbol_bytes, parity_buffers);
+            std::vector<uint8_t *> parity_payloads;
+            parity_payloads.reserve(parity_count);
 
-            auto enqueue_parity = [&](uint8_t group, uint8_t parity) {
-                const size_t parity_index = static_cast<size_t>(parity) * static_cast<size_t>(groups) + static_cast<size_t>(group);
-                if (parity_index >= parity_buffers.size() || parity_buffers[parity_index].empty())
-                {
-                    return;
-                }
-                const auto &parity_payload = parity_buffers[parity_index];
-
+            auto enqueue_parity_shell = [&](uint8_t group, uint8_t parity) {
                 VideoPacketHeaderV2 header;
                 header.Type = kVideoPacketType;
                 header.PacketSeqNum = packet_seq_num_.fetch_add(1);
@@ -600,7 +597,7 @@ namespace trb::udp
                 header.FrameId = current_frame_id;
                 header.TotalFragments = total_fragments;
                 header.FramePayloadLength = static_cast<uint32_t>(size);
-                header.PayloadLength = static_cast<uint16_t>(parity_payload.size());
+                header.PayloadLength = static_cast<uint16_t>(symbol_bytes);
                 header.KeyframeFlag = frame.keyframe ? 1 : 0;
                 header.FecTableId = config_.fec_table_id;
                 const uint32_t fragment_index = static_cast<uint32_t>(total_fragments) + static_cast<uint32_t>(group) +
@@ -617,25 +614,26 @@ namespace trb::udp
                 item.pacing_accounted = true;
                 item.is_keyframe = frame.keyframe;
                 item.is_fec_parity = true;
-                item.enqueue_steady_us = nowSteadyUs();
+                item.enqueue_steady_us = enqueue_steady_us;
                 item.frame_capture_steady_us = frame.capture_timestamp_us;
-                packet_codec_.buildVideoPacket(header, parity_payload.data(), parity_payload.size(), item.bytes);
-                item.wire_bytes = item.bytes.size();
-                send_queue_.push(std::move(item));
-            };
 
-            for (uint16_t index = 0; index < total_fragments; ++index)
-            {
-                enqueue_source(index);
-            }
+                packet_codec_.buildVideoPacket(header, nullptr, symbol_bytes, item.bytes);
+                const size_t payload_offset = item.bytes.size();
+                item.bytes.resize(payload_offset + symbol_bytes, 0);
+                parity_payloads.push_back(item.bytes.data() + payload_offset);
+                item.wire_bytes = item.bytes.size();
+                packet_batch.push_back(std::move(item));
+            };
 
             for (uint8_t parity = 0; parity < r_per_group; ++parity)
             {
                 for (uint8_t group = 0; group < groups; ++group)
                 {
-                    enqueue_parity(group, parity);
+                    enqueue_parity_shell(group, parity);
                 }
             }
+
+            fec_encoder_->buildParityInto(data, size, total_fragments, groups, r_per_group, symbol_bytes, parity_payloads);
         }
 
         QueueItem end;
@@ -645,9 +643,10 @@ namespace trb::udp
         end.stream_key = kVideoStreamKey;
         end.priority = kVideoPriority;
         end.pacing_accounted = false;
-        end.enqueue_steady_us = nowSteadyUs();
+        end.enqueue_steady_us = enqueue_steady_us;
         end.frame_capture_steady_us = frame.capture_timestamp_us;
-        send_queue_.push(std::move(end));
+        packet_batch.push_back(std::move(end));
+        send_queue_.pushBatch(std::move(packet_batch));
 
         const uint32_t packets_this_frame = fec_enabled
                                                 ? (static_cast<uint32_t>(total_fragments) + static_cast<uint32_t>(groups) * static_cast<uint32_t>(r_per_group))

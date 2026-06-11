@@ -24,6 +24,14 @@ namespace trb::udp
                                  uint8_t r_per_group,
                                  size_t symbol_bytes,
                                  std::vector<std::vector<uint8_t>> &out_parity) const = 0;
+
+        virtual void buildParityInto(const uint8_t *data,
+                                     size_t size,
+                                     uint16_t total_fragments,
+                                     uint8_t groups,
+                                     uint8_t r_per_group,
+                                     size_t symbol_bytes,
+                                     const std::vector<uint8_t *> &out_payloads) const = 0;
     };
 
 } // namespace trb::udp

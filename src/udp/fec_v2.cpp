@@ -47,6 +47,65 @@ namespace trb::udp
             pos = index;
             return true;
         }
+
+        const std::vector<uint8_t> &getCoef(uint8_t k, uint8_t r)
+        {
+            struct Cache
+            {
+                std::mutex mutex;
+                std::unordered_map<uint32_t, std::vector<uint8_t>> values;
+            };
+            static Cache cache;
+
+            const uint32_t key = (static_cast<uint32_t>(k) << 8) | static_cast<uint32_t>(r);
+            {
+                std::lock_guard<std::mutex> lock(cache.mutex);
+                auto it = cache.values.find(key);
+                if (it != cache.values.end())
+                {
+                    return it->second;
+                }
+            }
+
+            std::vector<uint8_t> coef(static_cast<size_t>(k) * static_cast<size_t>(r), 0);
+            for (uint8_t row = 0; row < r; ++row)
+            {
+                for (uint8_t column = 0; column < k; ++column)
+                {
+                    const uint8_t x = column;
+                    const uint8_t y = static_cast<uint8_t>(0x80u + row);
+                    coef[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(column)] = gf256::inv(static_cast<uint8_t>(x ^ y));
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            auto [it, inserted] = cache.values.emplace(key, std::move(coef));
+            (void)inserted;
+            return it->second;
+        }
+
+        void prepareGroupCoefficients(uint16_t total_fragments,
+                                      uint8_t groups,
+                                      uint8_t r_per_group,
+                                      std::vector<uint8_t> &k_by_group,
+                                      std::vector<const std::vector<uint8_t> *> &coef_by_group)
+        {
+            k_by_group.assign(groups, 0);
+            coef_by_group.assign(groups, nullptr);
+            for (uint8_t group = 0; group < groups; ++group)
+            {
+                uint8_t k_group = 0;
+                for (uint32_t index = group; index < total_fragments; index += groups)
+                {
+                    ++k_group;
+                }
+                k_by_group[group] = k_group;
+                if (k_group > 0)
+                {
+                    coef_by_group[group] = &getCoef(k_group, r_per_group);
+                }
+            }
+        }
     } // namespace
 
     bool FecV2::getParams(uint8_t table_id, uint16_t total_fragments, uint8_t &groups, uint8_t &r_per_group) const
@@ -81,71 +140,61 @@ namespace trb::udp
             return;
         }
 
-        auto getCoef = [](uint8_t k, uint8_t r) -> const std::vector<uint8_t> & {
-            struct Cache
-            {
-                std::mutex mutex;
-                std::unordered_map<uint32_t, std::vector<uint8_t>> values;
-            };
-            static Cache cache;
-
-            const uint32_t key = (static_cast<uint32_t>(k) << 8) | static_cast<uint32_t>(r);
-            {
-                std::lock_guard<std::mutex> lock(cache.mutex);
-                auto it = cache.values.find(key);
-                if (it != cache.values.end())
-                {
-                    return it->second;
-                }
-            }
-
-            std::vector<uint8_t> coef(static_cast<size_t>(k) * static_cast<size_t>(r), 0);
-            for (uint8_t row = 0; row < r; ++row)
-            {
-                for (uint8_t column = 0; column < k; ++column)
-                {
-                    const uint8_t x = column;
-                    const uint8_t y = static_cast<uint8_t>(0x80u + row);
-                    coef[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(column)] = gf256::inv(static_cast<uint8_t>(x ^ y));
-                }
-            }
-
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            auto [it, inserted] = cache.values.emplace(key, std::move(coef));
-            (void)inserted;
-            return it->second;
-        };
-
-        std::vector<uint8_t> k_by_group(groups, 0);
-        std::vector<const std::vector<uint8_t> *> coef_by_group(groups, nullptr);
-        for (uint8_t group = 0; group < groups; ++group)
+        const size_t parity_count = static_cast<size_t>(groups) * static_cast<size_t>(r_per_group);
+        out_parity.resize(parity_count);
+        std::vector<uint8_t *> out_payloads;
+        out_payloads.reserve(parity_count);
+        for (auto &payload : out_parity)
         {
-            uint8_t k_group = 0;
-            for (uint32_t index = group; index < total_fragments; index += groups)
-            {
-                ++k_group;
-            }
-            k_by_group[group] = k_group;
-            if (k_group > 0)
-            {
-                coef_by_group[group] = &getCoef(k_group, r_per_group);
-            }
+            payload.resize(symbol_bytes);
+            out_payloads.push_back(payload.data());
         }
 
-        out_parity.reserve(static_cast<size_t>(groups) * static_cast<size_t>(r_per_group));
+        buildParityInto(data, size, total_fragments, groups, r_per_group, symbol_bytes, out_payloads);
+    }
+
+    void FecV2::buildParityInto(const uint8_t *data,
+                                size_t size,
+                                uint16_t total_fragments,
+                                uint8_t groups,
+                                uint8_t r_per_group,
+                                size_t symbol_bytes,
+                                const std::vector<uint8_t *> &out_payloads) const
+    {
+        if (!data || size == 0 || groups == 0 || r_per_group == 0 || symbol_bytes == 0)
+        {
+            return;
+        }
+
+        const size_t parity_count = static_cast<size_t>(groups) * static_cast<size_t>(r_per_group);
+        if (out_payloads.size() < parity_count)
+        {
+            return;
+        }
+
+        std::vector<uint8_t> k_by_group;
+        std::vector<const std::vector<uint8_t> *> coef_by_group;
+        prepareGroupCoefficients(total_fragments, groups, r_per_group, k_by_group, coef_by_group);
+
         for (uint8_t parity = 0; parity < r_per_group; ++parity)
         {
             for (uint8_t group = 0; group < groups; ++group)
             {
+                const size_t parity_index = static_cast<size_t>(parity) * static_cast<size_t>(groups) + static_cast<size_t>(group);
+                uint8_t *parity_payload = out_payloads[parity_index];
+                if (!parity_payload)
+                {
+                    continue;
+                }
+                std::fill(parity_payload, parity_payload + symbol_bytes, 0);
+
                 const uint8_t k_group = k_by_group[group];
                 const auto *coef_ptr = coef_by_group[group];
                 if (k_group == 0 || !coef_ptr)
                 {
-                    out_parity.emplace_back();
                     continue;
                 }
 
-                std::vector<uint8_t> parity_buffer(symbol_bytes, 0);
                 const uint8_t *coef_row = coef_ptr->data() + static_cast<size_t>(parity) * static_cast<size_t>(k_group);
                 uint8_t local_index = 0;
                 for (uint32_t source_index = group; source_index < total_fragments; source_index += groups)
@@ -154,11 +203,10 @@ namespace trb::udp
                     const size_t chunk_size = offset < size ? std::min(symbol_bytes, size - offset) : 0;
                     if (chunk_size > 0)
                     {
-                        gf256::mulAdd(coef_row[local_index], data + offset, parity_buffer.data(), chunk_size);
+                        gf256::mulAdd(coef_row[local_index], data + offset, parity_payload, chunk_size);
                     }
                     ++local_index;
                 }
-                out_parity.emplace_back(std::move(parity_buffer));
             }
         }
     }
