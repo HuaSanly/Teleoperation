@@ -1,6 +1,6 @@
 /teleop_robot_bridge:
   ros__parameters:
-    subscribe_vr_pose_flag: false
+    subscribe_vr_pose_flag: true
 
     debug:
       direct_running_mode: false
