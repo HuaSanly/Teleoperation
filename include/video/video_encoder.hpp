@@ -37,6 +37,12 @@ namespace trb::video
             kH265 = 1,
         };
 
+        enum class InputFormat
+        {
+            kNv12,
+            kYuv420,
+        };
+
         struct Config
         {
             Codec codec = Codec::kH264;
@@ -45,6 +51,7 @@ namespace trb::video
             uint32_t height;
             uint32_t framerate;
             uint32_t bitrate; // bits per second
+            InputFormat input_format = InputFormat::kNv12;
             uint32_t idr_interval = 30;
             uint32_t idr_interval_gops = 30;
             uint32_t slice_intra_refresh_interval_slices = 0;
@@ -111,7 +118,7 @@ namespace trb::video
         void setInputDoneCallback(InputDoneCallback callback);
         void setSpsPpsCallback(SpsPpsCallback callback);
 
-        // Feed one NV12 DMA-BUF to the encoder. Returns false when the output
+        // Feed one raw DMA-BUF to the encoder. Returns false when the output
         // plane queue is full (caller should drainInputDone() and retry later).
         bool submit(int dmabuf_fd, uint64_t timestamp_us);
 

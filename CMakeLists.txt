@@ -18,6 +18,21 @@ find_package(OpenSSL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig QUIET)
+find_package(CUDAToolkit QUIET)
+
+set(TRB_HAS_CUDA_TOOLKIT FALSE)
+if(CUDAToolkit_FOUND)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(TRB_HAS_CUDA_TOOLKIT TRUE)
+  message(STATUS "Found CUDA Toolkit for video CUDA converter")
+else()
+  message(WARNING "CUDA Toolkit not found; video CUDA converter prototype will be unavailable.")
+endif()
 
 set(TRB_AUDIO_GSTREAMER_ENABLED FALSE)
 if(PkgConfig_FOUND)
@@ -153,6 +168,17 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   )
 
   target_compile_definitions(video_converter PUBLIC TRB_HAS_JETSON_MM_API=1)
+  if(TRB_HAS_CUDA_TOOLKIT)
+    target_compile_definitions(video_converter PUBLIC TRB_HAS_CUDA_CONVERTER=1)
+    target_sources(video_converter PRIVATE
+      src/video/cuda_yuv422_converter.cu
+    )
+    set_source_files_properties(src/video/cuda_yuv422_converter.cu PROPERTIES LANGUAGE CUDA)
+    target_include_directories(video_converter PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(video_converter CUDA::cudart CUDA::cuda_driver)
+  else()
+    target_compile_definitions(video_converter PUBLIC TRB_HAS_CUDA_CONVERTER=0)
+  endif()
 
   if(NOT CUDA_FOUND)
     if(POLICY CMP0146)
@@ -224,6 +250,21 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
     ${JETSON_NVMM_JPEG_LIBRARY}
   )
+
+  if(TRB_HAS_CUDA_TOOLKIT)
+    add_executable(cuda_yuv422_converter_bench
+      src/video/cuda_yuv422_converter_bench.cpp
+    )
+    target_include_directories(cuda_yuv422_converter_bench PRIVATE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      ${JETSON_MM_API_PATH}/include
+    )
+    target_link_libraries(cuda_yuv422_converter_bench
+      video_converter
+      ${JETSON_NVBUFSURFACE_LIBRARY}
+      ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
+    )
+  endif()
 
   # Video Encoder (H.264 hardware encode)
   add_library(video_encoder

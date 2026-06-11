@@ -83,22 +83,46 @@ namespace trb::udp
             trimVideoBacklogLocked(queue_.back().group_id);
         }
 
-        if (max_bytes_ > 0 && queue_bytes_ > max_bytes_)
+        enforceLimitsLocked();
+
+        lock.unlock();
+        cv_.notify_one();
+    }
+
+    void SendQueue::pushBatch(std::vector<QueueItem> &&items)
+    {
+        if (items.empty())
         {
-            static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
-            RCLCPP_WARN_THROTTLE(queueLogger(), steady_clock, 1000,
-                                 "UDP send queue high water: %zu/%zu bytes (%zu packets)",
-                                 queue_bytes_, max_bytes_, queue_.size());
+            return;
         }
 
-        while (!queue_.empty() &&
-               ((max_packets_ > 0 && queue_.size() > max_packets_) || (max_bytes_ > 0 && queue_bytes_ > max_bytes_)))
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!running_)
         {
-            if (!dropOldestVideoParityLocked("capacity_parity") && !dropOldestGroupLocked("capacity"))
-            {
-                break;
-            }
+            return;
         }
+
+        std::optional<uint32_t> newest_video_group_end;
+        for (auto &item : items)
+        {
+            if (item.kind == QueueItem::Kind::Datagram)
+            {
+                queue_bytes_ += item.wire_bytes;
+            }
+            item.priority = normalizePriority(item.priority);
+            if (item.stream == QueueItem::Stream::Video && item.kind == QueueItem::Kind::GroupEnd)
+            {
+                newest_video_group_end = item.group_id;
+            }
+            queue_.push_back(std::move(item));
+        }
+
+        if (newest_video_group_end.has_value())
+        {
+            trimVideoBacklogLocked(*newest_video_group_end);
+        }
+
+        enforceLimitsLocked();
 
         lock.unlock();
         cv_.notify_one();
@@ -521,6 +545,26 @@ namespace trb::udp
             queue_bytes_ = queue_bytes_ >= out.wire_bytes ? queue_bytes_ - out.wire_bytes : 0;
         }
         queue_.erase(iterator);
+    }
+
+    void SendQueue::enforceLimitsLocked()
+    {
+        if (max_bytes_ > 0 && queue_bytes_ > max_bytes_)
+        {
+            static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+            RCLCPP_WARN_THROTTLE(queueLogger(), steady_clock, 1000,
+                                 "UDP send queue high water: %zu/%zu bytes (%zu packets)",
+                                 queue_bytes_, max_bytes_, queue_.size());
+        }
+
+        while (!queue_.empty() &&
+               ((max_packets_ > 0 && queue_.size() > max_packets_) || (max_bytes_ > 0 && queue_bytes_ > max_bytes_)))
+        {
+            if (!dropOldestVideoParityLocked("capacity_parity") && !dropOldestGroupLocked("capacity"))
+            {
+                break;
+            }
+        }
     }
 
 } // namespace trb::udp

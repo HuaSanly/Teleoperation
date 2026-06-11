@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -29,8 +30,12 @@ namespace trb::video
             uint64_t undistort_failures = 0;
             uint64_t decode_us_total = 0;
             uint64_t transform_us_total = 0;
+            uint64_t transform_map_us_total = 0;
+            uint64_t transform_wait_us_total = 0;
+            uint64_t transform_call_us_total = 0;
             uint64_t undistort_us_total = 0;
             uint64_t encode_us_total = 0;
+            std::string converter_output_format;
         };
 
         explicit VideoStreamManager(rclcpp::Node &nh);

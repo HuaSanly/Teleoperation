@@ -87,6 +87,7 @@ namespace trb::udp
         void clearProtectedVideoGroup(uint32_t group_id);
 
         void push(QueueItem &&item);
+        void pushBatch(std::vector<QueueItem> &&items);
         void requeueFront(QueueItem &&item);
         void dropGroup(uint32_t group_id, QueueItem::Stream stream, const char *reason);
         bool dropParityForGroup(uint32_t group_id, QueueItem::Stream stream, const char *reason);
@@ -114,6 +115,7 @@ namespace trb::udp
         bool dropParityForGroupLocked(uint32_t group_id, QueueItem::Stream stream, const char *reason);
         void dropGroupLocked(uint32_t group_id, QueueItem::Stream stream, const char *reason);
         void removeItemLocked(QueueIterator iterator, QueueItem &out);
+        void enforceLimitsLocked();
         bool isProtectedVideoGroupLocked(uint32_t group_id, QueueItem::Stream stream) const;
         static uint8_t normalizePriority(uint8_t priority);
         static constexpr uint32_t kNoProtectedVideoGroup = UINT32_MAX;

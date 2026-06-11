@@ -446,12 +446,38 @@ namespace trb::video
                 std::string s = conv_compute;
                 std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
                                { return static_cast<char>(std::tolower(c)); });
-                if (s == "gpu")
+                if (s == "cuda")
+                    converter_config_.transform_compute_mode = 3;
+                else if (s == "gpu")
                     converter_config_.transform_compute_mode = 1;
                 else if (s == "vic")
                     converter_config_.transform_compute_mode = 2;
                 else
                     converter_config_.transform_compute_mode = 0;
+            }
+
+            std::string conv_output_format;
+            conv_output_format = declareOrGet<std::string>(nh_, "video.converter.output_format", "nv12");
+            {
+                std::string s = conv_output_format;
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+                               { return static_cast<char>(std::tolower(c)); });
+                if (s == "yuv420" || s == "yuv420m" || s == "i420")
+                {
+                    converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kYuv420;
+                    encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kYuv420;
+                }
+                else
+                {
+                    if (s != "nv12" && s != "nv12m" && !s.empty())
+                    {
+                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                    "Unknown video.converter.output_format='%s' (use nv12|yuv420). Falling back to nv12.",
+                                    conv_output_format.c_str());
+                    }
+                    converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kNv12;
+                    encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kNv12;
+                }
             }
 
             // Save encoder config for deferred initialization
@@ -638,6 +664,15 @@ namespace trb::video
                 eye_image_right_topic_ = declareOrGet<std::string>(nh_, "video.eye_image.right_topic", "data/right_eye_image");
             }
 
+            if ((undistort_enabled_ || eye_image_enabled_) &&
+                converter_config_.output_format == trb::video::VideoConverter::OutputFormat::kYuv420)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "video.converter.output_format=yuv420 requires eye_image and undistort to be disabled; falling back to nv12.");
+                converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kNv12;
+                encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kNv12;
+            }
+
             restart_on_bad_frames_ = declareOrGet<bool>(nh_, "video.decoder.restart_on_bad_frames", true);
             consecutive_bad_frame_threshold_ = declareOrGet<int>(nh_, "video.decoder.consecutive_bad_frame_threshold", 5);
             if (consecutive_bad_frame_threshold_ < 1)
@@ -718,12 +753,16 @@ namespace trb::video
 
             if (converter)
             {
+                snapshot.converter_output_format = converter->outputFormatName();
                 auto converter_stats = converter->consumeStats();
                 snapshot.convert_frames = converter_stats.processed_frames;
                 snapshot.converter_pool_drops = converter_stats.pool_drops;
                 snapshot.converter_failures = converter_stats.failed_frames;
                 snapshot.decode_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.decode_us_total));
                 snapshot.transform_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.transform_us_total));
+                snapshot.transform_map_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.map_us_total));
+                snapshot.transform_wait_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.transform_wait_us_total));
+                snapshot.transform_call_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.transform_call_us_total));
             }
 
             if (undistorter)

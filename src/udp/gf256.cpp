@@ -14,6 +14,7 @@ namespace trb::udp::gf256
         {
             std::array<uint8_t, 256> log{}; // log[0] unused
             std::array<uint8_t, 512> exp{}; // exp extended for fast wrap
+            std::array<std::array<uint8_t, 256>, 256> mul_lut{};
             bool ready{false};
 
             void init()
@@ -39,6 +40,19 @@ namespace trb::udp::gf256
                     exp[i] = exp[i - 255];
                 }
 
+                for (int coef = 0; coef < 256; ++coef)
+                {
+                    for (int value = 0; value < 256; ++value)
+                    {
+                        if (coef == 0 || value == 0)
+                        {
+                            mul_lut[coef][value] = 0;
+                            continue;
+                        }
+                        mul_lut[coef][value] = exp[static_cast<uint16_t>(log[coef]) + static_cast<uint16_t>(log[value])];
+                    }
+                }
+
                 ready = true;
             }
         };
@@ -57,13 +71,8 @@ namespace trb::udp::gf256
 
     uint8_t mul(uint8_t a, uint8_t b)
     {
-        if (a == 0 || b == 0)
-            return 0;
-
         auto &t = tables();
-        const uint16_t la = t.log[a];
-        const uint16_t lb = t.log[b];
-        return t.exp[la + lb];
+        return t.mul_lut[a][b];
     }
 
     uint8_t inv(uint8_t a)
@@ -104,14 +113,11 @@ namespace trb::udp::gf256
         }
 
         auto &t = tables();
-        const uint8_t lcoef = t.log[coef];
+        const auto &lut = t.mul_lut[coef];
 
         for (size_t i = 0; i < bytes; ++i)
         {
-            const uint8_t s = src[i];
-            if (s == 0)
-                continue;
-            dst[i] ^= t.exp[lcoef + t.log[s]];
+            dst[i] ^= lut[src[i]];
         }
     }
 

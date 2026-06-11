@@ -99,7 +99,7 @@
         arm_topic: "/arm_joint_feedback"
 
     video:
-      profile: [3840, 1080, 30]
+      profile: [3840, 1520, 30]
       device: "/dev/video0"
       pixel_format: "mjpeg"
       sbs_crop:
@@ -109,9 +109,10 @@
         buffer_count: 4
         warmup_drop_frames: 0
       converter:
-        compute: "vic"
-        dec_layout: "block"
+        compute: "cuda"
+        dec_layout: "pitch"
         out_layout: "pitch"
+        output_format: "nv12"
       decoder:
         buffer_pool_size: 4
         output_plane_buffers: 6
