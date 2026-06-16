@@ -163,6 +163,9 @@
       undistort:
         enabled: false
         calib_file: "config/calibration_stereo.yaml"
+        backend: "vpi_cuda"
+        profile: ""
+        fused: false
         require_calibration: true
       recording:
         enabled: false

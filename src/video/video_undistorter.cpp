@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -15,6 +18,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include "nvbufsurface.h"
+#include "video/cuda_nv12_undistorter.hpp"
+#include "video/nvbuf_mutex.hpp"
 
 #include <vpi/Image.h>
 #include <vpi/Status.h>
@@ -23,11 +28,39 @@
 #include <vpi/WarpMap.h>
 #include <vpi/algo/Remap.h>
 
+#ifndef TRB_HAS_CUDA_UNDISTORTER
+#define TRB_HAS_CUDA_UNDISTORTER 0
+#endif
+
 namespace trb::video
 {
 
     namespace
     {
+        enum class Backend
+        {
+            kVpiCuda,
+            kCuda,
+            kIdentity,
+        };
+
+        struct CalibrationSelection
+        {
+            YAML::Node node;
+            std::string profile;
+            std::string session;
+            double baseline_mm = 0.0;
+            double alpha = 0.0;
+            cv::Size calibration_size;
+            cv::Size runtime_size;
+            cv::Size stream_size;
+        };
+
+        struct MapBuildResult
+        {
+            std::vector<float> full_map_xy;
+            CalibrationSelection calibration;
+        };
 
         bool checkVpi(VPIStatus s, const char *what)
         {
@@ -41,8 +74,180 @@ namespace trb::video
             return false;
         }
 
-        // Read a flat yaml sequence into a fixed-size cv::Mat. Returns false if
-        // the node is missing AND |required| is true.
+        std::string normalizeBackend(std::string value)
+        {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            std::replace(value.begin(), value.end(), '-', '_');
+            return value;
+        }
+
+        Backend parseBackend(const std::string &value)
+        {
+            const std::string backend = normalizeBackend(value.empty() ? "vpi_cuda" : value);
+            if (backend == "cuda")
+            {
+                return Backend::kCuda;
+            }
+            if (backend == "identity" || backend == "disabled" || backend == "none")
+            {
+                return Backend::kIdentity;
+            }
+            return Backend::kVpiCuda;
+        }
+
+        const char *backendToString(Backend backend)
+        {
+            switch (backend)
+            {
+            case Backend::kCuda:
+                return "cuda";
+            case Backend::kIdentity:
+                return "identity";
+            case Backend::kVpiCuda:
+            default:
+                return "vpi_cuda";
+            }
+        }
+
+        bool readSize(const YAML::Node &node, const char *key, cv::Size &out)
+        {
+            if (!node[key])
+            {
+                return false;
+            }
+            const auto values = node[key].as<std::vector<int>>();
+            if (values.size() != 2)
+            {
+                return false;
+            }
+            out = cv::Size(values[0], values[1]);
+            return out.width > 0 && out.height > 0;
+        }
+
+        std::string sizeString(const cv::Size &size)
+        {
+            std::ostringstream oss;
+            oss << size.width << "x" << size.height;
+            return oss.str();
+        }
+
+        std::string availableProfilesString(const YAML::Node &list)
+        {
+            std::ostringstream oss;
+            if (!list || !list.IsSequence())
+            {
+                return "";
+            }
+            for (std::size_t i = 0; i < list.size(); ++i)
+            {
+                const YAML::Node item = list[i];
+                cv::Size stream_size;
+                const std::string profile = item["profile"] ? item["profile"].as<std::string>() : "";
+                const std::string session = item["session"] ? item["session"].as<std::string>() : "";
+                if (i > 0)
+                {
+                    oss << ", ";
+                }
+                oss << "{profile=" << (profile.empty() ? "<empty>" : profile)
+                    << " session=" << (session.empty() ? "<empty>" : session);
+                if (readSize(item, "stream_image_size", stream_size))
+                {
+                    oss << " stream=" << sizeString(stream_size);
+                }
+                oss << "}";
+            }
+            return oss.str();
+        }
+
+        bool selectCalibration(const YAML::Node &root,
+                               const VideoUndistorter::Config &cfg,
+                               CalibrationSelection &selection)
+        {
+            const cv::Size stream_size(static_cast<int>(cfg.width), static_cast<int>(cfg.height));
+            const cv::Size runtime_eye(static_cast<int>(cfg.width / 2u), static_cast<int>(cfg.height));
+
+            YAML::Node selected;
+            if (root["stereo_calibrations"])
+            {
+                const YAML::Node list = root["stereo_calibrations"];
+                if (!list.IsSequence())
+                {
+                    RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                 "[UNDISTORT] stereo_calibrations must be a list");
+                    return false;
+                }
+
+                for (const YAML::Node item : list)
+                {
+                    cv::Size item_stream;
+                    const bool have_stream = readSize(item, "stream_image_size", item_stream);
+                    const std::string profile = item["profile"] ? item["profile"].as<std::string>() : "";
+                    const std::string session = item["session"] ? item["session"].as<std::string>() : "";
+                    const bool profile_match = !cfg.profile.empty() &&
+                                               (cfg.profile == profile || cfg.profile == session);
+                    const bool size_match = cfg.profile.empty() && have_stream && item_stream == stream_size;
+                    if (profile_match || size_match)
+                    {
+                        selected = item;
+                        break;
+                    }
+                }
+
+                if (!selected)
+                {
+                    RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                 "[UNDISTORT] no calibration profile matched stream=%s selector='%s'. Available: %s",
+                                 sizeString(stream_size).c_str(),
+                                 cfg.profile.c_str(),
+                                 availableProfilesString(list).c_str());
+                    return false;
+                }
+            }
+            else
+            {
+                selected = root;
+            }
+
+            if (!selected["left"] || !selected["right"])
+            {
+                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                             "[UNDISTORT] selected calibration missing left/right sections");
+                return false;
+            }
+
+            selection = CalibrationSelection{};
+            selection.node = selected;
+            selection.profile = selected["profile"] ? selected["profile"].as<std::string>() : "";
+            selection.session = selected["session"] ? selected["session"].as<std::string>() : "";
+            selection.baseline_mm = selected["baseline_mm"] ? selected["baseline_mm"].as<double>() : 0.0;
+            selection.alpha = selected["alpha"] ? selected["alpha"].as<double>() : 0.0;
+            selection.calibration_size = runtime_eye;
+            selection.runtime_size = runtime_eye;
+            selection.stream_size = stream_size;
+
+            (void)readSize(selected, "calibration_image_size", selection.calibration_size);
+            cv::Size yaml_runtime;
+            if (readSize(selected, "runtime_image_size", yaml_runtime) && yaml_runtime != runtime_eye)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "[UNDISTORT] runtime_image_size=%s differs from pipeline single-eye size=%s; using pipeline size",
+                            sizeString(yaml_runtime).c_str(),
+                            sizeString(runtime_eye).c_str());
+            }
+            cv::Size yaml_stream;
+            if (readSize(selected, "stream_image_size", yaml_stream) && yaml_stream != stream_size)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "[UNDISTORT] stream_image_size=%s differs from pipeline size=%s; using pipeline size",
+                            sizeString(yaml_stream).c_str(),
+                            sizeString(stream_size).c_str());
+            }
+
+            return true;
+        }
+
         bool loadMatrixFromYaml(const YAML::Node &eye, const char *key,
                                 int rows, int cols, cv::Mat &out, bool required)
         {
@@ -67,7 +272,6 @@ namespace trb::video
             return true;
         }
 
-        // Read distortion vector (5..14 coefficients depending on model).
         bool loadDistortion(const YAML::Node &eye, cv::Mat &out)
         {
             if (!eye["D"])
@@ -86,10 +290,6 @@ namespace trb::video
             return true;
         }
 
-        // Build a single-eye mapping (R = optional, P = optional). Returns
-        // CV_32FC2 dense map of size runtime_size. Falls back to identity P
-        // via getOptimalNewCameraMatrix(K_run, D, runtime_size, alpha) when
-        // P is not provided in the YAML.
         bool buildEyeMap(const YAML::Node &eye_node,
                          const cv::Size &calib_size,
                          const cv::Size &runtime_size,
@@ -110,23 +310,27 @@ namespace trb::video
                 R = cv::Mat::eye(3, 3, CV_64F);
             }
 
-            // Scale K from calibration resolution to runtime resolution.
-            // K is in pixel units, so K' = diag(sx, sy, 1) * K.
             const double sx = static_cast<double>(runtime_size.width) /
                               static_cast<double>(calib_size.width);
             const double sy = static_cast<double>(runtime_size.height) /
                               static_cast<double>(calib_size.height);
             cv::Mat K_run = K_calib.clone();
-            K_run.at<double>(0, 0) *= sx; // fx
-            K_run.at<double>(0, 2) *= sx; // cx
-            K_run.at<double>(1, 1) *= sy; // fy
-            K_run.at<double>(1, 2) *= sy; // cy
+            K_run.at<double>(0, 0) *= sx;
+            K_run.at<double>(0, 2) *= sx;
+            K_run.at<double>(1, 1) *= sy;
+            K_run.at<double>(1, 2) *= sy;
 
             const bool have_P = loadMatrixFromYaml(eye_node, "P", 3, 4, P, false);
             cv::Mat new_K;
             if (have_P)
             {
-                new_K = P; // P is already a 3x4 projection in rectified frame.
+                new_K = P.clone();
+                new_K.at<double>(0, 0) *= sx;
+                new_K.at<double>(0, 2) *= sx;
+                new_K.at<double>(0, 3) *= sx;
+                new_K.at<double>(1, 1) *= sy;
+                new_K.at<double>(1, 2) *= sy;
+                new_K.at<double>(1, 3) *= sy;
             }
             else
             {
@@ -137,8 +341,130 @@ namespace trb::video
             cv::Mat map1, map2;
             cv::initUndistortRectifyMap(K_run, D, R, new_K, runtime_size,
                                         CV_32FC2, map1, map2);
-            map_xy_out = map1; // CV_32FC2: each pixel = (src_x, src_y)
+            map_xy_out = map1;
             return true;
+        }
+
+        bool buildFullMap(const CalibrationSelection &selection,
+                          const VideoUndistorter::Config &cfg,
+                          MapBuildResult &result)
+        {
+            const cv::Size runtime_eye(static_cast<int>(cfg.width / 2u),
+                                       static_cast<int>(cfg.height));
+            cv::Mat map_left, map_right;
+            if (!buildEyeMap(selection.node["left"], selection.calibration_size, runtime_eye, selection.alpha, map_left))
+            {
+                return false;
+            }
+            if (!buildEyeMap(selection.node["right"], selection.calibration_size, runtime_eye, selection.alpha, map_right))
+            {
+                return false;
+            }
+
+            const int width = static_cast<int>(cfg.width);
+            const int height = static_cast<int>(cfg.height);
+            const int single_w = runtime_eye.width;
+            const int single_h = runtime_eye.height;
+            const float clamp_x_max = static_cast<float>(single_w - 1);
+            const float clamp_y_max = static_cast<float>(single_h - 1);
+            result.full_map_xy.assign(static_cast<size_t>(width) * height * 2u, 0.0f);
+            result.calibration = selection;
+
+            for (int y = 0; y < height; ++y)
+            {
+                const int y_src = std::min(y, single_h - 1);
+                for (int x = 0; x < width; ++x)
+                {
+                    cv::Vec2f src;
+                    if (x < single_w)
+                    {
+                        src = map_left.at<cv::Vec2f>(y_src, x);
+                        src[0] = std::clamp(src[0], 0.0f, clamp_x_max);
+                        src[1] = std::clamp(src[1], 0.0f, clamp_y_max);
+                    }
+                    else
+                    {
+                        const int x_local = std::min(x - single_w, single_w - 1);
+                        src = map_right.at<cv::Vec2f>(y_src, x_local);
+                        src[0] = std::clamp(src[0], 0.0f, clamp_x_max);
+                        src[1] = std::clamp(src[1], 0.0f, clamp_y_max);
+                        src[0] += static_cast<float>(single_w);
+                    }
+
+                    const size_t index = (static_cast<size_t>(y) * width + x) * 2u;
+                    result.full_map_xy[index] = src[0];
+                    result.full_map_xy[index + 1] = src[1];
+                }
+            }
+            return true;
+        }
+
+        bool loadCalibrationMap(const std::string &yaml_path,
+                                const VideoUndistorter::Config &cfg,
+                                MapBuildResult &result)
+        {
+            YAML::Node root;
+            try
+            {
+                root = YAML::LoadFile(yaml_path);
+            }
+            catch (const std::exception &e)
+            {
+                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] failed to load '%s': %s", yaml_path.c_str(), e.what());
+                return false;
+            }
+
+            CalibrationSelection selection;
+            if (!selectCalibration(root, cfg, selection))
+            {
+                return false;
+            }
+            return buildFullMap(selection, cfg, result);
+        }
+
+        void buildIdentityMap(const VideoUndistorter::Config &cfg, MapBuildResult &result)
+        {
+            result = MapBuildResult{};
+            result.calibration.runtime_size = cv::Size(static_cast<int>(cfg.width / 2u), static_cast<int>(cfg.height));
+            result.calibration.stream_size = cv::Size(static_cast<int>(cfg.width), static_cast<int>(cfg.height));
+            result.full_map_xy.assign(static_cast<size_t>(cfg.width) * cfg.height * 2u, 0.0f);
+            for (uint32_t y = 0; y < cfg.height; ++y)
+            {
+                for (uint32_t x = 0; x < cfg.width; ++x)
+                {
+                    const size_t index = (static_cast<size_t>(y) * cfg.width + x) * 2u;
+                    result.full_map_xy[index] = static_cast<float>(x);
+                    result.full_map_xy[index + 1] = static_cast<float>(y);
+                }
+            }
+        }
+
+        void logCudaFailureOnce(const CudaNv12UndistorterResult &result,
+                                int src_fd,
+                                uint32_t width,
+                                uint32_t height,
+                                const char *mode)
+        {
+            static std::atomic<uint64_t> failure_count{0};
+            const uint64_t count = failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 5 || (count % 300 == 0))
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "[UNDISTORT] CUDA %s failed stage=%s err=%d src_fd=%d w=%u h=%u src_color=%u dst_color=%u src_planes=%u dst_planes=%u src_frame_type=%u dst_frame_type=%u failures=%lu",
+                            mode,
+                            result.error_stage,
+                            result.error_code,
+                            src_fd,
+                            width,
+                            height,
+                            result.src_color_format,
+                            result.dst_color_format,
+                            result.src_plane_count,
+                            result.dst_plane_count,
+                            result.src_frame_type,
+                            result.dst_frame_type,
+                            static_cast<unsigned long>(count));
+            }
         }
 
     } // namespace
@@ -146,37 +472,48 @@ namespace trb::video
     struct VideoUndistorter::Impl
     {
         Config cfg;
+        Backend backend{Backend::kVpiCuda};
+        bool fused_enabled{false};
+        std::string backend_name{"vpi_cuda"};
+        MapBuildResult map_result;
 
-        // Output NV12 NvBufSurface pool (same layout as VideoConverter output).
         std::vector<void *> surfaces;
         std::vector<int> dmabuf_fds;
         std::mutex pool_mutex;
         std::queue<size_t> free_indices;
         std::unordered_map<int, size_t> fd_to_index;
 
-        // VPI resources.
         VPIStream stream{nullptr};
         VPIPayload remap_payload{nullptr};
         VPIWarpMap warp_map{};
         bool warp_allocated{false};
-
-        // VPI image wrappers per dmabuf fd. Wrapping is cheap but not free,
-        // so we cache one VPIImage per pool entry plus one for the input.
-        // The input fd may change frame-to-frame (it comes from the converter
-        // pool), so we maintain a small LRU-ish cache keyed by fd.
         std::unordered_map<int, VPIImage> input_image_cache;
         std::unordered_map<int, VPIImage> output_image_cache;
 
-        // Stats.
+        std::unique_ptr<CudaNv12Undistorter> cuda_backend;
+
         std::atomic<uint64_t> processed_frames{0};
         std::atomic<uint64_t> pool_drops{0};
         std::atomic<uint64_t> failed_frames{0};
+        std::atomic<uint64_t> fallback_frames{0};
         std::atomic<int64_t> remap_us_total{0};
+        std::atomic<int64_t> map_us_total{0};
+        std::atomic<int64_t> kernel_us_total{0};
+        std::atomic<int64_t> sync_us_total{0};
 
-        ~Impl() { teardown(); }
+        ~Impl()
+        {
+            teardown();
+        }
 
         void teardown()
         {
+            if (cuda_backend)
+            {
+                cuda_backend->reset();
+                cuda_backend.reset();
+            }
+
             for (auto &kv : input_image_cache)
             {
                 if (kv.second)
@@ -245,6 +582,14 @@ namespace trb::video
 
             surfaces.assign(cfg.buffer_pool_size, nullptr);
             dmabuf_fds.assign(cfg.buffer_pool_size, -1);
+            {
+                std::lock_guard<std::mutex> lk(pool_mutex);
+                while (!free_indices.empty())
+                {
+                    free_indices.pop();
+                }
+                fd_to_index.clear();
+            }
             for (uint32_t i = 0; i < cfg.buffer_pool_size; ++i)
             {
                 NvBufSurface *surf = nullptr;
@@ -253,78 +598,18 @@ namespace trb::video
                     RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] NvBufSurfaceCreate failed at i=%u", i);
                     return false;
                 }
+                surf->numFilled = 1;
                 surfaces[i] = surf;
                 dmabuf_fds[i] = surf->surfaceList[0].bufferDesc;
+                std::lock_guard<std::mutex> lk(pool_mutex);
                 free_indices.push(i);
                 fd_to_index.emplace(dmabuf_fds[i], i);
             }
             return true;
         }
 
-        // Load the calibration YAML and assemble the SBS warp map. The map
-        // sits dense (interval=1) in a single VPI region matching the full
-        // SBS frame size. Right-eye dst x is offset by +single_w; per-eye
-        // src coordinates are clamped to their own half so bilinear sampling
-        // never crosses the seam.
-        bool buildWarpMap(const std::string &yaml_path)
+        bool buildVpiWarpMap()
         {
-            YAML::Node root;
-            try
-            {
-                root = YAML::LoadFile(yaml_path);
-            }
-            catch (const std::exception &e)
-            {
-                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] failed to load '%s': %s", yaml_path.c_str(), e.what());
-                return false;
-            }
-
-            // Figure out per-eye runtime size. The SBS frame is cfg.width x
-            // cfg.height; each eye occupies the left/right half.
-            const cv::Size runtime_eye(static_cast<int>(cfg.width / 2u),
-                                       static_cast<int>(cfg.height));
-
-            cv::Size calib_size = runtime_eye;
-            if (root["calibration_image_size"])
-            {
-                const auto v = root["calibration_image_size"].as<std::vector<int>>();
-                if (v.size() == 2)
-                {
-                    calib_size = cv::Size(v[0], v[1]);
-                }
-            }
-            if (root["runtime_image_size"])
-            {
-                const auto v = root["runtime_image_size"].as<std::vector<int>>();
-                if (v.size() == 2 &&
-                    (v[0] != runtime_eye.width || v[1] != runtime_eye.height))
-                {
-                    RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] runtime_image_size=[%d,%d] in yaml differs from "
-                             "pipeline single-eye size [%d,%d]; using pipeline size",
-                             v[0], v[1], runtime_eye.width, runtime_eye.height);
-                }
-            }
-            const double alpha = root["alpha"] ? root["alpha"].as<double>() : 0.0;
-
-            if (!root["left"] || !root["right"])
-            {
-                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] yaml missing 'left' or 'right' section");
-                return false;
-            }
-
-            cv::Mat map_left, map_right;
-            if (!buildEyeMap(root["left"], calib_size, runtime_eye, alpha, map_left))
-            {
-                return false;
-            }
-            if (!buildEyeMap(root["right"], calib_size, runtime_eye, alpha, map_right))
-            {
-                return false;
-            }
-
-            // Configure a single dense region covering the full SBS frame.
-            // Interval=1 power-of-two, region sizes meet 64-wide / 16-high
-            // alignment requirements (5120, 1440 both qualify).
             std::memset(&warp_map, 0, sizeof(warp_map));
             warp_map.grid.numHorizRegions = 1;
             warp_map.grid.numVertRegions = 1;
@@ -339,46 +624,22 @@ namespace trb::video
             }
             warp_allocated = true;
 
-            // numHorizPoints = (width / 1) + 1, numVertPoints = (height / 1) + 1.
             const int nx = warp_map.numHorizPoints;
             const int ny = warp_map.numVertPoints;
-            const int single_w = runtime_eye.width;
-            const int single_h = runtime_eye.height;
-            const float clamp_x_max = static_cast<float>(single_w - 1);
-            const float clamp_y_max = static_cast<float>(single_h - 1);
-
-            for (int v = 0; v < ny; ++v)
+            const int width = static_cast<int>(cfg.width);
+            const int height = static_cast<int>(cfg.height);
+            for (int y = 0; y < ny; ++y)
             {
                 auto *row = reinterpret_cast<VPIKeypointF32 *>(
                     reinterpret_cast<uint8_t *>(warp_map.keypoints) +
-                    static_cast<ptrdiff_t>(v) * warp_map.pitchBytes);
-                // Use clamped row index for src lookup (last grid row may be
-                // height, one past the last image row).
-                const int v_src = std::min(v, single_h - 1);
-
-                for (int h = 0; h < nx; ++h)
+                    static_cast<ptrdiff_t>(y) * warp_map.pitchBytes);
+                const int y_src = std::min(y, height - 1);
+                for (int x = 0; x < nx; ++x)
                 {
-                    cv::Vec2f src;
-                    if (h < single_w)
-                    {
-                        // Left eye dst column.
-                        src = map_left.at<cv::Vec2f>(v_src, h);
-                        src[0] = std::clamp(src[0], 0.0f, clamp_x_max);
-                        src[1] = std::clamp(src[1], 0.0f, clamp_y_max);
-                        // No offset; left-eye src lives in [0, single_w).
-                    }
-                    else
-                    {
-                        // Right eye dst column. Look up in right map at h - single_w.
-                        const int h_local = std::min(h - single_w, single_w - 1);
-                        src = map_right.at<cv::Vec2f>(v_src, h_local);
-                        src[0] = std::clamp(src[0], 0.0f, clamp_x_max);
-                        src[1] = std::clamp(src[1], 0.0f, clamp_y_max);
-                        // Offset src x into the right half of the SBS frame.
-                        src[0] += static_cast<float>(single_w);
-                    }
-                    row[h].x = src[0];
-                    row[h].y = src[1];
+                    const int x_src = std::min(x, width - 1);
+                    const size_t index = (static_cast<size_t>(y_src) * width + x_src) * 2u;
+                    row[x].x = map_result.full_map_xy[index];
+                    row[x].y = map_result.full_map_xy[index + 1];
                 }
             }
             return true;
@@ -386,6 +647,10 @@ namespace trb::video
 
         bool createVpiResources()
         {
+            if (!buildVpiWarpMap())
+            {
+                return false;
+            }
             if (!checkVpi(vpiStreamCreate(VPI_BACKEND_CUDA, &stream),
                           "vpiStreamCreate(CUDA)"))
             {
@@ -399,8 +664,47 @@ namespace trb::video
             return true;
         }
 
-        // Wrap or fetch a cached VPIImage for an NV12 NvBuffer fd. Returns
-        // nullptr on failure.
+        bool createCudaResources()
+        {
+#if TRB_HAS_CUDA_UNDISTORTER
+            if (cfg.output_surface_layout != 0)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "[UNDISTORT] CUDA backend supports pitch-linear NV12 output only; current output layout is block-linear");
+                return false;
+            }
+            cuda_backend = std::make_unique<CudaNv12Undistorter>();
+            if (!cuda_backend->initialize(cfg.width, cfg.height, map_result.full_map_xy))
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "[UNDISTORT] CUDA backend map initialization failed");
+                cuda_backend.reset();
+                return false;
+            }
+            for (void *surface : surfaces)
+            {
+                auto *dst = reinterpret_cast<NvBufSurface *>(surface);
+                if (!dst)
+                {
+                    return false;
+                }
+                dst->numFilled = 1;
+                CudaNv12UndistorterResult result;
+                if (!cuda_backend->prepareOutput(dst, &result))
+                {
+                    logCudaFailureOnce(result, dst->surfaceList[0].bufferDesc, cfg.width, cfg.height, "prepare");
+                    cuda_backend.reset();
+                    return false;
+                }
+            }
+            return true;
+#else
+            RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "[UNDISTORT] CUDA backend requested but CUDA undistorter was not built");
+            return false;
+#endif
+        }
+
         VPIImage getOrWrapImage(int fd, std::unordered_map<int, VPIImage> &cache)
         {
             auto it = cache.find(fd);
@@ -425,6 +729,131 @@ namespace trb::video
             return img;
         }
 
+        bool acquireOutput(size_t &out_idx, int &out_fd)
+        {
+            std::lock_guard<std::mutex> lk(pool_mutex);
+            if (free_indices.empty())
+            {
+                pool_drops.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            out_idx = free_indices.front();
+            free_indices.pop();
+            out_fd = dmabuf_fds[out_idx];
+            return true;
+        }
+
+        void releaseOutputIndex(size_t out_idx)
+        {
+            std::lock_guard<std::mutex> lk(pool_mutex);
+            free_indices.push(out_idx);
+        }
+
+        bool processVpi(int nv12_fd_in, size_t out_idx, int out_fd)
+        {
+            (void)out_idx;
+            const auto t0 = std::chrono::steady_clock::now();
+            VPIImage in_img = getOrWrapImage(nv12_fd_in, input_image_cache);
+            VPIImage out_img = getOrWrapImage(out_fd, output_image_cache);
+            if (!in_img || !out_img)
+            {
+                failed_frames.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            const VPIStatus s_submit = vpiSubmitRemap(
+                stream, VPI_BACKEND_CUDA, remap_payload,
+                in_img, out_img, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0);
+            if (s_submit != VPI_SUCCESS)
+            {
+                checkVpi(s_submit, "vpiSubmitRemap");
+                failed_frames.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            const auto sync_start = std::chrono::steady_clock::now();
+            const VPIStatus s_sync = vpiStreamSync(stream);
+            const auto t1 = std::chrono::steady_clock::now();
+            if (s_sync != VPI_SUCCESS)
+            {
+                checkVpi(s_sync, "vpiStreamSync");
+                failed_frames.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            const int64_t total_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            const int64_t sync_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - sync_start).count();
+            remap_us_total.fetch_add(total_us, std::memory_order_relaxed);
+            kernel_us_total.fetch_add(std::max<int64_t>(0, total_us - sync_us), std::memory_order_relaxed);
+            sync_us_total.fetch_add(sync_us, std::memory_order_relaxed);
+            processed_frames.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        bool surfaceFromFd(int fd, NvBufSurface *&surface)
+        {
+            std::lock_guard<std::mutex> lk(getNvBufMutex());
+            return NvBufSurfaceFromFd(fd, reinterpret_cast<void **>(&surface)) == 0 && surface;
+        }
+
+        void noteCudaFailure(bool count_failure)
+        {
+            if (count_failure)
+            {
+                failed_frames.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        bool processCuda(int fd_in, size_t out_idx, int out_fd, bool src_yuv422, bool count_failure)
+        {
+            if (!cuda_backend)
+            {
+                noteCudaFailure(count_failure);
+                return false;
+            }
+            NvBufSurface *src = nullptr;
+            if (!surfaceFromFd(fd_in, src))
+            {
+                noteCudaFailure(count_failure);
+                return false;
+            }
+            NvBufSurface *dst = reinterpret_cast<NvBufSurface *>(surfaces[out_idx]);
+            if (!dst)
+            {
+                noteCudaFailure(count_failure);
+                return false;
+            }
+            src->numFilled = 1;
+            dst->numFilled = 1;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            CudaNv12UndistorterResult result;
+            const bool ok = src_yuv422
+                ? cuda_backend->remapYuv422ToNv12(src, dst, &result)
+                : cuda_backend->remapNv12(src, dst, &result);
+            const auto t1 = std::chrono::steady_clock::now();
+            if (!ok)
+            {
+                logCudaFailureOnce(result, fd_in, cfg.width, cfg.height, src_yuv422 ? "yuv422->nv12" : "nv12");
+                noteCudaFailure(count_failure);
+                return false;
+            }
+
+            remap_us_total.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                std::memory_order_relaxed);
+            map_us_total.fetch_add(result.map_us, std::memory_order_relaxed);
+            kernel_us_total.fetch_add(result.kernel_us, std::memory_order_relaxed);
+            sync_us_total.fetch_add(result.sync_us, std::memory_order_relaxed);
+            processed_frames.fetch_add(1, std::memory_order_relaxed);
+            (void)out_fd;
+            return true;
+        }
+
+        bool processIdentity(int fd_in, size_t out_idx, int out_fd)
+        {
+            return processVpi(fd_in, out_idx, out_fd);
+        }
     };
 
     VideoUndistorter::VideoUndistorter() : impl_(new Impl()) {}
@@ -432,123 +861,168 @@ namespace trb::video
 
     bool VideoUndistorter::initialize(const Config &config)
     {
+        impl_->teardown();
         impl_->cfg = config;
+        impl_->backend = parseBackend(config.backend);
+        impl_->backend_name = backendToString(impl_->backend);
+        impl_->fused_enabled = config.fused && impl_->backend == Backend::kCuda;
 
-        if (config.calibration_file.empty())
+        if (config.width == 0 || config.height == 0 || (config.width & 1u) != 0)
         {
-            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] empty calibration_file");
+            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                         "[UNDISTORT] invalid SBS dimensions %ux%u", config.width, config.height);
             return false;
         }
-        if (!impl_->buildWarpMap(config.calibration_file))
+
+        bool map_ok = false;
+        if (impl_->backend == Backend::kIdentity)
+        {
+            buildIdentityMap(config, impl_->map_result);
+            map_ok = true;
+        }
+        else if (config.calibration_file.empty())
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] empty calibration_file");
+            map_ok = false;
+        }
+        else
+        {
+            map_ok = loadCalibrationMap(config.calibration_file, config, impl_->map_result);
+        }
+
+        if (!map_ok)
         {
             if (config.require_calibration)
             {
                 return false;
             }
-            RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] calibration unavailable; falling back to identity map");
-            // Fallback: identity-ish keypoints. Build a trivial map.
-            std::memset(&impl_->warp_map, 0, sizeof(impl_->warp_map));
-            impl_->warp_map.grid.numHorizRegions = 1;
-            impl_->warp_map.grid.numVertRegions = 1;
-            impl_->warp_map.grid.horizInterval[0] = 1;
-            impl_->warp_map.grid.vertInterval[0] = 1;
-            impl_->warp_map.grid.regionWidth[0] = static_cast<int16_t>(config.width);
-            impl_->warp_map.grid.regionHeight[0] = static_cast<int16_t>(config.height);
-            if (!checkVpi(vpiWarpMapAllocData(&impl_->warp_map),
-                          "vpiWarpMapAllocData(identity)"))
-            {
-                return false;
-            }
-            impl_->warp_allocated = true;
-            if (!checkVpi(vpiWarpMapGenerateIdentity(&impl_->warp_map),
-                          "vpiWarpMapGenerateIdentity"))
-            {
-                return false;
-            }
+            RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "[UNDISTORT] calibration unavailable; falling back to identity backend");
+            impl_->backend = Backend::kIdentity;
+            impl_->backend_name = backendToString(impl_->backend);
+            impl_->fused_enabled = false;
+            buildIdentityMap(config, impl_->map_result);
         }
 
-        if (!impl_->createVpiResources())
-        {
-            return false;
-        }
         if (!impl_->createOutputPool())
         {
             return false;
         }
 
-        RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] initialized: %ux%u, pool=%u, calib=%s",
-                 config.width, config.height, config.buffer_pool_size,
-                 config.calibration_file.c_str());
+        if (impl_->backend == Backend::kCuda)
+        {
+            if (!impl_->createCudaResources())
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (!impl_->createVpiResources())
+            {
+                return false;
+            }
+        }
+
+        const auto &cal = impl_->map_result.calibration;
+        RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                    "[UNDISTORT] initialized: %ux%u eye=%s pool=%u backend=%s fused=%d profile=%s session=%s baseline=%.3fmm alpha=%.3f calib=%s",
+                    config.width,
+                    config.height,
+                    sizeString(cal.runtime_size).c_str(),
+                    config.buffer_pool_size,
+                    impl_->backend_name.c_str(),
+                    impl_->fused_enabled ? 1 : 0,
+                    cal.profile.empty() ? "<direct>" : cal.profile.c_str(),
+                    cal.session.empty() ? "<none>" : cal.session.c_str(),
+                    cal.baseline_mm,
+                    cal.alpha,
+                    config.calibration_file.c_str());
         return true;
     }
 
     bool VideoUndistorter::process(int nv12_fd_in, int &nv12_fd_out)
     {
         nv12_fd_out = -1;
-        if (nv12_fd_in < 0 || !impl_->stream || !impl_->remap_payload)
+        if (nv12_fd_in < 0)
         {
             return false;
         }
 
-        // Acquire an output fd from the pool.
+        if (impl_->backend == Backend::kVpiCuda && (!impl_->stream || !impl_->remap_payload))
+        {
+            return false;
+        }
+
         size_t out_idx = 0;
         int out_fd = -1;
+        if (!impl_->acquireOutput(out_idx, out_fd))
         {
-            std::lock_guard<std::mutex> lk(impl_->pool_mutex);
-            if (impl_->free_indices.empty())
-            {
-                impl_->pool_drops.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            out_idx = impl_->free_indices.front();
-            impl_->free_indices.pop();
-            out_fd = impl_->dmabuf_fds[out_idx];
-        }
-
-        const auto t0 = std::chrono::steady_clock::now();
-
-        VPIImage in_img = impl_->getOrWrapImage(nv12_fd_in, impl_->input_image_cache);
-        VPIImage out_img = impl_->getOrWrapImage(out_fd, impl_->output_image_cache);
-        if (!in_img || !out_img)
-        {
-            std::lock_guard<std::mutex> lk(impl_->pool_mutex);
-            impl_->free_indices.push(out_idx);
-            impl_->failed_frames.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
-        // Submit one CUDA Remap and wait for completion. Synchronous submit
-        // matches the encode thread's existing transformSync() pattern and
-        // guarantees the encoder sees a finished output buffer.
-        const VPIStatus s_submit = vpiSubmitRemap(
-            impl_->stream, VPI_BACKEND_CUDA, impl_->remap_payload,
-            in_img, out_img, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0);
-        if (s_submit != VPI_SUCCESS)
+        bool ok = false;
+        if (impl_->backend == Backend::kCuda)
         {
-            checkVpi(s_submit, "vpiSubmitRemap");
-            std::lock_guard<std::mutex> lk(impl_->pool_mutex);
-            impl_->free_indices.push(out_idx);
-            impl_->failed_frames.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            ok = impl_->processCuda(nv12_fd_in, out_idx, out_fd, false, true);
         }
-        const VPIStatus s_sync = vpiStreamSync(impl_->stream);
-        if (s_sync != VPI_SUCCESS)
+        else
         {
-            checkVpi(s_sync, "vpiStreamSync");
-            std::lock_guard<std::mutex> lk(impl_->pool_mutex);
-            impl_->free_indices.push(out_idx);
-            impl_->failed_frames.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            ok = impl_->processVpi(nv12_fd_in, out_idx, out_fd);
         }
 
-        const auto t1 = std::chrono::steady_clock::now();
-        impl_->remap_us_total.fetch_add(
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-            std::memory_order_relaxed);
-        impl_->processed_frames.fetch_add(1, std::memory_order_relaxed);
+        if (!ok)
+        {
+            impl_->releaseOutputIndex(out_idx);
+            return false;
+        }
 
         nv12_fd_out = out_fd;
         return true;
+    }
+
+    bool VideoUndistorter::processYuv422(int yuv422_fd_in, int &nv12_fd_out)
+    {
+        nv12_fd_out = -1;
+        if (yuv422_fd_in < 0 || !supportsFusedYuv422())
+        {
+            return false;
+        }
+
+        size_t out_idx = 0;
+        int out_fd = -1;
+        if (!impl_->acquireOutput(out_idx, out_fd))
+        {
+            return false;
+        }
+
+        const bool ok = impl_->processCuda(yuv422_fd_in, out_idx, out_fd, true, false);
+        if (!ok)
+        {
+            impl_->releaseOutputIndex(out_idx);
+            return false;
+        }
+
+        nv12_fd_out = out_fd;
+        return true;
+    }
+
+    bool VideoUndistorter::supportsFusedYuv422() const
+    {
+        return impl_ && impl_->fused_enabled && impl_->backend == Backend::kCuda;
+    }
+
+    const std::string &VideoUndistorter::backendName() const
+    {
+        return impl_->backend_name;
+    }
+
+    void VideoUndistorter::noteFusedFallback()
+    {
+        if (impl_)
+        {
+            impl_->fallback_frames.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void VideoUndistorter::releaseFd(int dmabuf_fd)
@@ -567,7 +1041,12 @@ namespace trb::video
         s.processed_frames = impl_->processed_frames.exchange(0, std::memory_order_relaxed);
         s.pool_drops = impl_->pool_drops.exchange(0, std::memory_order_relaxed);
         s.failed_frames = impl_->failed_frames.exchange(0, std::memory_order_relaxed);
+        s.fallback_frames = impl_->fallback_frames.exchange(0, std::memory_order_relaxed);
         s.remap_us_total = impl_->remap_us_total.exchange(0, std::memory_order_relaxed);
+        s.map_us_total = impl_->map_us_total.exchange(0, std::memory_order_relaxed);
+        s.kernel_us_total = impl_->kernel_us_total.exchange(0, std::memory_order_relaxed);
+        s.sync_us_total = impl_->sync_us_total.exchange(0, std::memory_order_relaxed);
+        s.backend = impl_->backend_name;
         return s;
     }
 

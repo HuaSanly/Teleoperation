@@ -393,6 +393,9 @@ namespace trb::video
                 undistorter_config_.buffer_pool_size = conv_pool_size;
                 undistorter_config_.output_surface_layout = converter_config_.output_surface_layout;
                 undistorter_config_.calibration_file = declareOrGet<std::string>(nh_, "video.undistort.calib_file", "");
+                undistorter_config_.backend = declareOrGet<std::string>(nh_, "video.undistort.backend", "vpi_cuda");
+                undistorter_config_.profile = declareOrGet<std::string>(nh_, "video.undistort.profile", "");
+                undistorter_config_.fused = declareOrGet<bool>(nh_, "video.undistort.fused", false);
                 if (!undistorter_config_.calibration_file.empty() &&
                     undistorter_config_.calibration_file.front() != '/')
                 {
@@ -438,6 +441,10 @@ namespace trb::video
             {
                 converter_config_.output_surface_layout = 0;
             }
+            if (undistort_enabled_)
+            {
+                undistorter_config_.output_surface_layout = converter_config_.output_surface_layout;
+            }
             decoder_config_.decode_surface_layout = converter_config_.decode_surface_layout;
 
             std::string conv_compute;
@@ -454,6 +461,14 @@ namespace trb::video
                     converter_config_.transform_compute_mode = 2;
                 else
                     converter_config_.transform_compute_mode = 0;
+            }
+            if (undistort_enabled_ &&
+                undistorter_config_.fused &&
+                converter_config_.transform_compute_mode != 3)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "video.undistort.fused=true requires video.converter.compute=cuda; fused path disabled.");
+                undistorter_config_.fused = false;
             }
 
             std::string conv_output_format;
@@ -742,6 +757,7 @@ namespace trb::video
             snapshot.decoder_drops = stats_decoder_drops_.exchange(0, std::memory_order_relaxed);
             snapshot.encoder_submit_failures = stats_encoder_submit_failures_.exchange(0, std::memory_order_relaxed);
             snapshot.encode_us_total = stats_encode_us_total_.exchange(0, std::memory_order_relaxed);
+            snapshot.decode_us_total = stats_fused_decode_us_total_.exchange(0, std::memory_order_relaxed);
 
             std::shared_ptr<trb::video::VideoConverter> converter;
             std::shared_ptr<trb::video::VideoUndistorter> undistorter;
@@ -758,7 +774,7 @@ namespace trb::video
                 snapshot.convert_frames = converter_stats.processed_frames;
                 snapshot.converter_pool_drops = converter_stats.pool_drops;
                 snapshot.converter_failures = converter_stats.failed_frames;
-                snapshot.decode_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.decode_us_total));
+                snapshot.decode_us_total += static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.decode_us_total));
                 snapshot.transform_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.transform_us_total));
                 snapshot.transform_map_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.map_us_total));
                 snapshot.transform_wait_us_total = static_cast<uint64_t>(std::max<int64_t>(0, converter_stats.transform_wait_us_total));
@@ -771,7 +787,12 @@ namespace trb::video
                 snapshot.undistort_frames = und_stats.processed_frames;
                 snapshot.undistort_pool_drops = und_stats.pool_drops;
                 snapshot.undistort_failures = und_stats.failed_frames;
+                snapshot.undistort_fallback_frames = und_stats.fallback_frames;
                 snapshot.undistort_us_total = static_cast<uint64_t>(std::max<int64_t>(0, und_stats.remap_us_total));
+                snapshot.undistort_map_us_total = static_cast<uint64_t>(std::max<int64_t>(0, und_stats.map_us_total));
+                snapshot.undistort_kernel_us_total = static_cast<uint64_t>(std::max<int64_t>(0, und_stats.kernel_us_total));
+                snapshot.undistort_sync_us_total = static_cast<uint64_t>(std::max<int64_t>(0, und_stats.sync_us_total));
+                snapshot.undistort_backend = und_stats.backend;
             }
 
             return snapshot;
@@ -1183,33 +1204,68 @@ namespace trb::video
 
                 stats_decode_frames_.fetch_add(1, std::memory_order_relaxed);
 
-                int nv12_fd = -1;
-                const bool ok = converter_->transformSync(dec_frame.yuv_dmabuf_fd,
-                                                          dec_frame.capture_timestamp_us,
-                                                          dec_frame.decode_us,
-                                                          nv12_fd);
-                // VIC has consumed the YUV buffer; return it to the decoder.
-                decoder_->requeueCapture(dec_frame);
-
-                if (!ok)
-                    continue;
-
-                int downstream_fd = nv12_fd;
-                if (undistorter_)
+                int downstream_fd = -1;
+                bool have_downstream = false;
+                bool used_fused = false;
+                if (undistorter_ && undistorter_->supportsFusedYuv422())
                 {
-                    int undist_fd = -1;
-                    const bool und_ok = undistorter_->process(nv12_fd, undist_fd);
-                    // Converter output is no longer needed once undistorter
-                    // has finished (synchronous CUDA Remap copies the data).
-                    converter_->releaseFd(nv12_fd);
-                    if (!und_ok)
+                    int fused_fd = -1;
+                    if (undistorter_->processYuv422(dec_frame.yuv_dmabuf_fd, fused_fd))
                     {
-                        continue;
+                        if (dec_frame.decode_us > 0)
+                        {
+                            stats_fused_decode_us_total_.fetch_add(dec_frame.decode_us, std::memory_order_relaxed);
+                        }
+                        downstream_fd = fused_fd;
+                        have_downstream = true;
+                        used_fused = true;
                     }
-                    downstream_fd = undist_fd;
+                    else
+                    {
+                        undistorter_->noteFusedFallback();
+                        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                             *rclcpp::Clock::make_shared(),
+                                             1000,
+                                             "[ENCODE] fused CUDA undistort failed; falling back to converter + remap");
+                    }
                 }
 
+                if (!have_downstream)
+                {
+                    int nv12_fd = -1;
+                    const bool ok = converter_->transformSync(dec_frame.yuv_dmabuf_fd,
+                                                              dec_frame.capture_timestamp_us,
+                                                              dec_frame.decode_us,
+                                                              nv12_fd);
+                    if (!ok)
+                    {
+                        decoder_->requeueCapture(dec_frame);
+                        continue;
+                    }
+
+                    downstream_fd = nv12_fd;
+                    if (undistorter_)
+                    {
+                        int undist_fd = -1;
+                        const bool und_ok = undistorter_->process(nv12_fd, undist_fd);
+                        converter_->releaseFd(nv12_fd);
+                        if (!und_ok)
+                        {
+                            decoder_->requeueCapture(dec_frame);
+                            continue;
+                        }
+                        downstream_fd = undist_fd;
+                    }
+                    have_downstream = true;
+                }
+
+                // Decoder YUV buffer is no longer needed after either the
+                // fused CUDA path or the converter path has synchronously
+                // consumed it.
+                decoder_->requeueCapture(dec_frame);
+
                 (void)onConverterOutput(downstream_fd, dec_frame.capture_timestamp_us);
+                (void)used_fused;
             }
         }
 
@@ -1592,6 +1648,7 @@ namespace trb::video
                     stats_decoder_drops_.store(0, std::memory_order_relaxed);
                     stats_encoder_submit_failures_.store(0, std::memory_order_relaxed);
                     stats_encode_us_total_.store(0, std::memory_order_relaxed);
+                    stats_fused_decode_us_total_.store(0, std::memory_order_relaxed);
                     if (converter_)
                     {
                         (void)converter_->consumeStats();
@@ -1834,6 +1891,7 @@ namespace trb::video
         std::atomic<uint64_t> stats_decoder_drops_{0};
         std::atomic<uint64_t> stats_encoder_submit_failures_{0};
         std::atomic<uint64_t> stats_encode_us_total_{0};
+        std::atomic<uint64_t> stats_fused_decode_us_total_{0};
         std::atomic<bool> eye_image_publisher_ready_{false};
         std::atomic<bool> eye_image_has_subscribers_{false};
         std::atomic<bool> eye_image_inflight_{false};

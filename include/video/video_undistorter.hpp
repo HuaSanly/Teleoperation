@@ -64,6 +64,20 @@ namespace trb::video
             // calibration YAML.
             std::string calibration_file;
 
+            // Rectification backend:
+            //   vpi_cuda - VPI Remap on CUDA backend (stable default)
+            //   cuda     - in-tree CUDA NV12 remap backend
+            //   identity - copy/identity remap for debugging and bypass tests
+            std::string backend = "vpi_cuda";
+
+            // Optional profile/session selector for YAML files that contain a
+            // stereo_calibrations list. Empty means auto-match stream_image_size.
+            std::string profile;
+
+            // Enable direct decoded-YUV422 -> rectified-NV12 CUDA path when
+            // the converter and CUDA backend support the current surfaces.
+            bool fused = false;
+
             // If true and calibration cannot be loaded, initialize() returns
             // false and the pipeline should bypass undistortion. If false,
             // initialize() will fall back to an identity map (debug only).
@@ -75,7 +89,12 @@ namespace trb::video
             uint64_t processed_frames = 0;
             uint64_t pool_drops = 0;
             uint64_t failed_frames = 0;
+            uint64_t fallback_frames = 0;
             int64_t  remap_us_total = 0;
+            int64_t  map_us_total = 0;
+            int64_t  kernel_us_total = 0;
+            int64_t  sync_us_total = 0;
+            std::string backend;
         };
 
         VideoUndistorter();
@@ -91,6 +110,16 @@ namespace trb::video
         // or the VPI submit/sync failed. The input fd is NOT released by this
         // call.
         bool process(int nv12_fd_in, int &nv12_fd_out);
+
+        // Optional fused path: decoded pitch-linear planar YUV422 DMA-BUF
+        // directly to rectified pitch-linear NV12 DMA-BUF. Returns false when
+        // unavailable or unsupported; callers should fall back to converter +
+        // process() in that case.
+        bool processYuv422(int yuv422_fd_in, int &nv12_fd_out);
+
+        bool supportsFusedYuv422() const;
+        const std::string &backendName() const;
+        void noteFusedFallback();
 
         // Return a previously emitted dmabuf fd back to the internal pool.
         void releaseFd(int dmabuf_fd);

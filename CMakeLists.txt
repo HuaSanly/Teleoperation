@@ -345,6 +345,15 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     src/video/video_undistorter.cpp
     src/video/eye_image_publisher.cpp
   )
+  if(TRB_HAS_CUDA_TOOLKIT)
+    list(APPEND VIDEO_ADVANCED_SOURCES
+      src/video/cuda_nv12_undistorter.cu
+    )
+  else()
+    list(APPEND VIDEO_ADVANCED_SOURCES
+      src/video/cuda_nv12_undistorter_stub.cpp
+    )
+  endif()
   list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
     ${OpenCV_INCLUDE_DIRS}
     ${VPI_INCLUDE_DIR}
@@ -357,11 +366,28 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
     ${JETSON_NVV4L2_LIBRARY}
   )
+  if(TRB_HAS_CUDA_TOOLKIT)
+    list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
+      ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    list(APPEND VIDEO_ADVANCED_LIBS
+      CUDA::cudart
+      CUDA::cuda_driver
+    )
+  endif()
   set_source_files_properties(
     src/video/video_stream_manager.cpp
     src/video/video_decoder.cpp
     PROPERTIES COMPILE_OPTIONS "-Wno-pedantic"
   )
+  if(TRB_HAS_CUDA_TOOLKIT)
+    set_source_files_properties(
+      src/video/cuda_nv12_undistorter.cu
+      PROPERTIES
+        LANGUAGE CUDA
+        COMPILE_OPTIONS "-Wno-pedantic"
+    )
+  endif()
 else()
   message(WARNING "Jetson Multimedia API not found at ${JETSON_MM_API_PATH}. video_converter will be built in stub mode.")
 endif()
@@ -411,6 +437,12 @@ target_include_directories(${PROJECT_NAME}_node PUBLIC
   "${PROTO_GENS_DIR}"
   ${VIDEO_ADVANCED_INCLUDE_DIRS}
 )
+
+if(TRB_HAS_CUDA_TOOLKIT)
+  target_compile_definitions(${PROJECT_NAME}_node PUBLIC TRB_HAS_CUDA_UNDISTORTER=1)
+else()
+  target_compile_definitions(${PROJECT_NAME}_node PUBLIC TRB_HAS_CUDA_UNDISTORTER=0)
+endif()
 
 target_compile_features(${PROJECT_NAME}_node PUBLIC cxx_std_17)
 
