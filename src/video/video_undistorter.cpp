@@ -21,13 +21,6 @@
 #include "video/cuda_nv12_undistorter.hpp"
 #include "video/nvbuf_mutex.hpp"
 
-#include <vpi/Image.h>
-#include <vpi/Status.h>
-#include <vpi/Stream.h>
-#include <vpi/Types.h>
-#include <vpi/WarpMap.h>
-#include <vpi/algo/Remap.h>
-
 #ifndef TRB_HAS_CUDA_UNDISTORTER
 #define TRB_HAS_CUDA_UNDISTORTER 0
 #endif
@@ -37,13 +30,6 @@ namespace trb::video
 
     namespace
     {
-        enum class Backend
-        {
-            kVpiCuda,
-            kCuda,
-            kIdentity,
-        };
-
         struct CalibrationSelection
         {
             YAML::Node node;
@@ -61,55 +47,6 @@ namespace trb::video
             std::vector<float> full_map_xy;
             CalibrationSelection calibration;
         };
-
-        bool checkVpi(VPIStatus s, const char *what)
-        {
-            if (s == VPI_SUCCESS)
-            {
-                return true;
-            }
-            char buf[VPI_MAX_STATUS_MESSAGE_LENGTH];
-            vpiGetLastStatusMessage(buf, sizeof(buf));
-            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] %s failed: %d (%s)", what, static_cast<int>(s), buf);
-            return false;
-        }
-
-        std::string normalizeBackend(std::string value)
-        {
-            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
-            std::replace(value.begin(), value.end(), '-', '_');
-            return value;
-        }
-
-        Backend parseBackend(const std::string &value)
-        {
-            const std::string backend = normalizeBackend(value.empty() ? "vpi_cuda" : value);
-            if (backend == "cuda")
-            {
-                return Backend::kCuda;
-            }
-            if (backend == "identity" || backend == "disabled" || backend == "none")
-            {
-                return Backend::kIdentity;
-            }
-            return Backend::kVpiCuda;
-        }
-
-        const char *backendToString(Backend backend)
-        {
-            switch (backend)
-            {
-            case Backend::kCuda:
-                return "cuda";
-            case Backend::kIdentity:
-                return "identity";
-            case Backend::kVpiCuda:
-            default:
-                return "vpi_cuda";
-            }
-        }
 
         bool readSize(const YAML::Node &node, const char *key, cv::Size &out)
         {
@@ -472,9 +409,8 @@ namespace trb::video
     struct VideoUndistorter::Impl
     {
         Config cfg;
-        Backend backend{Backend::kVpiCuda};
         bool fused_enabled{false};
-        std::string backend_name{"vpi_cuda"};
+        std::string backend_name{"cuda"};
         MapBuildResult map_result;
 
         std::vector<void *> surfaces;
@@ -482,13 +418,6 @@ namespace trb::video
         std::mutex pool_mutex;
         std::queue<size_t> free_indices;
         std::unordered_map<int, size_t> fd_to_index;
-
-        VPIStream stream{nullptr};
-        VPIPayload remap_payload{nullptr};
-        VPIWarpMap warp_map{};
-        bool warp_allocated{false};
-        std::unordered_map<int, VPIImage> input_image_cache;
-        std::unordered_map<int, VPIImage> output_image_cache;
 
         std::unique_ptr<CudaNv12Undistorter> cuda_backend;
 
@@ -512,40 +441,6 @@ namespace trb::video
             {
                 cuda_backend->reset();
                 cuda_backend.reset();
-            }
-
-            for (auto &kv : input_image_cache)
-            {
-                if (kv.second)
-                {
-                    vpiImageDestroy(kv.second);
-                }
-            }
-            input_image_cache.clear();
-
-            for (auto &kv : output_image_cache)
-            {
-                if (kv.second)
-                {
-                    vpiImageDestroy(kv.second);
-                }
-            }
-            output_image_cache.clear();
-
-            if (remap_payload)
-            {
-                vpiPayloadDestroy(remap_payload);
-                remap_payload = nullptr;
-            }
-            if (stream)
-            {
-                vpiStreamDestroy(stream);
-                stream = nullptr;
-            }
-            if (warp_allocated)
-            {
-                vpiWarpMapFreeData(&warp_map);
-                warp_allocated = false;
             }
 
             {
@@ -608,62 +503,6 @@ namespace trb::video
             return true;
         }
 
-        bool buildVpiWarpMap()
-        {
-            std::memset(&warp_map, 0, sizeof(warp_map));
-            warp_map.grid.numHorizRegions = 1;
-            warp_map.grid.numVertRegions = 1;
-            warp_map.grid.horizInterval[0] = 1;
-            warp_map.grid.vertInterval[0] = 1;
-            warp_map.grid.regionWidth[0] = static_cast<int16_t>(cfg.width);
-            warp_map.grid.regionHeight[0] = static_cast<int16_t>(cfg.height);
-
-            if (!checkVpi(vpiWarpMapAllocData(&warp_map), "vpiWarpMapAllocData"))
-            {
-                return false;
-            }
-            warp_allocated = true;
-
-            const int nx = warp_map.numHorizPoints;
-            const int ny = warp_map.numVertPoints;
-            const int width = static_cast<int>(cfg.width);
-            const int height = static_cast<int>(cfg.height);
-            for (int y = 0; y < ny; ++y)
-            {
-                auto *row = reinterpret_cast<VPIKeypointF32 *>(
-                    reinterpret_cast<uint8_t *>(warp_map.keypoints) +
-                    static_cast<ptrdiff_t>(y) * warp_map.pitchBytes);
-                const int y_src = std::min(y, height - 1);
-                for (int x = 0; x < nx; ++x)
-                {
-                    const int x_src = std::min(x, width - 1);
-                    const size_t index = (static_cast<size_t>(y_src) * width + x_src) * 2u;
-                    row[x].x = map_result.full_map_xy[index];
-                    row[x].y = map_result.full_map_xy[index + 1];
-                }
-            }
-            return true;
-        }
-
-        bool createVpiResources()
-        {
-            if (!buildVpiWarpMap())
-            {
-                return false;
-            }
-            if (!checkVpi(vpiStreamCreate(VPI_BACKEND_CUDA, &stream),
-                          "vpiStreamCreate(CUDA)"))
-            {
-                return false;
-            }
-            if (!checkVpi(vpiCreateRemap(VPI_BACKEND_CUDA, &warp_map, &remap_payload),
-                          "vpiCreateRemap"))
-            {
-                return false;
-            }
-            return true;
-        }
-
         bool createCudaResources()
         {
 #if TRB_HAS_CUDA_UNDISTORTER
@@ -699,34 +538,10 @@ namespace trb::video
             }
             return true;
 #else
-            RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                        "[UNDISTORT] CUDA backend requested but CUDA undistorter was not built");
+            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                         "[UNDISTORT] CUDA undistorter was not built; install CUDA Toolkit or disable video.undistort.enabled");
             return false;
 #endif
-        }
-
-        VPIImage getOrWrapImage(int fd, std::unordered_map<int, VPIImage> &cache)
-        {
-            auto it = cache.find(fd);
-            if (it != cache.end())
-            {
-                return it->second;
-            }
-            VPIImageData data;
-            std::memset(&data, 0, sizeof(data));
-            data.bufferType = VPI_IMAGE_BUFFER_NVBUFFER;
-            data.buffer.fd = fd;
-
-            VPIImage img = nullptr;
-            const VPIStatus s = vpiImageCreateWrapper(
-                &data, nullptr, VPI_BACKEND_CUDA, &img);
-            if (s != VPI_SUCCESS || !img)
-            {
-                checkVpi(s, "vpiImageCreateWrapper(NVBUFFER)");
-                return nullptr;
-            }
-            cache.emplace(fd, img);
-            return img;
         }
 
         bool acquireOutput(size_t &out_idx, int &out_fd)
@@ -747,47 +562,6 @@ namespace trb::video
         {
             std::lock_guard<std::mutex> lk(pool_mutex);
             free_indices.push(out_idx);
-        }
-
-        bool processVpi(int nv12_fd_in, size_t out_idx, int out_fd)
-        {
-            (void)out_idx;
-            const auto t0 = std::chrono::steady_clock::now();
-            VPIImage in_img = getOrWrapImage(nv12_fd_in, input_image_cache);
-            VPIImage out_img = getOrWrapImage(out_fd, output_image_cache);
-            if (!in_img || !out_img)
-            {
-                failed_frames.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-
-            const VPIStatus s_submit = vpiSubmitRemap(
-                stream, VPI_BACKEND_CUDA, remap_payload,
-                in_img, out_img, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0);
-            if (s_submit != VPI_SUCCESS)
-            {
-                checkVpi(s_submit, "vpiSubmitRemap");
-                failed_frames.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-
-            const auto sync_start = std::chrono::steady_clock::now();
-            const VPIStatus s_sync = vpiStreamSync(stream);
-            const auto t1 = std::chrono::steady_clock::now();
-            if (s_sync != VPI_SUCCESS)
-            {
-                checkVpi(s_sync, "vpiStreamSync");
-                failed_frames.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-
-            const int64_t total_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            const int64_t sync_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - sync_start).count();
-            remap_us_total.fetch_add(total_us, std::memory_order_relaxed);
-            kernel_us_total.fetch_add(std::max<int64_t>(0, total_us - sync_us), std::memory_order_relaxed);
-            sync_us_total.fetch_add(sync_us, std::memory_order_relaxed);
-            processed_frames.fetch_add(1, std::memory_order_relaxed);
-            return true;
         }
 
         bool surfaceFromFd(int fd, NvBufSurface *&surface)
@@ -849,11 +623,6 @@ namespace trb::video
             (void)out_fd;
             return true;
         }
-
-        bool processIdentity(int fd_in, size_t out_idx, int out_fd)
-        {
-            return processVpi(fd_in, out_idx, out_fd);
-        }
     };
 
     VideoUndistorter::VideoUndistorter() : impl_(new Impl()) {}
@@ -863,9 +632,8 @@ namespace trb::video
     {
         impl_->teardown();
         impl_->cfg = config;
-        impl_->backend = parseBackend(config.backend);
-        impl_->backend_name = backendToString(impl_->backend);
-        impl_->fused_enabled = config.fused && impl_->backend == Backend::kCuda;
+        impl_->backend_name = "cuda";
+        impl_->fused_enabled = config.fused;
 
         if (config.width == 0 || config.height == 0 || (config.width & 1u) != 0)
         {
@@ -875,12 +643,7 @@ namespace trb::video
         }
 
         bool map_ok = false;
-        if (impl_->backend == Backend::kIdentity)
-        {
-            buildIdentityMap(config, impl_->map_result);
-            map_ok = true;
-        }
-        else if (config.calibration_file.empty())
+        if (config.calibration_file.empty())
         {
             RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[UNDISTORT] empty calibration_file");
             map_ok = false;
@@ -897,9 +660,7 @@ namespace trb::video
                 return false;
             }
             RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                        "[UNDISTORT] calibration unavailable; falling back to identity backend");
-            impl_->backend = Backend::kIdentity;
-            impl_->backend_name = backendToString(impl_->backend);
+                        "[UNDISTORT] calibration unavailable; using CUDA identity map");
             impl_->fused_enabled = false;
             buildIdentityMap(config, impl_->map_result);
         }
@@ -909,19 +670,9 @@ namespace trb::video
             return false;
         }
 
-        if (impl_->backend == Backend::kCuda)
+        if (!impl_->createCudaResources())
         {
-            if (!impl_->createCudaResources())
-            {
-                return false;
-            }
-        }
-        else
-        {
-            if (!impl_->createVpiResources())
-            {
-                return false;
-            }
+            return false;
         }
 
         const auto &cal = impl_->map_result.calibration;
@@ -949,7 +700,7 @@ namespace trb::video
             return false;
         }
 
-        if (impl_->backend == Backend::kVpiCuda && (!impl_->stream || !impl_->remap_payload))
+        if (!impl_->cuda_backend)
         {
             return false;
         }
@@ -961,15 +712,7 @@ namespace trb::video
             return false;
         }
 
-        bool ok = false;
-        if (impl_->backend == Backend::kCuda)
-        {
-            ok = impl_->processCuda(nv12_fd_in, out_idx, out_fd, false, true);
-        }
-        else
-        {
-            ok = impl_->processVpi(nv12_fd_in, out_idx, out_fd);
-        }
+        const bool ok = impl_->processCuda(nv12_fd_in, out_idx, out_fd, false, true);
 
         if (!ok)
         {
@@ -1009,7 +752,7 @@ namespace trb::video
 
     bool VideoUndistorter::supportsFusedYuv422() const
     {
-        return impl_ && impl_->fused_enabled && impl_->backend == Backend::kCuda;
+        return impl_ && impl_->fused_enabled && impl_->cuda_backend;
     }
 
     const std::string &VideoUndistorter::backendName() const

@@ -12,25 +12,24 @@
 namespace trb::video
 {
 
-    // Stereo undistort + rectify on Jetson, single-pass over a side-by-side
-    // (left-half + right-half) NV12 frame. Implementation uses VPI Remap on
-    // the CUDA backend so it runs in parallel with the existing VIC pipeline
-    // (decoder/converter/eye_image_publisher) and does not contend on the VIC
-    // global mutex.
+    // Stereo undistort + rectify on Jetson using in-tree CUDA kernels over a
+    // side-by-side frame. The preferred runtime path fuses decoded planar
+    // YUV422 -> rectified NV12 so the encoder and eye-image publisher still
+    // receive NV12 DMA-BUFs without an intermediate converter pass.
     //
     // Lifecycle:
     //   1. construct, then initialize(cfg). initialize() reads the calibration
     //      YAML, runs cv::initUndistortRectifyMap() once per eye on the host,
     //      hconcat's the two per-eye dense maps into a single full-frame map
-    //      (right-eye dst x is offset by +single_eye_width), uploads it to
-    //      a VPIWarpMap, and creates a CUDA-backend Remap payload + a pool
-    //      of NV12 output NvBufSurface dmabufs (same layout as VideoConverter
-    //      output, so the encoder can consume them unchanged).
-    //   2. process(in_fd, out_fd) submits one Remap operation and synchronously
-    //      waits for completion. The caller owns the input fd lifecycle (this
-    //      class never releases it) and must return the output fd via
-    //      releaseFd() once the downstream consumers are done.
-    //   3. destruction tears down VPI resources and destroys the pool.
+    //      (right-eye dst x is offset by +single_eye_width), uploads it once
+    //      to CUDA, and creates a pool of NV12 output NvBufSurface dmabufs
+    //      (same layout as VideoConverter output, so the encoder can consume
+    //      them unchanged).
+    //   2. processYuv422(in_fd, out_fd) runs the fused decoded-YUV422 ->
+    //      rectified-NV12 path. process(in_fd, out_fd) remains available for
+    //      CUDA NV12 remap fallback/tests. The caller owns the input fd
+    //      lifecycle and must return the output fd via releaseFd().
+    //   3. destruction tears down CUDA resources and destroys the pool.
     //
     // Calibration YAML schema (see config/calibration_stereo.yaml.example):
     //   calibration_image_size: [W_calib, H_calib]
@@ -64,23 +63,17 @@ namespace trb::video
             // calibration YAML.
             std::string calibration_file;
 
-            // Rectification backend:
-            //   vpi_cuda - VPI Remap on CUDA backend (stable default)
-            //   cuda     - in-tree CUDA NV12 remap backend
-            //   identity - copy/identity remap for debugging and bypass tests
-            std::string backend = "vpi_cuda";
-
             // Optional profile/session selector for YAML files that contain a
             // stereo_calibrations list. Empty means auto-match stream_image_size.
             std::string profile;
 
             // Enable direct decoded-YUV422 -> rectified-NV12 CUDA path when
             // the converter and CUDA backend support the current surfaces.
-            bool fused = false;
+            bool fused = true;
 
             // If true and calibration cannot be loaded, initialize() returns
             // false and the pipeline should bypass undistortion. If false,
-            // initialize() will fall back to an identity map (debug only).
+            // initialize() will use an identity map (debug only).
             bool require_calibration = true;
         };
 
@@ -105,16 +98,12 @@ namespace trb::video
 
         bool initialize(const Config &config);
 
-        // Synchronously remap one full-frame SBS NV12 dmabuf into a freshly
-        // pool-acquired NV12 dmabuf. Returns false if the pool is exhausted
-        // or the VPI submit/sync failed. The input fd is NOT released by this
-        // call.
+        // CUDA-remap one full-frame SBS NV12 dmabuf into a freshly acquired
+        // NV12 dmabuf. This is a fallback/test path; fused YUV422 is preferred.
         bool process(int nv12_fd_in, int &nv12_fd_out);
 
-        // Optional fused path: decoded pitch-linear planar YUV422 DMA-BUF
-        // directly to rectified pitch-linear NV12 DMA-BUF. Returns false when
-        // unavailable or unsupported; callers should fall back to converter +
-        // process() in that case.
+        // Preferred fused path: decoded pitch-linear planar YUV422 DMA-BUF
+        // directly to rectified pitch-linear NV12 DMA-BUF.
         bool processYuv422(int yuv422_fd_in, int &nv12_fd_out);
 
         bool supportsFusedYuv422() const;

@@ -441,18 +441,33 @@ public:
             return false;
         }
 
+        cudaError_t ret = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        if (ret != cudaSuccess)
+        {
+            stream_ = nullptr;
+            return false;
+        }
+        ret = cudaEventCreateWithFlags(&done_event_, cudaEventDisableTiming);
+        if (ret != cudaSuccess)
+        {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+            done_event_ = nullptr;
+            return false;
+        }
+
         const size_t bytes = map_xy.size() * sizeof(float);
-        cudaError_t ret = cudaMalloc(reinterpret_cast<void **>(&map_xy_device_), bytes);
+        ret = cudaMalloc(reinterpret_cast<void **>(&map_xy_device_), bytes);
         if (ret != cudaSuccess)
         {
             map_xy_device_ = nullptr;
+            reset();
             return false;
         }
         ret = cudaMemcpy(map_xy_device_, map_xy.data(), bytes, cudaMemcpyHostToDevice);
         if (ret != cudaSuccess)
         {
-            cudaFree(map_xy_device_);
-            map_xy_device_ = nullptr;
+            reset();
             return false;
         }
         return true;
@@ -533,6 +548,16 @@ public:
             cudaFree(map_xy_device_);
             map_xy_device_ = nullptr;
         }
+        if (done_event_)
+        {
+            cudaEventDestroy(done_event_);
+            done_event_ = nullptr;
+        }
+        if (stream_)
+        {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
         cuda_initialized_ = false;
         width_ = 0;
         height_ = 0;
@@ -601,7 +626,7 @@ private:
         const dim3 y_block(32, 8);
         const dim3 y_grid((width + y_block.x - 1) / y_block.x,
                           (height + y_block.y - 1) / y_block.y);
-        remapNv12YKernel<<<y_grid, y_block>>>(
+        remapNv12YKernel<<<y_grid, y_block, 0, stream_>>>(
             static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
             static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
             map_xy_device_,
@@ -613,7 +638,7 @@ private:
         const dim3 uv_block(32, 8);
         const dim3 uv_grid(((width / 2) + uv_block.x - 1) / uv_block.x,
                            ((height / 2) + uv_block.y - 1) / uv_block.y);
-        remapNv12UvKernel<<<uv_grid, uv_block>>>(
+        remapNv12UvKernel<<<uv_grid, uv_block, 0, stream_>>>(
             static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[1]),
             static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
             map_xy_device_,
@@ -644,7 +669,7 @@ private:
         const dim3 y_block(32, 8);
         const dim3 y_grid((width + y_block.x - 1) / y_block.x,
                           (height + y_block.y - 1) / y_block.y);
-        remapYuv422ToNv12YKernel<<<y_grid, y_block>>>(
+        remapYuv422ToNv12YKernel<<<y_grid, y_block, 0, stream_>>>(
             static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
             static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
             map_xy_device_,
@@ -656,7 +681,7 @@ private:
         const dim3 uv_block(32, 8);
         const dim3 uv_grid(((width / 2) + uv_block.x - 1) / uv_block.x,
                            ((height / 2) + uv_block.y - 1) / uv_block.y);
-        remapYuv422ToNv12UvKernel<<<uv_grid, uv_block>>>(
+        remapYuv422ToNv12UvKernel<<<uv_grid, uv_block, 0, stream_>>>(
             static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[1]),
             static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[2]),
             static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
@@ -679,7 +704,11 @@ private:
             return false;
         }
         const auto sync_start = std::chrono::steady_clock::now();
-        ret = cudaDeviceSynchronize();
+        ret = cudaEventRecord(done_event_, stream_);
+        if (ret == cudaSuccess)
+        {
+            ret = cudaEventSynchronize(done_event_);
+        }
         const auto sync_end = std::chrono::steady_clock::now();
         if (result)
         {
@@ -718,6 +747,8 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     float2 *map_xy_device_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t done_event_ = nullptr;
     std::vector<MappedEglFrame> outputs_;
 };
 

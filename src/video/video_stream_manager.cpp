@@ -380,11 +380,9 @@ namespace trb::video
             converter_config_.input_height = height;
             converter_config_.buffer_pool_size = conv_pool_size;
 
-            // Undistort + stereo-rectify (optional, off by default). When
-            // enabled we insert a VPI CUDA Remap stage between converter
-            // and encoder; the same NV12 fd is also forwarded to the
-            // eye_image_publisher, so both downstream consumers see the
-            // rectified image.
+            // Undistort + stereo-rectify (optional). The preferred path is
+            // fused CUDA decoded-YUV422 -> rectified-NV12; the same NV12 fd
+            // is forwarded to encoder and eye_image_publisher.
             undistort_enabled_ = declareOrGet<bool>(nh_, "video.undistort.enabled", false);
             if (undistort_enabled_)
             {
@@ -393,9 +391,8 @@ namespace trb::video
                 undistorter_config_.buffer_pool_size = conv_pool_size;
                 undistorter_config_.output_surface_layout = converter_config_.output_surface_layout;
                 undistorter_config_.calibration_file = declareOrGet<std::string>(nh_, "video.undistort.calib_file", "");
-                undistorter_config_.backend = declareOrGet<std::string>(nh_, "video.undistort.backend", "vpi_cuda");
                 undistorter_config_.profile = declareOrGet<std::string>(nh_, "video.undistort.profile", "");
-                undistorter_config_.fused = declareOrGet<bool>(nh_, "video.undistort.fused", false);
+                undistorter_config_.fused = declareOrGet<bool>(nh_, "video.undistort.fused", true);
                 if (!undistorter_config_.calibration_file.empty() &&
                     undistorter_config_.calibration_file.front() != '/')
                 {
@@ -1118,8 +1115,10 @@ namespace trb::video
                     auto und = std::make_shared<trb::video::VideoUndistorter>();
                     if (!und->initialize(undistorter_config_))
                     {
-                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoUndistorter initialize failed; "
-                                 "continuing without undistortion");
+                        RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                     "[ENCODE] VideoUndistorter initialize failed while video.undistort.enabled=true; "
+                                     "pipeline startup aborted");
+                        converter.reset();
                     }
                     else
                     {

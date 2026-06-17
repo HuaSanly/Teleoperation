@@ -319,27 +319,6 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
   )
 
-  find_path(VPI_INCLUDE_DIR
-    NAMES vpi/VPI.h
-    PATHS
-      /opt/nvidia/vpi4/include
-      /opt/nvidia/vpi3/include
-      /opt/nvidia/vpi2/include
-      /usr/include
-  )
-  find_library(VPI_LIBRARY
-    NAMES nvvpi
-    PATHS
-      /opt/nvidia/vpi4/lib/aarch64-linux-gnu
-      /opt/nvidia/vpi3/lib/aarch64-linux-gnu
-      /opt/nvidia/vpi2/lib/aarch64-linux-gnu
-      /lib/aarch64-linux-gnu
-      /usr/lib/aarch64-linux-gnu
-  )
-  if(NOT VPI_INCLUDE_DIR OR NOT VPI_LIBRARY)
-    message(FATAL_ERROR "VPI headers/library not found; required for VideoUndistorter")
-  endif()
-
   list(APPEND VIDEO_ADVANCED_SOURCES
     src/video/video_decoder.cpp
     src/video/video_undistorter.cpp
@@ -356,12 +335,10 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   endif()
   list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
     ${OpenCV_INCLUDE_DIRS}
-    ${VPI_INCLUDE_DIR}
   )
   list(APPEND VIDEO_ADVANCED_LIBS
     ${OpenCV_LIBS}
     yaml-cpp
-    ${VPI_LIBRARY}
     ${JETSON_NVBUFSURFACE_LIBRARY}
     ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
     ${JETSON_NVV4L2_LIBRARY}

@@ -161,11 +161,10 @@
         left_topic: "data/left_eye_image"
         right_topic: "data/right_eye_image"
       undistort:
-        enabled: false
+        enabled: true
         calib_file: "config/calibration_stereo.yaml"
-        backend: "vpi_cuda"
         profile: ""
-        fused: false
+        fused: true
         require_calibration: true
       recording:
         enabled: false

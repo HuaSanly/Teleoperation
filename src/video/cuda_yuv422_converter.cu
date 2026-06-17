@@ -274,6 +274,8 @@ bool launchConversion(NvBufSurface *src,
                       NvBufSurface *dst,
                       const MappedEglFrame &src_frame,
                       const MappedEglFrame &dst_frame,
+                      cudaStream_t stream,
+                      cudaEvent_t done_event,
                       CudaYuv422ConverterResult *result)
 {
     const auto &src_pp = src->surfaceList[0].planeParams;
@@ -286,7 +288,7 @@ bool launchConversion(NvBufSurface *src,
     const dim3 y_block(32, 8);
     const dim3 y_grid((width + y_block.x - 1) / y_block.x,
                       (height + y_block.y - 1) / y_block.y);
-    copyYKernel<<<y_grid, y_block>>>(
+    copyYKernel<<<y_grid, y_block, 0, stream>>>(
         static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
         static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
         width,
@@ -297,7 +299,7 @@ bool launchConversion(NvBufSurface *src,
     const dim3 uv_block(32, 8);
     const dim3 uv_grid((chroma_width + uv_block.x - 1) / uv_block.x,
                        (chroma_height + uv_block.y - 1) / uv_block.y);
-    yuv422PlanarToNv12UvKernel<<<uv_grid, uv_block>>>(
+    yuv422PlanarToNv12UvKernel<<<uv_grid, uv_block, 0, stream>>>(
         static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[1]),
         static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[2]),
         static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
@@ -314,7 +316,11 @@ bool launchConversion(NvBufSurface *src,
         return false;
     }
 
-    cuda_ret = cudaDeviceSynchronize();
+    cuda_ret = cudaEventRecord(done_event, stream);
+    if (cuda_ret == cudaSuccess)
+    {
+        cuda_ret = cudaEventSynchronize(done_event);
+    }
     if (cuda_ret != cudaSuccess)
     {
         setFailure(result, "sync-kernel", static_cast<int>(cuda_ret));
@@ -341,6 +347,11 @@ public:
     bool prepareOutput(NvBufSurface *dst, CudaYuv422ConverterResult *result)
     {
         if (!validateOutputSurface(dst, result) || !ensureCudaContext(cuda_initialized_, result))
+        {
+            return false;
+        }
+
+        if (!ensureStream(result))
         {
             return false;
         }
@@ -402,7 +413,7 @@ public:
         }
 
         const bool ok = validateMappedFrames(src_frame, *dst_frame, result) &&
-                        launchConversion(src, dst, src_frame, *dst_frame, result);
+                        launchConversion(src, dst, src_frame, *dst_frame, stream_, done_event_, result);
         resetMappedFrame(src_frame);
         return ok;
     }
@@ -414,10 +425,48 @@ public:
             resetMappedFrame(mapped);
         }
         outputs_.clear();
+        if (done_event_)
+        {
+            cudaEventDestroy(done_event_);
+            done_event_ = nullptr;
+        }
+        if (stream_)
+        {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
         cuda_initialized_ = false;
     }
 
 private:
+    bool ensureStream(CudaYuv422ConverterResult *result)
+    {
+        if (stream_ && done_event_)
+        {
+            return true;
+        }
+
+        cudaError_t cuda_ret = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+        if (cuda_ret != cudaSuccess)
+        {
+            stream_ = nullptr;
+            setFailure(result, "create-stream", static_cast<int>(cuda_ret));
+            return false;
+        }
+
+        cuda_ret = cudaEventCreateWithFlags(&done_event_, cudaEventDisableTiming);
+        if (cuda_ret != cudaSuccess)
+        {
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+            done_event_ = nullptr;
+            setFailure(result, "create-event", static_cast<int>(cuda_ret));
+            return false;
+        }
+
+        return true;
+    }
+
     MappedEglFrame *findOutput(NvBufSurface *surface)
     {
         if (!surface || surface->numFilled == 0)
@@ -437,6 +486,8 @@ private:
     }
 
     bool cuda_initialized_ = false;
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t done_event_ = nullptr;
     std::vector<MappedEglFrame> outputs_;
 };
 
