@@ -108,11 +108,6 @@
       v4l2:
         buffer_count: 4
         warmup_drop_frames: 0
-      converter:
-        compute: "cuda"
-        dec_layout: "pitch"
-        out_layout: "pitch"
-        output_format: "nv12"
       decoder:
         buffer_pool_size: 4
         output_plane_buffers: 6
@@ -164,7 +159,6 @@
         enabled: true
         calib_file: "config/calibration_stereo.yaml"
         profile: ""
-        fused: true
         require_calibration: true
       recording:
         enabled: false

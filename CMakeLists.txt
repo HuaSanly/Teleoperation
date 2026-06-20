@@ -18,21 +18,15 @@ find_package(OpenSSL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig QUIET)
-find_package(CUDAToolkit QUIET)
+find_package(CUDAToolkit REQUIRED)
 
-set(TRB_HAS_CUDA_TOOLKIT FALSE)
-if(CUDAToolkit_FOUND)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
-  endif()
-  enable_language(CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
-  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  set(TRB_HAS_CUDA_TOOLKIT TRUE)
-  message(STATUS "Found CUDA Toolkit for video CUDA converter")
-else()
-  message(WARNING "CUDA Toolkit not found; video CUDA converter prototype will be unavailable.")
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+message(STATUS "Found CUDA Toolkit for video CUDA post-processing")
 
 set(TRB_AUDIO_GSTREAMER_ENABLED FALSE)
 if(PkgConfig_FOUND)
@@ -168,34 +162,12 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   )
 
   target_compile_definitions(video_converter PUBLIC TRB_HAS_JETSON_MM_API=1)
-  if(TRB_HAS_CUDA_TOOLKIT)
-    target_compile_definitions(video_converter PUBLIC TRB_HAS_CUDA_CONVERTER=1)
-    target_sources(video_converter PRIVATE
-      src/video/cuda_yuv422_converter.cu
-    )
-    set_source_files_properties(src/video/cuda_yuv422_converter.cu PROPERTIES LANGUAGE CUDA)
-    target_include_directories(video_converter PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(video_converter CUDA::cudart CUDA::cuda_driver)
-  else()
-    target_compile_definitions(video_converter PUBLIC TRB_HAS_CUDA_CONVERTER=0)
-  endif()
-
-  if(NOT CUDA_FOUND)
-    if(POLICY CMP0146)
-      cmake_policy(SET CMP0146 OLD)
-    endif()
-    find_package(CUDA)
-  endif()
-
-  if(CUDA_FOUND)
-    target_include_directories(video_converter PUBLIC ${CUDA_INCLUDE_DIRS})
-    target_link_libraries(video_converter cuda)
-  elseif(EXISTS "/usr/local/cuda/include")
-    target_include_directories(video_converter PUBLIC "/usr/local/cuda/include")
-    target_link_libraries(video_converter cuda)
-  else()
-    message(WARNING "CUDA headers not found; Jetson MJPEG decode may fail to compile (missing cuda.h).")
-  endif()
+  target_sources(video_converter PRIVATE
+    src/video/cuda_yuv422_converter.cu
+  )
+  set_source_files_properties(src/video/cuda_yuv422_converter.cu PROPERTIES LANGUAGE CUDA)
+  target_include_directories(video_converter PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(video_converter CUDA::cudart CUDA::cuda_driver)
 
   target_include_directories(video_converter PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -212,10 +184,6 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     NAMES nvbufsurface
     PATHS ${JETSON_LIBRARY_DIRS}
   )
-  find_library(JETSON_NVBUFSURFTRANSFORM_LIBRARY
-    NAMES nvbufsurftransform
-    PATHS ${JETSON_LIBRARY_DIRS}
-  )
   find_library(JETSON_NVMM_JPEG_LIBRARY
     NAMES nvmm_jpeg
     PATHS ${JETSON_LIBRARY_DIRS}
@@ -223,16 +191,15 @@ if(EXISTS "${JETSON_MM_API_PATH}")
 
   if(NOT JETSON_NVV4L2_LIBRARY OR
      NOT JETSON_NVBUFSURFACE_LIBRARY OR
-     NOT JETSON_NVBUFSURFTRANSFORM_LIBRARY OR
      NOT JETSON_NVMM_JPEG_LIBRARY)
     message(FATAL_ERROR
       "Jetson multimedia libraries not found in configured search paths. "
-      "Expected nvv4l2, nvbufsurface, nvbufsurftransform, nvmm_jpeg under: ${JETSON_LIBRARY_DIRS}")
+      "Expected nvv4l2, nvbufsurface, nvmm_jpeg under: ${JETSON_LIBRARY_DIRS}")
   endif()
 
   target_sources(video_converter PRIVATE
     "${JETSON_COMMON_DIR}/classes/NvJpegDecoder.cpp"
-    "${JETSON_COMMON_DIR}/classes/NvBufSurface.cpp"
+    src/video/nvbufsurface_shim.cpp
     "${JETSON_COMMON_DIR}/classes/NvBuffer.cpp"
     "${JETSON_COMMON_DIR}/classes/NvElement.cpp"
     "${JETSON_COMMON_DIR}/classes/NvLogging.cpp"
@@ -247,24 +214,8 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     v4l2
     ${JETSON_NVV4L2_LIBRARY}
     ${JETSON_NVBUFSURFACE_LIBRARY}
-    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
     ${JETSON_NVMM_JPEG_LIBRARY}
   )
-
-  if(TRB_HAS_CUDA_TOOLKIT)
-    add_executable(cuda_yuv422_converter_bench
-      src/video/cuda_yuv422_converter_bench.cpp
-    )
-    target_include_directories(cuda_yuv422_converter_bench PRIVATE
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-      ${JETSON_MM_API_PATH}/include
-    )
-    target_link_libraries(cuda_yuv422_converter_bench
-      video_converter
-      ${JETSON_NVBUFSURFACE_LIBRARY}
-      ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
-    )
-  endif()
 
   # Video Encoder (H.264 hardware encode)
   add_library(video_encoder
@@ -284,16 +235,9 @@ if(EXISTS "${JETSON_MM_API_PATH}")
 
   target_compile_definitions(video_encoder PUBLIC TRB_HAS_JETSON_MM_API=1)
 
-  if(CUDA_FOUND)
-    target_include_directories(video_encoder PUBLIC ${CUDA_INCLUDE_DIRS})
-    target_link_libraries(video_encoder cuda)
-  elseif(EXISTS "/usr/local/cuda/include")
-    target_include_directories(video_encoder PUBLIC "/usr/local/cuda/include")
-    target_link_libraries(video_encoder cuda)
-  endif()
-
   target_include_directories(video_encoder PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${CUDAToolkit_INCLUDE_DIRS}
     ${JETSON_JPEG_INCLUDE_DIR}
     ${JETSON_MM_API_PATH}/include
     ${JETSON_COMMON_DIR}/classes
@@ -301,7 +245,6 @@ if(EXISTS "${JETSON_MM_API_PATH}")
 
   target_sources(video_encoder PRIVATE
     "${JETSON_COMMON_DIR}/classes/NvVideoEncoder.cpp"
-    "${JETSON_COMMON_DIR}/classes/NvBufSurface.cpp"
     "${JETSON_COMMON_DIR}/classes/NvBuffer.cpp"
     "${JETSON_COMMON_DIR}/classes/NvElement.cpp"
     "${JETSON_COMMON_DIR}/classes/NvLogging.cpp"
@@ -316,57 +259,41 @@ if(EXISTS "${JETSON_MM_API_PATH}")
     v4l2
     ${JETSON_NVV4L2_LIBRARY}
     ${JETSON_NVBUFSURFACE_LIBRARY}
-    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
   )
 
   list(APPEND VIDEO_ADVANCED_SOURCES
     src/video/video_decoder.cpp
     src/video/video_undistorter.cpp
     src/video/eye_image_publisher.cpp
+    src/video/cuda_eye_image_processor.cu
+    src/video/cuda_nv12_undistorter.cu
   )
-  if(TRB_HAS_CUDA_TOOLKIT)
-    list(APPEND VIDEO_ADVANCED_SOURCES
-      src/video/cuda_nv12_undistorter.cu
-    )
-  else()
-    list(APPEND VIDEO_ADVANCED_SOURCES
-      src/video/cuda_nv12_undistorter_stub.cpp
-    )
-  endif()
   list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
     ${OpenCV_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
   )
   list(APPEND VIDEO_ADVANCED_LIBS
     ${OpenCV_LIBS}
     yaml-cpp
     ${JETSON_NVBUFSURFACE_LIBRARY}
-    ${JETSON_NVBUFSURFTRANSFORM_LIBRARY}
     ${JETSON_NVV4L2_LIBRARY}
+    CUDA::cudart
+    CUDA::cuda_driver
   )
-  if(TRB_HAS_CUDA_TOOLKIT)
-    list(APPEND VIDEO_ADVANCED_INCLUDE_DIRS
-      ${CUDAToolkit_INCLUDE_DIRS}
-    )
-    list(APPEND VIDEO_ADVANCED_LIBS
-      CUDA::cudart
-      CUDA::cuda_driver
-    )
-  endif()
   set_source_files_properties(
     src/video/video_stream_manager.cpp
     src/video/video_decoder.cpp
     PROPERTIES COMPILE_OPTIONS "-Wno-pedantic"
   )
-  if(TRB_HAS_CUDA_TOOLKIT)
-    set_source_files_properties(
-      src/video/cuda_nv12_undistorter.cu
-      PROPERTIES
-        LANGUAGE CUDA
-        COMPILE_OPTIONS "-Wno-pedantic"
-    )
-  endif()
+  set_source_files_properties(
+    src/video/cuda_eye_image_processor.cu
+    src/video/cuda_nv12_undistorter.cu
+    PROPERTIES
+      LANGUAGE CUDA
+      COMPILE_OPTIONS "-Wno-pedantic"
+  )
 else()
-  message(WARNING "Jetson Multimedia API not found at ${JETSON_MM_API_PATH}. video_converter will be built in stub mode.")
+  message(FATAL_ERROR "Jetson Multimedia API not found at ${JETSON_MM_API_PATH}. CUDA video pipeline cannot be built.")
 endif()
 
 
@@ -414,12 +341,6 @@ target_include_directories(${PROJECT_NAME}_node PUBLIC
   "${PROTO_GENS_DIR}"
   ${VIDEO_ADVANCED_INCLUDE_DIRS}
 )
-
-if(TRB_HAS_CUDA_TOOLKIT)
-  target_compile_definitions(${PROJECT_NAME}_node PUBLIC TRB_HAS_CUDA_UNDISTORTER=1)
-else()
-  target_compile_definitions(${PROJECT_NAME}_node PUBLIC TRB_HAS_CUDA_UNDISTORTER=0)
-endif()
 
 target_compile_features(${PROJECT_NAME}_node PUBLIC cxx_std_17)
 

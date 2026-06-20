@@ -9,7 +9,6 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <dlfcn.h>
 #include <functional>
 #include <memory>
@@ -40,9 +39,8 @@
 #include "video/video_undistorter.hpp"
 #include "video/nvbuf_mutex.hpp"
 
-// Jetson Multimedia API for DMA-BUF surface access and transforms
+// Jetson Multimedia API for DMA-BUF surface access
 #include "nvbufsurface.h"
-#include "nvbufsurftransform.h"
 
 namespace trb::video
 {
@@ -159,23 +157,21 @@ namespace trb::video
      *
      * Threads:
      *   capture_thread_  : V4L2 dequeue -> decoder.submit(MJPEG) -> V4L2 requeue
-     *   encode_thread_   : decoder.dequeueSync -> converter.transformSync
-     *                      -> encoder.submit + encoder.dequeueOne -> onEncoderPacket
+     *   encode_thread_   : decoder.dequeueSync -> CUDA postprocess -> encoder.submit
      *   eye_image_thread_: consume NV12 frames from nv12_queue_ -> ROS Image publish
      *
      * Data Flow:
      *   V4L2 Camera (MJPEG)                              [capture_thread_]
-    *        -> NvJPEGDecoder   (MJPEG -> YUV dma-buf)   [encode_thread_]
-     *        -> VideoConverter  (YUV  -> NV12 via VIC)   [encode_thread_]
+     *        -> NvJPEGDecoder   (MJPEG -> YUV DMA-BUF)   [encode_thread_]
+     *        -> CUDA postprocess:
+     *             undistort on  : fused YUV422 -> rectified NV12
+     *             undistort off : YUV422 -> NV12 converter
      *        -> VideoEncoder    (NV12 -> H.264)          [encode_thread_]
      *        -> onEncoderPacket -> UDP/gRPC              [encode_thread_]
-        *
-        *   In parallel: a ref-counted NV12 converter fd is handed to
-        *   eye_image_thread_ for crop/scale/publish to ROS topics. The fd is
-        *   returned to VideoConverter only after both NVENC input-done and
-        *   eye_image processing have released their references.
      *
-     * All VIC operations across threads are serialized via getNvBufMutex().
+     *   In parallel: a ref-counted NV12 fd is handed to eye_image_thread_
+     *   for CUDA crop/scale/RGB publish. The fd returns to its owner only
+     *   after NVENC input-done and eye_image processing have released it.
      */
 
     struct SharedNv12Frame
@@ -360,7 +356,7 @@ namespace trb::video
             frame_height_ = height;
             frame_rate_ = framerate;
 
-            // Save converter config for deferred initialization in encode thread
+            // Save CUDA postprocess config for deferred initialization in encode thread.
             decoder_config_.width = width;
             decoder_config_.height = height;
             int decoder_output_plane_buffers_param;
@@ -389,10 +385,8 @@ namespace trb::video
                 undistorter_config_.width = width;
                 undistorter_config_.height = height;
                 undistorter_config_.buffer_pool_size = conv_pool_size;
-                undistorter_config_.output_surface_layout = converter_config_.output_surface_layout;
                 undistorter_config_.calibration_file = declareOrGet<std::string>(nh_, "video.undistort.calib_file", "");
                 undistorter_config_.profile = declareOrGet<std::string>(nh_, "video.undistort.profile", "");
-                undistorter_config_.fused = declareOrGet<bool>(nh_, "video.undistort.fused", true);
                 if (!undistorter_config_.calibration_file.empty() &&
                     undistorter_config_.calibration_file.front() != '/')
                 {
@@ -405,92 +399,8 @@ namespace trb::video
                 }
                 undistorter_config_.require_calibration = declareOrGet<bool>(nh_, "video.undistort.require_calibration", true);
             }
-
-            auto parse_layout = [](const std::string &v) -> int32_t
-            {
-                std::string s = v;
-                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
-                               { return static_cast<char>(std::tolower(c)); });
-                if (s == "block" || s == "blocklinear" || s == "block-linear")
-                    return 1;
-                return 0;
-            };
-
-            std::string conv_dec_layout, conv_out_layout, conv_layout_legacy;
-            conv_dec_layout = declareOrGet<std::string>(nh_, "video.converter.dec_layout", "");
-            conv_out_layout = declareOrGet<std::string>(nh_, "video.converter.out_layout", "");
-            conv_layout_legacy = declareOrGet<std::string>(nh_, "video.converter.layout", "");
-
-            if (!conv_dec_layout.empty())
-            {
-                converter_config_.decode_surface_layout = parse_layout(conv_dec_layout);
-            }
-            else if (!conv_layout_legacy.empty())
-            {
-                converter_config_.decode_surface_layout = parse_layout(conv_layout_legacy);
-            }
-
-            if (!conv_out_layout.empty())
-            {
-                converter_config_.output_surface_layout = parse_layout(conv_out_layout);
-            }
-            else
-            {
-                converter_config_.output_surface_layout = 0;
-            }
-            if (undistort_enabled_)
-            {
-                undistorter_config_.output_surface_layout = converter_config_.output_surface_layout;
-            }
-            decoder_config_.decode_surface_layout = converter_config_.decode_surface_layout;
-
-            std::string conv_compute;
-            conv_compute = declareOrGet<std::string>(nh_, "video.converter.compute", "default");
-            {
-                std::string s = conv_compute;
-                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
-                               { return static_cast<char>(std::tolower(c)); });
-                if (s == "cuda")
-                    converter_config_.transform_compute_mode = 3;
-                else if (s == "gpu")
-                    converter_config_.transform_compute_mode = 1;
-                else if (s == "vic")
-                    converter_config_.transform_compute_mode = 2;
-                else
-                    converter_config_.transform_compute_mode = 0;
-            }
-            if (undistort_enabled_ &&
-                undistorter_config_.fused &&
-                converter_config_.transform_compute_mode != 3)
-            {
-                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                            "video.undistort.fused=true requires video.converter.compute=cuda; fused path disabled.");
-                undistorter_config_.fused = false;
-            }
-
-            std::string conv_output_format;
-            conv_output_format = declareOrGet<std::string>(nh_, "video.converter.output_format", "nv12");
-            {
-                std::string s = conv_output_format;
-                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
-                               { return static_cast<char>(std::tolower(c)); });
-                if (s == "yuv420" || s == "yuv420m" || s == "i420")
-                {
-                    converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kYuv420;
-                    encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kYuv420;
-                }
-                else
-                {
-                    if (s != "nv12" && s != "nv12m" && !s.empty())
-                    {
-                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                                    "Unknown video.converter.output_format='%s' (use nv12|yuv420). Falling back to nv12.",
-                                    conv_output_format.c_str());
-                    }
-                    converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kNv12;
-                    encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kNv12;
-                }
-            }
+            decoder_config_.decode_surface_layout = 0;
+            encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kNv12;
 
             // Save encoder config for deferred initialization
             encoder_config_.width = width;
@@ -676,15 +586,6 @@ namespace trb::video
                 eye_image_right_topic_ = declareOrGet<std::string>(nh_, "video.eye_image.right_topic", "data/right_eye_image");
             }
 
-            if ((undistort_enabled_ || eye_image_enabled_) &&
-                converter_config_.output_format == trb::video::VideoConverter::OutputFormat::kYuv420)
-            {
-                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                            "video.converter.output_format=yuv420 requires eye_image and undistort to be disabled; falling back to nv12.");
-                converter_config_.output_format = trb::video::VideoConverter::OutputFormat::kNv12;
-                encoder_config_.input_format = trb::video::VideoEncoder::InputFormat::kNv12;
-            }
-
             restart_on_bad_frames_ = declareOrGet<bool>(nh_, "video.decoder.restart_on_bad_frames", true);
             consecutive_bad_frame_threshold_ = declareOrGet<int>(nh_, "video.decoder.consecutive_bad_frame_threshold", 5);
             if (consecutive_bad_frame_threshold_ < 1)
@@ -748,6 +649,7 @@ namespace trb::video
         VideoStreamManager::StatsSnapshot consumeStats()
         {
             VideoStreamManager::StatsSnapshot snapshot;
+            snapshot.converter_output_format = "nv12";
             snapshot.capture_frames = stats_capture_frames_.exchange(0, std::memory_order_relaxed);
             snapshot.decode_frames = stats_decode_frames_.exchange(0, std::memory_order_relaxed);
             snapshot.encode_frames = stats_encode_frames_.exchange(0, std::memory_order_relaxed);
@@ -1095,7 +997,7 @@ namespace trb::video
         // drains decoded DMA-BUF fds and feeds VIC/NvVideoEncoder.
         void encodeThreadMain()
         {
-            // Initialize decoder, converter and encoder in this thread.
+            // Initialize decoder, CUDA postprocess, and encoder in this thread.
             decoder_ = std::make_shared<trb::video::VideoDecoder>();
             if (!decoder_->initialize(decoder_config_))
             {
@@ -1104,13 +1006,8 @@ namespace trb::video
             }
             else
             {
-                auto converter = std::make_shared<trb::video::VideoConverter>();
-                if (!converter->initialize(converter_config_))
-                {
-                    RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoConverter initialize failed");
-                    converter.reset();
-                }
-                else if (undistort_enabled_)
+                bool postprocess_ready = false;
+                if (undistort_enabled_)
                 {
                     auto und = std::make_shared<trb::video::VideoUndistorter>();
                     if (!und->initialize(undistorter_config_))
@@ -1118,20 +1015,33 @@ namespace trb::video
                         RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
                                      "[ENCODE] VideoUndistorter initialize failed while video.undistort.enabled=true; "
                                      "pipeline startup aborted");
-                        converter.reset();
                     }
                     else
                     {
                         std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
                         undistorter_ = und;
+                        converter_.reset();
+                        postprocess_ready = true;
                     }
                 }
-                if (converter)
+                else
                 {
+                    auto converter = std::make_shared<trb::video::VideoConverter>();
+                    if (!converter->initialize(converter_config_))
+                    {
+                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoConverter initialize failed");
+                    }
+                    else
                     {
                         std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
                         converter_ = converter;
+                        undistorter_.reset();
+                        postprocess_ready = true;
                     }
+                }
+
+                if (postprocess_ready)
+                {
                     std::shared_ptr<trb::video::VideoEncoder> new_encoder =
                         std::make_shared<trb::video::VideoEncoder>();
                     if (!new_encoder->initialize(encoder_config_))
@@ -1164,7 +1074,7 @@ namespace trb::video
             // encoder DQ thread that long-blocks on the encoder capture plane
             // so encoded AUs are forwarded the moment NVENC signals readiness
             // (no dependency on this thread's loop cadence).
-            if (decoder_ && converter_ && encoder_)
+            if (decoder_ && (converter_ || undistorter_) && encoder_)
             {
                 capture_thread_ = std::thread(&Impl::captureThreadMain, this);
                 encoder_dq_thread_ = std::thread(&Impl::encoderDqThreadMain, this);
@@ -1175,8 +1085,8 @@ namespace trb::video
                 return;
             }
 
-            // Encode-thread main loop: drain decoder capture plane, run VIC
-            // transform, submit to encoder, and drain encoder capture plane.
+            // Encode-thread main loop: drain decoder capture plane, run CUDA
+            // postprocess, submit to encoder, and drain encoder input done.
             while (pipeline_running_.load(std::memory_order_acquire))
             {
                 // Reap completed encoder input buffers (returns fds to the
@@ -1187,7 +1097,7 @@ namespace trb::video
                     encoder_->drainInputDone();
                 }
 
-                if (!decoder_ || !converter_ || !encoder_)
+                if (!decoder_ || !encoder_ || (!converter_ && !undistorter_))
                 {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
@@ -1204,58 +1114,36 @@ namespace trb::video
                 stats_decode_frames_.fetch_add(1, std::memory_order_relaxed);
 
                 int downstream_fd = -1;
-                bool have_downstream = false;
-                bool used_fused = false;
-                if (undistorter_ && undistorter_->supportsFusedYuv422())
+                if (undistorter_)
                 {
-                    int fused_fd = -1;
-                    if (undistorter_->processYuv422(dec_frame.yuv_dmabuf_fd, fused_fd))
+                    if (undistorter_->processYuv422(dec_frame.yuv_dmabuf_fd, downstream_fd))
                     {
                         if (dec_frame.decode_us > 0)
                         {
                             stats_fused_decode_us_total_.fetch_add(dec_frame.decode_us, std::memory_order_relaxed);
                         }
-                        downstream_fd = fused_fd;
-                        have_downstream = true;
-                        used_fused = true;
                     }
                     else
                     {
-                        undistorter_->noteFusedFallback();
                         RCLCPP_WARN_THROTTLE(rclcpp::get_logger("teleop_robot_bridge.video"),
                                              *rclcpp::Clock::make_shared(),
                                              1000,
-                                             "[ENCODE] fused CUDA undistort failed; falling back to converter + remap");
+                                             "[ENCODE] fused CUDA undistort failed; dropping frame");
+                        decoder_->requeueCapture(dec_frame);
+                        continue;
                     }
                 }
-
-                if (!have_downstream)
+                else if (converter_)
                 {
-                    int nv12_fd = -1;
                     const bool ok = converter_->transformSync(dec_frame.yuv_dmabuf_fd,
                                                               dec_frame.capture_timestamp_us,
                                                               dec_frame.decode_us,
-                                                              nv12_fd);
+                                                              downstream_fd);
                     if (!ok)
                     {
                         decoder_->requeueCapture(dec_frame);
                         continue;
                     }
-
-                    downstream_fd = nv12_fd;
-                    if (undistorter_)
-                    {
-                        int undist_fd = -1;
-                        const bool und_ok = undistorter_->process(nv12_fd, undist_fd);
-                        converter_->releaseFd(nv12_fd);
-                        if (!und_ok)
-                        {
-                            decoder_->requeueCapture(dec_frame);
-                            continue;
-                        }
-                        downstream_fd = undist_fd;
-                    }
-                    have_downstream = true;
                 }
 
                 // Decoder YUV buffer is no longer needed after either the
@@ -1264,7 +1152,6 @@ namespace trb::video
                 decoder_->requeueCapture(dec_frame);
 
                 (void)onConverterOutput(downstream_fd, dec_frame.capture_timestamp_us);
-                (void)used_fused;
             }
         }
 
@@ -1427,28 +1314,10 @@ namespace trb::video
         }
 
         // ==================== Eye Image Thread ====================
-        // Responsibility: Receive NV12 copy from encode thread, crop/scale, publish ROS images
+        // Responsibility: Receive NV12 fd from encode thread, CUDA crop/scale/RGB, publish ROS images.
         void eyeImageThreadMain()
         {
-            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"), "[EYE_IMAGE] Thread started (zero-copy shared fd mode with VIC lock)");
-
-            // Setup VIC-based transform session for THIS thread
-            // All VIC operations are serialized via getNvBufMutex()
-            {
-                NvBufSurfTransformConfigParams transform_config;
-                memset(&transform_config, 0, sizeof(transform_config));
-                transform_config.compute_mode = NvBufSurfTransformCompute_VIC;  // Use VIC (serialized via mutex)
-                transform_config.gpu_id = 0;
-                transform_config.cuda_stream = 0;
-                
-                const int sret = NvBufSurfTransformSetSessionParams(&transform_config);
-                if (sret != 0)
-                {
-                    RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "[EYE_IMAGE] NvBufSurfTransformSetSessionParams failed ret=%d", sret);
-                    return;
-                }
-                RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"), "[EYE_IMAGE] VIC transform session initialized (serialized via mutex)");
-            }
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"), "[EYE_IMAGE] Thread started (CUDA shared fd mode)");
 
             // Initialize eye image publisher (no independent decoder)
             eye_image_publisher_ = std::make_shared<trb::video::EyeImagePublisher>();
@@ -1466,11 +1335,6 @@ namespace trb::video
                 return;
             }
 
-            // Inject the shared VIC mutex so EyeImagePublisher locks only
-            // around its NvBufSurfTransform call. CPU NV12->RGB conversion
-            // and ROS publish then run outside the lock, freeing the encode
-            // thread (which also needs VIC for converter/copy) much sooner.
-            eye_image_publisher_->setVicMutex(&trb::video::getNvBufMutex());
             eye_image_publisher_ready_.store(true, std::memory_order_release);
             updateEyeImageSubscriberState();
 

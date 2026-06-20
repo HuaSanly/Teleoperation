@@ -21,10 +21,6 @@
 #include "video/cuda_nv12_undistorter.hpp"
 #include "video/nvbuf_mutex.hpp"
 
-#ifndef TRB_HAS_CUDA_UNDISTORTER
-#define TRB_HAS_CUDA_UNDISTORTER 0
-#endif
-
 namespace trb::video
 {
 
@@ -409,7 +405,6 @@ namespace trb::video
     struct VideoUndistorter::Impl
     {
         Config cfg;
-        bool fused_enabled{false};
         std::string backend_name{"cuda"};
         MapBuildResult map_result;
 
@@ -469,8 +464,7 @@ namespace trb::video
             p.gpuId = 0;
             p.width = cfg.width;
             p.height = cfg.height;
-            p.layout = (cfg.output_surface_layout == 1) ? NVBUF_LAYOUT_BLOCK_LINEAR
-                                                       : NVBUF_LAYOUT_PITCH;
+            p.layout = NVBUF_LAYOUT_PITCH;
             p.colorFormat = NVBUF_COLOR_FORMAT_NV12;
             p.memType = NVBUF_MEM_SURFACE_ARRAY;
             p.isContiguous = true;
@@ -505,13 +499,6 @@ namespace trb::video
 
         bool createCudaResources()
         {
-#if TRB_HAS_CUDA_UNDISTORTER
-            if (cfg.output_surface_layout != 0)
-            {
-                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
-                            "[UNDISTORT] CUDA backend supports pitch-linear NV12 output only; current output layout is block-linear");
-                return false;
-            }
             cuda_backend = std::make_unique<CudaNv12Undistorter>();
             if (!cuda_backend->initialize(cfg.width, cfg.height, map_result.full_map_xy))
             {
@@ -537,11 +524,6 @@ namespace trb::video
                 }
             }
             return true;
-#else
-            RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
-                         "[UNDISTORT] CUDA undistorter was not built; install CUDA Toolkit or disable video.undistort.enabled");
-            return false;
-#endif
         }
 
         bool acquireOutput(size_t &out_idx, int &out_fd)
@@ -633,7 +615,6 @@ namespace trb::video
         impl_->teardown();
         impl_->cfg = config;
         impl_->backend_name = "cuda";
-        impl_->fused_enabled = config.fused;
 
         if (config.width == 0 || config.height == 0 || (config.width & 1u) != 0)
         {
@@ -661,7 +642,6 @@ namespace trb::video
             }
             RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
                         "[UNDISTORT] calibration unavailable; using CUDA identity map");
-            impl_->fused_enabled = false;
             buildIdentityMap(config, impl_->map_result);
         }
 
@@ -677,13 +657,12 @@ namespace trb::video
 
         const auto &cal = impl_->map_result.calibration;
         RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
-                    "[UNDISTORT] initialized: %ux%u eye=%s pool=%u backend=%s fused=%d profile=%s session=%s baseline=%.3fmm alpha=%.3f calib=%s",
+                    "[UNDISTORT] initialized: %ux%u eye=%s pool=%u backend=%s path=fused_yuv422_to_nv12 profile=%s session=%s baseline=%.3fmm alpha=%.3f calib=%s",
                     config.width,
                     config.height,
                     sizeString(cal.runtime_size).c_str(),
                     config.buffer_pool_size,
                     impl_->backend_name.c_str(),
-                    impl_->fused_enabled ? 1 : 0,
                     cal.profile.empty() ? "<direct>" : cal.profile.c_str(),
                     cal.session.empty() ? "<none>" : cal.session.c_str(),
                     cal.baseline_mm,
@@ -739,7 +718,7 @@ namespace trb::video
             return false;
         }
 
-        const bool ok = impl_->processCuda(yuv422_fd_in, out_idx, out_fd, true, false);
+        const bool ok = impl_->processCuda(yuv422_fd_in, out_idx, out_fd, true, true);
         if (!ok)
         {
             impl_->releaseOutputIndex(out_idx);
@@ -752,20 +731,12 @@ namespace trb::video
 
     bool VideoUndistorter::supportsFusedYuv422() const
     {
-        return impl_ && impl_->fused_enabled && impl_->cuda_backend;
+        return impl_ && impl_->cuda_backend;
     }
 
     const std::string &VideoUndistorter::backendName() const
     {
         return impl_->backend_name;
-    }
-
-    void VideoUndistorter::noteFusedFallback()
-    {
-        if (impl_)
-        {
-            impl_->fallback_frames.fetch_add(1, std::memory_order_relaxed);
-        }
     }
 
     void VideoUndistorter::releaseFd(int dmabuf_fd)

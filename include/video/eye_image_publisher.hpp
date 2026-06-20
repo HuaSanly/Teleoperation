@@ -1,11 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <functional>
 #include <vector>
 #include <string>
-#include <mutex>
 #include <atomic>
 
 #include "sensor_msgs/msg/image.hpp"
@@ -17,18 +16,20 @@ struct NvBufSurface;
 namespace trb::video
 {
 
+class CudaEyeImageProcessor;
+
 /**
  * @brief Publishes left and right eye images from a side-by-side stereo frame.
  * 
- * ARCHITECTURE: Receives NV12 surface from shared decoder (VideoConverter)
+ * ARCHITECTURE: Receives NV12 surface from the encode pipeline
  * - No independent decoder (shares with encode pipeline)
- * - Receives NV12 surface pointer, crops left/right halves, scales, converts to RGB
+ * - Uses CUDA to crop left/right halves, scale, and convert to RGB
  * - Publishes to ROS Image topics
  * 
  * Input: NV12 NvBufSurface* (3840x1520)
  * Output: Two ROS Image topics (640x360 each)
  * 
- * Uses Jetson VIC for hardware-accelerated crop + scale.
+ * Uses pinned host RGB buffers for the final ROS Image copy.
  */
 class EyeImagePublisher
 {
@@ -67,15 +68,6 @@ public:
     bool initialize(rclcpp::Node & nh, uint32_t src_width, uint32_t src_height, const Config& config);
 
     /**
-     * @brief Inject the VIC mutex used to serialise NvBufSurfTransform calls
-     * across pipeline stages. When set, only the actual NvBufSurfTransform
-     * call is locked; the subsequent CPU NV12->RGB conversion and ROS publish
-     * run outside the lock so they do not block the encode thread.
-     * Pass nullptr to disable external locking.
-     */
-    void setVicMutex(std::mutex* vic_mutex) { vic_mutex_ = vic_mutex; }
-
-    /**
      * @brief Process NV12 frame from shared decoder.
      * @param src_surface NvBufSurface pointer of the source NV12 surface
      * @param timestamp_us Frame timestamp in microseconds
@@ -108,26 +100,17 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr left_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr right_pub_;
     
-    // NV12 buffers for crop+scale output (2 buffers: left and right)
-    std::vector<void*> nv12_surfaces_;  // NvBufSurface*
-    std::vector<int> nv12_fds_;
-    
     // RGB buffers for final output
-    std::vector<std::vector<uint8_t>> rgb_buffers_;
+    std::vector<uint8_t*> rgb_buffers_;
+    size_t rgb_buffer_size_ = 0;
+    std::unique_ptr<CudaEyeImageProcessor> cuda_processor_;
     
     std::atomic<bool> initialized_{false};
-    std::mutex mutex_;
-    // Optional injected VIC mutex (owned externally). Used only around the
-    // NvBufSurfTransform call inside cropScaleToNV12 to keep lock-hold time
-    // minimal. nullptr = no external locking.
-    std::mutex* vic_mutex_ = nullptr;
     
     // Statistics
     std::atomic<uint64_t> frame_count_{0};
     
     void destroyBuffers();
-    bool cropScaleToNV12(NvBufSurface* src_surf, int dst_idx, bool is_right_eye);
-    bool convertNV12ToRGB(NvBufSurface* surf, uint8_t* rgb_out, size_t rgb_size);
     void publishImage(rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& pub, const uint8_t* rgb_data, uint64_t timestamp_us);
 };
 

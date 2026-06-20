@@ -1,9 +1,9 @@
 /**
  * @file nvbuf_mutex.hpp
- * @brief Global mutex for serializing NvBufSurface/VIC hardware operations
+ * @brief Global mutex for serializing selected NvBufSurface operations.
  * 
- * The VIC (Video Image Compositor) hardware on Jetson is NOT thread-safe.
- * All NvBufSurfTransform operations must be serialized across threads.
+ * Some Jetson NvBufSurface helper calls touch process-global bookkeeping.
+ * Keep those calls serialized while CUDA kernels run outside this lock.
  */
 
 #pragma once
@@ -14,10 +14,9 @@ namespace trb::video
 {
 
 /**
- * @brief Global mutex for VIC/NvBufSurface operations
+ * @brief Global mutex for NvBufSurface metadata/helper operations.
  * 
  * Use this lock around any of the following operations:
- * - NvBufSurfTransform()
  * - NvBufSurfaceMap() / NvBufSurfaceUnMap()
  * - NvBufSurfaceSyncForCpu() / NvBufSurfaceSyncForDevice()
  * - NvBufSurfaceFromFd()
