@@ -22,8 +22,17 @@ namespace trb::video
             // The pointer remains valid until requeue(frame.v4l2_buf) is called.
             const uint8_t *data = nullptr;
             size_t size = 0;
+            // Valid when Config::memory_mode is kDmaBuf. The fd belongs to the
+            // capturer buffer pool and remains owned until requeue().
+            int dmabuf_fd = -1;
             uint64_t timestamp_us = 0;
             struct v4l2_buffer v4l2_buf;
+        };
+
+        enum class MemoryMode
+        {
+            kMmap,
+            kDmaBuf,
         };
 
         struct Config
@@ -34,6 +43,7 @@ namespace trb::video
             uint32_t framerate = 30;
             uint32_t pixel_format = V4L2_PIX_FMT_MJPEG; // common for UVC
             uint32_t buffer_count = 8;
+            MemoryMode memory_mode = MemoryMode::kMmap;
         };
 
         VideoV4L2Capturer();
@@ -67,11 +77,15 @@ namespace trb::video
         {
             void *start = nullptr;
             size_t length = 0;
+            void *surface = nullptr;
+            int dmabuf_fd = -1;
         };
 
         bool openDevice();
         bool configureDevice();
         bool requestBuffers();
+        bool requestMmapBuffers(uint32_t count);
+        bool requestDmaBufBuffers(uint32_t count);
         bool streamOn();
         void streamOff();
         void closeDevice();

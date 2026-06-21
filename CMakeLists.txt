@@ -153,6 +153,10 @@ if(EXISTS "${JETSON_MM_API_PATH}")
   endif()
   message(STATUS "Using Jetson JPEG headers: ${JETSON_JPEG_INCLUDE_DIR}")
 
+  target_include_directories(video_v4l2_capturer PUBLIC
+    ${JETSON_MM_API_PATH}/include
+  )
+
   # Jetson Multimedia API sources are third-party; keep our code strict, but
   # silence known noisy warnings from upstream headers/samples.
   target_compile_options(video_converter PRIVATE
@@ -196,6 +200,10 @@ if(EXISTS "${JETSON_MM_API_PATH}")
       "Jetson multimedia libraries not found in configured search paths. "
       "Expected nvv4l2, nvbufsurface, nvmm_jpeg under: ${JETSON_LIBRARY_DIRS}")
   endif()
+
+  target_link_libraries(video_v4l2_capturer
+    ${JETSON_NVBUFSURFACE_LIBRARY}
+  )
 
   target_sources(video_converter PRIVATE
     "${JETSON_COMMON_DIR}/classes/NvJpegDecoder.cpp"

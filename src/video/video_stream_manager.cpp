@@ -135,6 +135,19 @@ namespace trb::video
             return "unknown";
         }
 
+        const char *v4l2PixelFormatName(uint32_t format)
+        {
+            switch (format)
+            {
+            case V4L2_PIX_FMT_MJPEG:
+                return "mjpeg";
+            case V4L2_PIX_FMT_YUYV:
+                return "yuyv";
+            default:
+                return "unknown";
+            }
+        }
+
         void joinThread(std::thread &thread, const char *name)
         {
             if (!thread.joinable())
@@ -153,21 +166,24 @@ namespace trb::video
     }
 
     /**
-     * @brief Architecture: 3 pipeline threads (post Stage F refactor).
+     * @brief Architecture: CUDA video postprocess pipeline.
      *
-     * Threads:
-     *   capture_thread_  : V4L2 dequeue -> decoder.submit(MJPEG) -> V4L2 requeue
+     * MJPEG input:
+     *   capture_thread_  : V4L2 MMAP dequeue -> NvJPEGDecoder submit -> V4L2 requeue
      *   encode_thread_   : decoder.dequeueSync -> CUDA postprocess -> encoder.submit
-     *   eye_image_thread_: consume NV12 frames from nv12_queue_ -> ROS Image publish
+     *
+     * YUYV input:
+     *   encode_thread_   : V4L2 DMABUF dequeue -> CUDA postprocess -> V4L2 requeue
+     *                      -> encoder.submit
      *
      * Data Flow:
-     *   V4L2 Camera (MJPEG)                              [capture_thread_]
-     *        -> NvJPEGDecoder   (MJPEG -> YUV DMA-BUF)   [encode_thread_]
+     *   V4L2 Camera (MJPEG) -> NvJPEGDecoder -> YUV422 DMA-BUF
+     *   V4L2 Camera (YUYV)  -> camera-owned YUYV DMA-BUF
      *        -> CUDA postprocess:
-     *             undistort on  : fused YUV422 -> rectified NV12
-     *             undistort off : YUV422 -> NV12 converter
-     *        -> VideoEncoder    (NV12 -> H.264)          [encode_thread_]
-     *        -> onEncoderPacket -> UDP/gRPC              [encode_thread_]
+     *             undistort on  : fused YUV422/YUYV -> rectified NV12
+     *             undistort off : YUV422/YUYV -> NV12 converter
+     *        -> VideoEncoder    (NV12 -> H.264/H.265)
+     *        -> onEncoderPacket -> UDP/gRPC
      *
      *   In parallel: a ref-counted NV12 fd is handed to eye_image_thread_
      *   for CUDA crop/scale/RGB publish. The fd returns to its owner only
@@ -321,6 +337,7 @@ namespace trb::video
             else if (fmt == "yuyv" || fmt == "yuy2")
             {
                 cap_cfg.pixel_format = V4L2_PIX_FMT_YUYV;
+                cap_cfg.memory_mode = trb::video::VideoV4L2Capturer::MemoryMode::kDmaBuf;
             }
             else
             {
@@ -340,6 +357,7 @@ namespace trb::video
             // Use negotiated device format for downstream
             const uint32_t actual_w = capturer_->width();
             const uint32_t actual_h = capturer_->height();
+            const uint32_t actual_pixfmt = capturer_->pixelFormat();
             if (actual_w > 0 && actual_h > 0 && (actual_w != width || actual_h != height))
             {
                 RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), 
@@ -350,6 +368,22 @@ namespace trb::video
             }
             capturer_config_.width = width;
             capturer_config_.height = height;
+            yuyv_direct_enabled_ = (cap_cfg.pixel_format == V4L2_PIX_FMT_YUYV &&
+                                    actual_pixfmt == V4L2_PIX_FMT_YUYV &&
+                                    cap_cfg.memory_mode == trb::video::VideoV4L2Capturer::MemoryMode::kDmaBuf);
+            if (cap_cfg.pixel_format == V4L2_PIX_FMT_YUYV && !yuyv_direct_enabled_)
+            {
+                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                             "VideoStreamManager: requested YUYV direct path but V4L2 negotiated pixfmt=%s/0x%08x",
+                             v4l2PixelFormatName(actual_pixfmt),
+                             actual_pixfmt);
+                capturer_.reset();
+                return false;
+            }
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "VideoStreamManager: input pixfmt=%s path=%s",
+                        v4l2PixelFormatName(actual_pixfmt),
+                        yuyv_direct_enabled_ ? "yuyv_dmabuf_direct" : "mjpeg_decode");
 
             // Store dimensions for eye image thread
             frame_width_ = width;
@@ -989,83 +1023,119 @@ namespace trb::video
         }
 
         // ==================== Encode Thread ====================
-        // Single unified thread:
-        //   1. Dequeue V4L2 MJPEG mmap buffer.
-        //   2. Hand pointer to NvJPEGDecoder (which returns a decoded YUV DMA-BUF).
-        //   3. Requeue V4L2 buffer immediately.
-        // NvJPEGDecoder runs synchronously on the capture thread; this thread
-        // drains decoded DMA-BUF fds and feeds VIC/NvVideoEncoder.
-        void encodeThreadMain()
+        bool initializePostprocess()
         {
-            // Initialize decoder, CUDA postprocess, and encoder in this thread.
-            decoder_ = std::make_shared<trb::video::VideoDecoder>();
-            if (!decoder_->initialize(decoder_config_))
+            bool postprocess_ready = false;
+            if (undistort_enabled_)
             {
-                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoDecoder initialize failed");
-                decoder_.reset();
-            }
-            else
-            {
-                bool postprocess_ready = false;
-                if (undistort_enabled_)
+                auto und = std::make_shared<trb::video::VideoUndistorter>();
+                if (!und->initialize(undistorter_config_))
                 {
-                    auto und = std::make_shared<trb::video::VideoUndistorter>();
-                    if (!und->initialize(undistorter_config_))
-                    {
-                        RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
-                                     "[ENCODE] VideoUndistorter initialize failed while video.undistort.enabled=true; "
-                                     "pipeline startup aborted");
-                    }
-                    else
-                    {
-                        std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
-                        undistorter_ = und;
-                        converter_.reset();
-                        postprocess_ready = true;
-                    }
+                    RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                 "[ENCODE] VideoUndistorter initialize failed while video.undistort.enabled=true; "
+                                 "pipeline startup aborted");
                 }
                 else
                 {
-                    auto converter = std::make_shared<trb::video::VideoConverter>();
-                    if (!converter->initialize(converter_config_))
+                    std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
+                    undistorter_ = und;
+                    converter_.reset();
+                    postprocess_ready = true;
+                }
+            }
+            else
+            {
+                auto converter = std::make_shared<trb::video::VideoConverter>();
+                if (!converter->initialize(converter_config_))
+                {
+                    RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoConverter initialize failed");
+                }
+                else
+                {
+                    std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
+                    converter_ = converter;
+                    undistorter_.reset();
+                    postprocess_ready = true;
+                }
+            }
+            return postprocess_ready;
+        }
+
+        bool initializeEncoder()
+        {
+            std::shared_ptr<trb::video::VideoEncoder> new_encoder =
+                std::make_shared<trb::video::VideoEncoder>();
+            if (!new_encoder->initialize(encoder_config_))
+            {
+                RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoEncoder initialize failed");
+                return false;
+            }
+
+            new_encoder->setInputDoneCallback(std::bind(&Impl::onEncoderInputDone, this, std::placeholders::_1));
+            SpsPpsCallback pending_sps_pps;
+            {
+                // Publish the encoder under callback_mutex_ so that external
+                // setTargetBitrate / setSpsPpsCallback never see a partially
+                // constructed or already-destroyed instance.
+                std::lock_guard<std::mutex> lk(callback_mutex_);
+                encoder_ = new_encoder;
+                pending_sps_pps = sps_pps_callback_;
+            }
+            if (pending_sps_pps)
+            {
+                new_encoder->setSpsPpsCallback(pending_sps_pps);
+            }
+            return true;
+        }
+
+        bool postprocessYuv422Fd(int src_fd,
+                                 uint64_t capture_timestamp_us,
+                                 uint64_t decode_us,
+                                 int &downstream_fd)
+        {
+            downstream_fd = -1;
+            if (undistorter_)
+            {
+                if (undistorter_->processYuv422(src_fd, downstream_fd))
+                {
+                    if (decode_us > 0)
                     {
-                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoConverter initialize failed");
+                        stats_fused_decode_us_total_.fetch_add(decode_us, std::memory_order_relaxed);
                     }
-                    else
-                    {
-                        std::lock_guard<std::mutex> lk(pipeline_component_mutex_);
-                        converter_ = converter;
-                        undistorter_.reset();
-                        postprocess_ready = true;
-                    }
+                    return true;
                 }
 
-                if (postprocess_ready)
+                RCLCPP_WARN_THROTTLE(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                     *rclcpp::Clock::make_shared(),
+                                     1000,
+                                     "[ENCODE] fused CUDA undistort failed; dropping frame");
+                return false;
+            }
+            if (converter_)
+            {
+                return converter_->transformSync(src_fd,
+                                                 capture_timestamp_us,
+                                                 decode_us,
+                                                 downstream_fd);
+            }
+            return false;
+        }
+
+        void encodeThreadMain()
+        {
+            if (!initializePostprocess() || !initializeEncoder())
+            {
+                requestPipelineRestart("encode_pipeline_init_failed");
+                return;
+            }
+
+            if (!yuyv_direct_enabled_)
+            {
+                decoder_ = std::make_shared<trb::video::VideoDecoder>();
+                if (!decoder_->initialize(decoder_config_))
                 {
-                    std::shared_ptr<trb::video::VideoEncoder> new_encoder =
-                        std::make_shared<trb::video::VideoEncoder>();
-                    if (!new_encoder->initialize(encoder_config_))
-                    {
-                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoEncoder initialize failed");
-                        new_encoder.reset();
-                    }
-                    else
-                    {
-                        new_encoder->setInputDoneCallback(std::bind(&Impl::onEncoderInputDone, this, std::placeholders::_1));
-                        SpsPpsCallback pending_sps_pps;
-                        {
-                            // Publish the encoder under callback_mutex_ so that external
-                            // setTargetBitrate / setSpsPpsCallback never see a partially
-                            // constructed or already-destroyed instance.
-                            std::lock_guard<std::mutex> lk(callback_mutex_);
-                            encoder_ = new_encoder;
-                            pending_sps_pps = sps_pps_callback_;
-                        }
-                        if (pending_sps_pps)
-                        {
-                            new_encoder->setSpsPpsCallback(pending_sps_pps);
-                        }
-                    }
+                    RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"), "[ENCODE] VideoDecoder initialize failed");
+                    decoder_.reset();
                 }
             }
 
@@ -1074,9 +1144,12 @@ namespace trb::video
             // encoder DQ thread that long-blocks on the encoder capture plane
             // so encoded AUs are forwarded the moment NVENC signals readiness
             // (no dependency on this thread's loop cadence).
-            if (decoder_ && (converter_ || undistorter_) && encoder_)
+            if ((yuyv_direct_enabled_ || decoder_) && (converter_ || undistorter_) && encoder_)
             {
-                capture_thread_ = std::thread(&Impl::captureThreadMain, this);
+                if (!yuyv_direct_enabled_)
+                {
+                    capture_thread_ = std::thread(&Impl::captureThreadMain, this);
+                }
                 encoder_dq_thread_ = std::thread(&Impl::encoderDqThreadMain, this);
             }
             else
@@ -1085,6 +1158,17 @@ namespace trb::video
                 return;
             }
 
+            if (yuyv_direct_enabled_)
+            {
+                encodeYuyvDirectLoop();
+                return;
+            }
+
+            encodeDecodedLoop();
+        }
+
+        void encodeDecodedLoop()
+        {
             // Encode-thread main loop: drain decoder capture plane, run CUDA
             // postprocess, submit to encoder, and drain encoder input done.
             while (pipeline_running_.load(std::memory_order_acquire))
@@ -1114,36 +1198,13 @@ namespace trb::video
                 stats_decode_frames_.fetch_add(1, std::memory_order_relaxed);
 
                 int downstream_fd = -1;
-                if (undistorter_)
+                if (!postprocessYuv422Fd(dec_frame.yuv_dmabuf_fd,
+                                         dec_frame.capture_timestamp_us,
+                                         dec_frame.decode_us,
+                                         downstream_fd))
                 {
-                    if (undistorter_->processYuv422(dec_frame.yuv_dmabuf_fd, downstream_fd))
-                    {
-                        if (dec_frame.decode_us > 0)
-                        {
-                            stats_fused_decode_us_total_.fetch_add(dec_frame.decode_us, std::memory_order_relaxed);
-                        }
-                    }
-                    else
-                    {
-                        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("teleop_robot_bridge.video"),
-                                             *rclcpp::Clock::make_shared(),
-                                             1000,
-                                             "[ENCODE] fused CUDA undistort failed; dropping frame");
-                        decoder_->requeueCapture(dec_frame);
-                        continue;
-                    }
-                }
-                else if (converter_)
-                {
-                    const bool ok = converter_->transformSync(dec_frame.yuv_dmabuf_fd,
-                                                              dec_frame.capture_timestamp_us,
-                                                              dec_frame.decode_us,
-                                                              downstream_fd);
-                    if (!ok)
-                    {
-                        decoder_->requeueCapture(dec_frame);
-                        continue;
-                    }
+                    decoder_->requeueCapture(dec_frame);
+                    continue;
                 }
 
                 // Decoder YUV buffer is no longer needed after either the
@@ -1152,6 +1213,89 @@ namespace trb::video
                 decoder_->requeueCapture(dec_frame);
 
                 (void)onConverterOutput(downstream_fd, dec_frame.capture_timestamp_us);
+            }
+        }
+
+        void encodeYuyvDirectLoop()
+        {
+            if (!capturer_ || !capturer_->start())
+            {
+                RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
+                             "Failed to start V4L2 YUYV DMABUF capturer");
+                requestPipelineRestart("yuyv_direct_capture_start_failed");
+                return;
+            }
+
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "V4L2 YUYV direct capturer started (warmup_drop_frames=%d)",
+                        v4l2_warmup_drop_frames_);
+
+            const auto warmup_start = std::chrono::steady_clock::now();
+            auto last_successful_dequeue = warmup_start;
+            int warmup_dropped_frames = 0;
+            bool warmup_done = (v4l2_warmup_drop_frames_ == 0);
+            bool warned_no_frames = false;
+
+            while (pipeline_running_.load(std::memory_order_acquire))
+            {
+                if (encoder_)
+                {
+                    encoder_->drainInputDone();
+                }
+
+                trb::video::VideoV4L2Capturer::Frame frame;
+                if (!capturer_ || !capturer_->dequeue(frame, 100))
+                {
+                    const auto now_tp = std::chrono::steady_clock::now();
+                    if (!warned_no_frames && (now_tp - last_successful_dequeue) >= std::chrono::seconds(2))
+                    {
+                        const double stalled_sec = std::chrono::duration<double>(now_tp - last_successful_dequeue).count();
+                        RCLCPP_WARN(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                    "V4L2 YUYV direct capturer started but no frames dequeued for %.1fs",
+                                    stalled_sec);
+                        warned_no_frames = true;
+                    }
+                    continue;
+                }
+
+                const auto now_tp = std::chrono::steady_clock::now();
+                last_successful_dequeue = now_tp;
+                warned_no_frames = false;
+
+                if (!warmup_done)
+                {
+                    (void)capturer_->requeue(frame.v4l2_buf);
+                    if (++warmup_dropped_frames >= v4l2_warmup_drop_frames_)
+                    {
+                        const double warmup_elapsed_ms = static_cast<double>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                now_tp - warmup_start).count()) / 1000.0;
+                        RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                    "V4L2 YUYV direct warmup complete: dropped=%d elapsed=%.1fms",
+                                    warmup_dropped_frames,
+                                    warmup_elapsed_ms);
+                        warmup_done = true;
+                    }
+                    continue;
+                }
+
+                const uint64_t capture_steady_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now_tp.time_since_epoch()).count());
+
+                stats_capture_frames_.fetch_add(1, std::memory_order_relaxed);
+                (void)encode_frame_in_count_.fetch_add(1, std::memory_order_relaxed);
+
+                int downstream_fd = -1;
+                if (frame.dmabuf_fd < 0 ||
+                    !postprocessYuv422Fd(frame.dmabuf_fd, capture_steady_us, 0, downstream_fd))
+                {
+                    (void)capturer_->requeue(frame.v4l2_buf);
+                    continue;
+                }
+
+                (void)capturer_->requeue(frame.v4l2_buf);
+                (void)onConverterOutput(downstream_fd, capture_steady_us);
             }
         }
 
@@ -1722,6 +1866,7 @@ namespace trb::video
         trb::video::VideoConverter::Config converter_config_;
         trb::video::VideoUndistorter::Config undistorter_config_;
         bool undistort_enabled_{false};
+        bool yuyv_direct_enabled_{false};
         trb::video::VideoEncoder::Config encoder_config_;
         trb::video::VideoRecorder::Config recorder_config_;
 

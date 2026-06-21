@@ -1632,19 +1632,11 @@ namespace trb
         uint64_t undistort_frames = 0;
         uint64_t undistort_pool_drops = 0;
         uint64_t undistort_failures = 0;
-        uint64_t undistort_fallback_frames = 0;
         uint64_t decode_us_total = 0;
         uint64_t transform_us_total = 0;
-        uint64_t transform_map_us_total = 0;
-        uint64_t transform_wait_us_total = 0;
-        uint64_t transform_call_us_total = 0;
         uint64_t undistort_us_total = 0;
-        uint64_t undistort_map_us_total = 0;
-        uint64_t undistort_kernel_us_total = 0;
-        uint64_t undistort_sync_us_total = 0;
         uint64_t encode_us_total = 0;
         std::string converter_output_format = "unknown";
-        std::string undistort_backend = "off";
         trb::udp::UdpManager::VideoStatsSnapshot udp_stats;
         bool have_video_module = false;
         bool have_udp_module = false;
@@ -1663,9 +1655,6 @@ namespace trb
             encoder_submit_failures = video_stats.encoder_submit_failures;
             decode_us_total = video_stats.decode_us_total;
             transform_us_total = video_stats.transform_us_total;
-            transform_map_us_total = video_stats.transform_map_us_total;
-            transform_wait_us_total = video_stats.transform_wait_us_total;
-            transform_call_us_total = video_stats.transform_call_us_total;
             if (!video_stats.converter_output_format.empty())
             {
                 converter_output_format = video_stats.converter_output_format;
@@ -1674,15 +1663,7 @@ namespace trb
             undistort_frames = video_stats.undistort_frames;
             undistort_pool_drops = video_stats.undistort_pool_drops;
             undistort_failures = video_stats.undistort_failures;
-            undistort_fallback_frames = video_stats.undistort_fallback_frames;
             undistort_us_total = video_stats.undistort_us_total;
-            undistort_map_us_total = video_stats.undistort_map_us_total;
-            undistort_kernel_us_total = video_stats.undistort_kernel_us_total;
-            undistort_sync_us_total = video_stats.undistort_sync_us_total;
-            if (!video_stats.undistort_backend.empty())
-            {
-                undistort_backend = video_stats.undistort_backend;
-            }
         }
         if (udp_module_ && udp_module_->isRunning())
         {
@@ -1726,10 +1707,7 @@ namespace trb
         const double conv_fps = static_cast<double>(convert_frames) / elapsed_sec;
         const double und_fps = static_cast<double>(undistort_frames) / elapsed_sec;
         const double enc_fps = static_cast<double>(encode_frames) / elapsed_sec;
-        const double udp_in_fps = static_cast<double>(udp_stats.input_frames) / elapsed_sec;
         const double tx_fps = static_cast<double>(udp_stats.sent_frames) / elapsed_sec;
-        const double fec_pps = static_cast<double>(udp_stats.fec_output_packets) / elapsed_sec;
-        const double tx_pps = static_cast<double>(udp_stats.sent_packets) / elapsed_sec;
         const double tx_mbps = (static_cast<double>(udp_stats.sent_bytes) * 8.0 / 1000000.0) / elapsed_sec;
 
         const double dec_ms = decode_frames > 0
@@ -1738,49 +1716,15 @@ namespace trb
         const double conv_ms = convert_frames > 0
                                    ? static_cast<double>(transform_us_total) / static_cast<double>(convert_frames) / 1000.0
                                    : 0.0;
-        const double conv_map_ms = convert_frames > 0
-                                       ? static_cast<double>(transform_map_us_total) / static_cast<double>(convert_frames) / 1000.0
-                                       : 0.0;
-        const double conv_wait_ms = convert_frames > 0
-                                        ? static_cast<double>(transform_wait_us_total) / static_cast<double>(convert_frames) / 1000.0
-                                        : 0.0;
-        const double conv_call_ms = convert_frames > 0
-                                        ? static_cast<double>(transform_call_us_total) / static_cast<double>(convert_frames) / 1000.0
-                                        : 0.0;
         const double und_ms = undistort_frames > 0
                                   ? static_cast<double>(undistort_us_total) / static_cast<double>(undistort_frames) / 1000.0
                                   : 0.0;
-        const double und_map_ms = undistort_frames > 0
-                                      ? static_cast<double>(undistort_map_us_total) / static_cast<double>(undistort_frames) / 1000.0
-                                      : 0.0;
-        const double und_kernel_ms = undistort_frames > 0
-                                         ? static_cast<double>(undistort_kernel_us_total) / static_cast<double>(undistort_frames) / 1000.0
-                                         : 0.0;
-        const double und_sync_ms = undistort_frames > 0
-                                       ? static_cast<double>(undistort_sync_us_total) / static_cast<double>(undistort_frames) / 1000.0
-                                       : 0.0;
         const double enc_ms = encode_frames > 0
                                   ? static_cast<double>(encode_us_total) / static_cast<double>(encode_frames) / 1000.0
                                   : 0.0;
-        const double cap2fec_ms = udp_stats.cap_to_fec_samples > 0
-                                      ? static_cast<double>(udp_stats.cap_to_fec_us_total) / static_cast<double>(udp_stats.cap_to_fec_samples) / 1000.0
-                                      : 0.0;
-        const double fec_wait_ms = udp_stats.fec_internal_wait_samples > 0
-                                       ? static_cast<double>(udp_stats.fec_internal_wait_us_total) / static_cast<double>(udp_stats.fec_internal_wait_samples) / 1000.0
-                                       : 0.0;
-        const double send_q_ms = udp_stats.send_queue_delay_samples > 0
-                                     ? static_cast<double>(udp_stats.send_queue_delay_us_total) / static_cast<double>(udp_stats.send_queue_delay_samples) / 1000.0
-                                     : 0.0;
-        const double send_us = udp_stats.sent_packets > 0
-                                   ? static_cast<double>(udp_stats.send_syscall_us_total) / static_cast<double>(udp_stats.sent_packets)
-                                   : 0.0;
         const double e2e_ms = udp_stats.end_to_end_samples > 0
                                   ? static_cast<double>(udp_stats.end_to_end_us_total) / static_cast<double>(udp_stats.end_to_end_samples) / 1000.0
                                   : 0.0;
-        const double pacer_debt_ms = static_cast<double>(udp_stats.pacer_debt_us) / 1000.0;
-        const double pacer_q_ms = static_cast<double>(udp_stats.pacer_expected_queue_us) / 1000.0;
-        const double pacer_mbps = static_cast<double>(udp_stats.pacer_adjusted_bps) / 1000000.0;
-        const int running = video_module_ && video_module_->isRunning() ? 1 : 0;
 
         if (udp_drop_total > 0 || udp_sockdrop_total > 0)
         {
@@ -1792,23 +1736,18 @@ namespace trb
         }
 
         RCLCPP_INFO(this->get_logger(),
-                    "[VIDEO] fmt=%s und_backend=%s cap=%.1ffps dec=%.1ffps conv=%.1ffps und=%.1ffps enc=%.1ffps udp_in=%.1ffps tx=%.1ffps %.1fMbps fec=%.0fpps txpkt=%.0fpps drop=dec%lu conv%lu und%lu undfb%lu enc%lu udp%lu sockblk%lu sockdrop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f conv_map%.2f conv_wait%.2f conv_call%.2f und%.2f und_map%.2f und_kernel%.2f und_sync%.2f enc%.2f cap2fec%.2f fecwait%.2f sendq%.2f send%.1fus e2e=%.2fms pacer=debt%.2f q%.2f rate%.1fMbps running=%d",
+                    "[VIDEO] fmt=%s fps=cap%.1f dec%.1f conv%.1f und%.1f enc%.1f tx%.1f %.1fMbps drop=dec%lu conv%lu und%lu enc%lu udp%lu sock=blk%lu drop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f und%.2f enc%.2f e2e=%.2fms",
                     converter_output_format.c_str(),
-                    undistort_backend.c_str(),
                     cap_fps,
                     dec_fps,
                     conv_fps,
                     und_fps,
                     enc_fps,
-                    udp_in_fps,
                     tx_fps,
                     tx_mbps,
-                    fec_pps,
-                    tx_pps,
                     static_cast<unsigned long>(decoder_drops),
                     static_cast<unsigned long>(conv_drop_total),
                     static_cast<unsigned long>(und_drop_total),
-                    static_cast<unsigned long>(undistort_fallback_frames),
                     static_cast<unsigned long>(encoder_submit_failures),
                     static_cast<unsigned long>(udp_drop_total),
                     static_cast<unsigned long>(udp_sockblk_total),
@@ -1817,23 +1756,9 @@ namespace trb
                     static_cast<double>(udp_stats.queue_bytes) / 1024.0,
                     dec_ms,
                     conv_ms,
-                    conv_map_ms,
-                    conv_wait_ms,
-                    conv_call_ms,
                     und_ms,
-                    und_map_ms,
-                    und_kernel_ms,
-                    und_sync_ms,
                     enc_ms,
-                    cap2fec_ms,
-                    fec_wait_ms,
-                    send_q_ms,
-                    send_us,
-                    e2e_ms,
-                    pacer_debt_ms,
-                    pacer_q_ms,
-                    pacer_mbps,
-                    running);
+                    e2e_ms);
     }
 
     void MainNode::ensureNegotiationRetryTimer()

@@ -27,6 +27,13 @@ struct MappedEglFrame
     bool valid = false;
 };
 
+enum class SourceFormat
+{
+    kNv12,
+    kPlanarYuv422,
+    kPackedYuyv,
+};
+
 uint64_t elapsedUs(std::chrono::steady_clock::time_point start,
                    std::chrono::steady_clock::time_point end)
 {
@@ -201,7 +208,10 @@ bool validateNv12Pair(NvBufSurface *src, NvBufSurface *dst, CudaNv12UndistorterR
     return true;
 }
 
-bool validateYuv422ToNv12Pair(NvBufSurface *src, NvBufSurface *dst, CudaNv12UndistorterResult *result)
+bool validateYuv422ToNv12Pair(NvBufSurface *src,
+                              NvBufSurface *dst,
+                              SourceFormat &source_format,
+                              CudaNv12UndistorterResult *result)
 {
     if (!src || !dst || src->numFilled == 0 || dst->numFilled == 0)
     {
@@ -213,18 +223,25 @@ bool validateYuv422ToNv12Pair(NvBufSurface *src, NvBufSurface *dst, CudaNv12Undi
     const auto &dst_sp = dst->surfaceList[0];
     const auto &src_pp = src_sp.planeParams;
     const auto &dst_pp = dst_sp.planeParams;
+    const bool planar_yuv422 = src_sp.colorFormat == NVBUF_COLOR_FORMAT_YUV422 &&
+                               src_pp.num_planes >= 3;
+    const bool packed_yuyv = src_sp.colorFormat == NVBUF_COLOR_FORMAT_YUYV &&
+                             src_pp.num_planes >= 1;
+
     if (src_sp.layout != NVBUF_LAYOUT_PITCH ||
         dst_sp.layout != NVBUF_LAYOUT_PITCH ||
-        src_sp.colorFormat != NVBUF_COLOR_FORMAT_YUV422 ||
+        (!planar_yuv422 && !packed_yuyv) ||
         dst_sp.colorFormat != NVBUF_COLOR_FORMAT_NV12 ||
-        src_pp.num_planes < 3 ||
         dst_pp.num_planes < 2 ||
         src_pp.width[0] != dst_pp.width[0] ||
-        src_pp.height[0] != dst_pp.height[0])
+        src_pp.height[0] != dst_pp.height[0] ||
+        (src_pp.width[0] & 1u) ||
+        (src_pp.height[0] & 1u))
     {
         setFailure(result, "validate-yuv422-format", -2);
         return false;
     }
+    source_format = packed_yuyv ? SourceFormat::kPackedYuyv : SourceFormat::kPlanarYuv422;
     return true;
 }
 
@@ -245,7 +262,7 @@ bool validateMappedFrames(const MappedEglFrame &src,
         src.frame.planeCount < expected_src_planes ||
         dst.frame.planeCount < 2 ||
         !src.frame.frame.pPitch[0] ||
-        !src.frame.frame.pPitch[1] ||
+        (src_planes >= 2 && !src.frame.frame.pPitch[1]) ||
         (src_planes >= 3 && !src.frame.frame.pPitch[2]) ||
         !dst.frame.frame.pPitch[0] ||
         !dst.frame.frame.pPitch[1])
@@ -309,6 +326,78 @@ __device__ __forceinline__ uint8_t bilinearNv12Chroma(const uint8_t *uv_plane,
     const float p10 = static_cast<float>(uv_plane[y0 * pitch + x1 * 2 + channel]);
     const float p01 = static_cast<float>(uv_plane[y1 * pitch + x0 * 2 + channel]);
     const float p11 = static_cast<float>(uv_plane[y1 * pitch + x1 * 2 + channel]);
+    const float top = p00 + (p10 - p00) * fx;
+    const float bot = p01 + (p11 - p01) * fx;
+    const float value = top + (bot - top) * fy;
+    return static_cast<uint8_t>(clampFloat(value + 0.5f, 0.0f, 255.0f));
+}
+
+__device__ __forceinline__ uint8_t yuyvLumaAt(const uint8_t *plane,
+                                              int pitch,
+                                              int x,
+                                              int y)
+{
+    const uint8_t *pair = plane + y * pitch + (x >> 1) * 4;
+    return (x & 1) ? pair[2] : pair[0];
+}
+
+__device__ __forceinline__ uint8_t yuyvChromaAt(const uint8_t *plane,
+                                                int pitch,
+                                                int chroma_x,
+                                                int y,
+                                                int channel)
+{
+    const uint8_t *pair = plane + y * pitch + chroma_x * 4;
+    return channel == 0 ? pair[1] : pair[3];
+}
+
+__device__ __forceinline__ uint8_t bilinearYuyvLuma(const uint8_t *plane,
+                                                    int pitch,
+                                                    int width,
+                                                    int height,
+                                                    float sx,
+                                                    float sy)
+{
+    sx = clampFloat(sx, 0.0f, static_cast<float>(width - 1));
+    sy = clampFloat(sy, 0.0f, static_cast<float>(height - 1));
+    const int x0 = static_cast<int>(floorf(sx));
+    const int y0 = static_cast<int>(floorf(sy));
+    const int x1 = min(x0 + 1, width - 1);
+    const int y1 = min(y0 + 1, height - 1);
+    const float fx = sx - static_cast<float>(x0);
+    const float fy = sy - static_cast<float>(y0);
+
+    const float p00 = static_cast<float>(yuyvLumaAt(plane, pitch, x0, y0));
+    const float p10 = static_cast<float>(yuyvLumaAt(plane, pitch, x1, y0));
+    const float p01 = static_cast<float>(yuyvLumaAt(plane, pitch, x0, y1));
+    const float p11 = static_cast<float>(yuyvLumaAt(plane, pitch, x1, y1));
+    const float top = p00 + (p10 - p00) * fx;
+    const float bot = p01 + (p11 - p01) * fx;
+    const float value = top + (bot - top) * fy;
+    return static_cast<uint8_t>(clampFloat(value + 0.5f, 0.0f, 255.0f));
+}
+
+__device__ __forceinline__ uint8_t bilinearYuyvChroma(const uint8_t *plane,
+                                                      int pitch,
+                                                      int chroma_width,
+                                                      int height,
+                                                      float sx,
+                                                      float sy,
+                                                      int channel)
+{
+    sx = clampFloat(sx, 0.0f, static_cast<float>(chroma_width - 1));
+    sy = clampFloat(sy, 0.0f, static_cast<float>(height - 1));
+    const int x0 = static_cast<int>(floorf(sx));
+    const int y0 = static_cast<int>(floorf(sy));
+    const int x1 = min(x0 + 1, chroma_width - 1);
+    const int y1 = min(y0 + 1, height - 1);
+    const float fx = sx - static_cast<float>(x0);
+    const float fy = sy - static_cast<float>(y0);
+
+    const float p00 = static_cast<float>(yuyvChromaAt(plane, pitch, x0, y0, channel));
+    const float p10 = static_cast<float>(yuyvChromaAt(plane, pitch, x1, y0, channel));
+    const float p01 = static_cast<float>(yuyvChromaAt(plane, pitch, x0, y1, channel));
+    const float p11 = static_cast<float>(yuyvChromaAt(plane, pitch, x1, y1, channel));
     const float top = p00 + (p10 - p00) * fx;
     const float bot = p01 + (p11 - p01) * fx;
     const float value = top + (bot - top) * fy;
@@ -409,6 +498,58 @@ __global__ void remapYuv422ToNv12UvKernel(const uint8_t *src_u,
     const uint8_t u1 = bilinearU8(src_u, src_u_pitch, src_chroma_width, height, chroma_sx, chroma_sy1);
     const uint8_t v0 = bilinearU8(src_v, src_v_pitch, src_chroma_width, height, chroma_sx, chroma_sy0);
     const uint8_t v1 = bilinearU8(src_v, src_v_pitch, src_chroma_width, height, chroma_sx, chroma_sy1);
+
+    uint8_t *dst = dst_uv + y * dst_pitch + x * 2;
+    dst[0] = static_cast<uint8_t>((static_cast<unsigned>(u0) + static_cast<unsigned>(u1) + 1u) >> 1);
+    dst[1] = static_cast<uint8_t>((static_cast<unsigned>(v0) + static_cast<unsigned>(v1) + 1u) >> 1);
+}
+
+__global__ void remapYuyvToNv12YKernel(const uint8_t *src_yuyv,
+                                       uint8_t *dst_y,
+                                       const float2 *map_xy,
+                                       int width,
+                                       int height,
+                                       int src_pitch,
+                                       int dst_pitch)
+{
+    const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= width || y >= height)
+    {
+        return;
+    }
+    const float2 src = map_xy[y * width + x];
+    dst_y[y * dst_pitch + x] = bilinearYuyvLuma(src_yuyv, src_pitch, width, height, src.x, src.y);
+}
+
+__global__ void remapYuyvToNv12UvKernel(const uint8_t *src_yuyv,
+                                        uint8_t *dst_uv,
+                                        const float2 *map_xy,
+                                        int width,
+                                        int height,
+                                        int src_pitch,
+                                        int dst_pitch)
+{
+    const int x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int y = static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y);
+    const int dst_chroma_width = width / 2;
+    const int dst_chroma_height = height / 2;
+    const int src_chroma_width = width / 2;
+    if (x >= dst_chroma_width || y >= dst_chroma_height)
+    {
+        return;
+    }
+
+    const int luma_x = min(x * 2, width - 1);
+    const int luma_y = min(y * 2, height - 1);
+    const float2 src = map_xy[luma_y * width + luma_x];
+    const float chroma_sx = src.x * 0.5f;
+    const float chroma_sy0 = src.y;
+    const float chroma_sy1 = clampFloat(src.y + 1.0f, 0.0f, static_cast<float>(height - 1));
+    const uint8_t u0 = bilinearYuyvChroma(src_yuyv, src_pitch, src_chroma_width, height, chroma_sx, chroma_sy0, 0);
+    const uint8_t u1 = bilinearYuyvChroma(src_yuyv, src_pitch, src_chroma_width, height, chroma_sx, chroma_sy1, 0);
+    const uint8_t v0 = bilinearYuyvChroma(src_yuyv, src_pitch, src_chroma_width, height, chroma_sx, chroma_sy0, 1);
+    const uint8_t v1 = bilinearYuyvChroma(src_yuyv, src_pitch, src_chroma_width, height, chroma_sx, chroma_sy1, 1);
 
     uint8_t *dst = dst_uv + y * dst_pitch + x * 2;
     dst[0] = static_cast<uint8_t>((static_cast<unsigned>(u0) + static_cast<unsigned>(u1) + 1u) >> 1);
@@ -519,7 +660,7 @@ public:
             return false;
         }
 
-        return remapCommon(src, dst, 2, false, result);
+        return remapCommon(src, dst, 2, SourceFormat::kNv12, result);
     }
 
     bool remapYuv422ToNv12(NvBufSurface *src, NvBufSurface *dst, CudaNv12UndistorterResult *result)
@@ -528,12 +669,14 @@ public:
         {
             *result = CudaNv12UndistorterResult{};
         }
-        if (!map_xy_device_ || !validateYuv422ToNv12Pair(src, dst, result) || !prepareOutput(dst, result))
+        SourceFormat source_format = SourceFormat::kPlanarYuv422;
+        if (!map_xy_device_ || !validateYuv422ToNv12Pair(src, dst, source_format, result) || !prepareOutput(dst, result))
         {
             return false;
         }
 
-        return remapCommon(src, dst, 3, true, result);
+        const int src_planes = source_format == SourceFormat::kPackedYuyv ? 1 : 3;
+        return remapCommon(src, dst, src_planes, source_format, result);
     }
 
     void reset()
@@ -567,7 +710,7 @@ private:
     bool remapCommon(NvBufSurface *src,
                      NvBufSurface *dst,
                      int src_planes,
-                     bool src_yuv422,
+                     SourceFormat source_format,
                      CudaNv12UndistorterResult *result)
     {
         auto *dst_frame = findOutput(dst);
@@ -590,9 +733,9 @@ private:
         if (mapped_ok)
         {
             const auto kernel_start = std::chrono::steady_clock::now();
-            kernel_ok = src_yuv422
-                ? launchYuv422(src, dst, src_frame, *dst_frame, result)
-                : launchNv12(src, dst, src_frame, *dst_frame, result);
+            kernel_ok = source_format == SourceFormat::kNv12
+                ? launchNv12(src, dst, src_frame, *dst_frame, result)
+                : launchYuv422(src, dst, src_frame, *dst_frame, source_format, result);
             const auto kernel_end = std::chrono::steady_clock::now();
             if (result)
             {
@@ -654,6 +797,7 @@ private:
                       NvBufSurface *dst,
                       const MappedEglFrame &src_frame,
                       const MappedEglFrame &dst_frame,
+                      SourceFormat source_format,
                       CudaNv12UndistorterResult *result)
     {
         const auto &src_pp = src->surfaceList[0].planeParams;
@@ -669,28 +813,56 @@ private:
         const dim3 y_block(32, 8);
         const dim3 y_grid((width + y_block.x - 1) / y_block.x,
                           (height + y_block.y - 1) / y_block.y);
-        remapYuv422ToNv12YKernel<<<y_grid, y_block, 0, stream_>>>(
-            static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
-            static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
-            map_xy_device_,
-            width,
-            height,
-            static_cast<int>(src_pp.pitch[0]),
-            static_cast<int>(dst_pp.pitch[0]));
+        if (source_format == SourceFormat::kPackedYuyv)
+        {
+            remapYuyvToNv12YKernel<<<y_grid, y_block, 0, stream_>>>(
+                static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
+                static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
+                map_xy_device_,
+                width,
+                height,
+                static_cast<int>(src_pp.pitch[0]),
+                static_cast<int>(dst_pp.pitch[0]));
+        }
+        else
+        {
+            remapYuv422ToNv12YKernel<<<y_grid, y_block, 0, stream_>>>(
+                static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
+                static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[0]),
+                map_xy_device_,
+                width,
+                height,
+                static_cast<int>(src_pp.pitch[0]),
+                static_cast<int>(dst_pp.pitch[0]));
+        }
 
         const dim3 uv_block(32, 8);
         const dim3 uv_grid(((width / 2) + uv_block.x - 1) / uv_block.x,
                            ((height / 2) + uv_block.y - 1) / uv_block.y);
-        remapYuv422ToNv12UvKernel<<<uv_grid, uv_block, 0, stream_>>>(
-            static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[1]),
-            static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[2]),
-            static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
-            map_xy_device_,
-            width,
-            height,
-            static_cast<int>(src_pp.pitch[1]),
-            static_cast<int>(src_pp.pitch[2]),
-            static_cast<int>(dst_pp.pitch[1]));
+        if (source_format == SourceFormat::kPackedYuyv)
+        {
+            remapYuyvToNv12UvKernel<<<uv_grid, uv_block, 0, stream_>>>(
+                static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[0]),
+                static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
+                map_xy_device_,
+                width,
+                height,
+                static_cast<int>(src_pp.pitch[0]),
+                static_cast<int>(dst_pp.pitch[1]));
+        }
+        else
+        {
+            remapYuv422ToNv12UvKernel<<<uv_grid, uv_block, 0, stream_>>>(
+                static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[1]),
+                static_cast<const uint8_t *>(src_frame.frame.frame.pPitch[2]),
+                static_cast<uint8_t *>(dst_frame.frame.frame.pPitch[1]),
+                map_xy_device_,
+                width,
+                height,
+                static_cast<int>(src_pp.pitch[1]),
+                static_cast<int>(src_pp.pitch[2]),
+                static_cast<int>(dst_pp.pitch[1]));
+        }
 
         return syncKernel(result);
     }

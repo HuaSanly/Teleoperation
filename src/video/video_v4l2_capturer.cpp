@@ -9,8 +9,24 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "nvbufsurface.h"
+
 namespace trb::video
 {
+    namespace
+    {
+        const char *memoryModeName(VideoV4L2Capturer::MemoryMode mode)
+        {
+            switch (mode)
+            {
+            case VideoV4L2Capturer::MemoryMode::kDmaBuf:
+                return "dmabuf";
+            case VideoV4L2Capturer::MemoryMode::kMmap:
+            default:
+                return "mmap";
+            }
+        }
+    }
 
     VideoV4L2Capturer::VideoV4L2Capturer() = default;
 
@@ -163,7 +179,9 @@ namespace trb::video
         struct v4l2_buffer v4l2_buf;
         memset(&v4l2_buf, 0, sizeof(v4l2_buf));
         v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        v4l2_buf.memory = V4L2_MEMORY_MMAP;
+        v4l2_buf.memory = (config_.memory_mode == MemoryMode::kDmaBuf)
+                               ? V4L2_MEMORY_DMABUF
+                               : V4L2_MEMORY_MMAP;
 
         {
             std::lock_guard<std::mutex> lk(ioctl_mutex_);
@@ -178,20 +196,37 @@ namespace trb::video
             }
         }
 
-        if (v4l2_buf.index >= buffers_.size() || buffers_[v4l2_buf.index].start == nullptr)
+        if (v4l2_buf.index >= buffers_.size())
         {
             std::cerr << "VIDIOC_DQBUF returned invalid index=" << v4l2_buf.index
                       << " (buffers=" << buffers_.size() << ")" << std::endl;
             return false;
         }
 
+        const auto &buffer = buffers_[v4l2_buf.index];
+        if ((config_.memory_mode == MemoryMode::kMmap && buffer.start == nullptr) ||
+            (config_.memory_mode == MemoryMode::kDmaBuf && buffer.dmabuf_fd < 0))
+        {
+            std::cerr << "VIDIOC_DQBUF returned uninitialized buffer index=" << v4l2_buf.index << std::endl;
+            return false;
+        }
+
         frame.v4l2_buf = v4l2_buf;
-        frame.data = static_cast<const uint8_t *>(buffers_[v4l2_buf.index].start);
+        frame.data = (config_.memory_mode == MemoryMode::kMmap)
+                         ? static_cast<const uint8_t *>(buffer.start)
+                         : nullptr;
         frame.size = static_cast<size_t>(v4l2_buf.bytesused);
+        frame.dmabuf_fd = (config_.memory_mode == MemoryMode::kDmaBuf)
+                              ? buffer.dmabuf_fd
+                              : -1;
+        if (config_.memory_mode == MemoryMode::kDmaBuf && frame.size == 0)
+        {
+            frame.size = buffer.length;
+        }
         frame.timestamp_us = static_cast<uint64_t>(v4l2_buf.timestamp.tv_sec) * 1000000ULL +
                              static_cast<uint64_t>(v4l2_buf.timestamp.tv_usec);
 
-        return frame.data != nullptr && frame.size != 0;
+        return (frame.data != nullptr || frame.dmabuf_fd >= 0) && frame.size != 0;
     }
 
     bool VideoV4L2Capturer::requeue(const struct v4l2_buffer &v4l2_buf)
@@ -201,7 +236,20 @@ namespace trb::video
 
         struct v4l2_buffer buf = v4l2_buf;
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.memory = (config_.memory_mode == MemoryMode::kDmaBuf)
+                         ? V4L2_MEMORY_DMABUF
+                         : V4L2_MEMORY_MMAP;
+        if (config_.memory_mode == MemoryMode::kDmaBuf)
+        {
+            if (buf.index >= buffers_.size() || buffers_[buf.index].dmabuf_fd < 0)
+            {
+                std::cerr << "VIDIOC_QBUF invalid dmabuf index=" << buf.index << std::endl;
+                return false;
+            }
+            buf.m.fd = buffers_[buf.index].dmabuf_fd;
+            buf.length = buffers_[buf.index].length;
+            buf.bytesused = 0;
+        }
 
         std::lock_guard<std::mutex> lk(ioctl_mutex_);
         if (ioctl(cam_fd_, VIDIOC_QBUF, &buf) < 0)
@@ -257,6 +305,7 @@ namespace trb::video
         std::cerr << "VideoV4L2Capturer negotiated format: "
               << actual_width_ << "x" << actual_height_
               << " pixfmt=0x" << std::hex << actual_pixel_format_ << std::dec
+              << " memory=" << memoryModeName(config_.memory_mode)
               << std::endl;
 
         // best-effort set framerate
@@ -282,6 +331,21 @@ namespace trb::video
             return true;
 
         const uint32_t count = (config_.buffer_count == 0) ? 4 : config_.buffer_count;
+
+        if (config_.memory_mode == MemoryMode::kDmaBuf)
+        {
+            return requestDmaBufBuffers(count);
+        }
+
+        return requestMmapBuffers(count);
+    }
+
+    bool VideoV4L2Capturer::requestMmapBuffers(uint32_t count)
+    {
+        if (count == 0)
+        {
+            count = 4;
+        }
 
         struct v4l2_requestbuffers rb;
         memset(&rb, 0, sizeof(rb));
@@ -336,6 +400,92 @@ namespace trb::video
         return true;
     }
 
+    bool VideoV4L2Capturer::requestDmaBufBuffers(uint32_t count)
+    {
+        if (count == 0)
+        {
+            count = 4;
+        }
+
+        if (actual_pixel_format_ != V4L2_PIX_FMT_YUYV)
+        {
+            std::cerr << "DMABUF capture is only supported for negotiated YUYV; actual pixfmt=0x"
+                      << std::hex << actual_pixel_format_ << std::dec << std::endl;
+            return false;
+        }
+
+        struct v4l2_requestbuffers rb;
+        memset(&rb, 0, sizeof(rb));
+        rb.count = count;
+        rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        rb.memory = V4L2_MEMORY_DMABUF;
+
+        if (ioctl(cam_fd_, VIDIOC_REQBUFS, &rb) < 0)
+        {
+            std::cerr << "VIDIOC_REQBUFS DMABUF failed: " << strerror(errno) << " (" << errno << ")" << std::endl;
+            return false;
+        }
+
+        if (rb.count == 0)
+        {
+            std::cerr << "Driver returned 0 DMABUF buffers" << std::endl;
+            return false;
+        }
+
+        buffers_.resize(rb.count);
+
+        for (uint32_t index = 0; index < rb.count; ++index)
+        {
+            NvBufSurfaceCreateParams params;
+            memset(&params, 0, sizeof(params));
+            params.gpuId = 0;
+            params.width = actual_width_;
+            params.height = actual_height_;
+            params.layout = NVBUF_LAYOUT_PITCH;
+            params.colorFormat = NVBUF_COLOR_FORMAT_YUYV;
+            params.memType = NVBUF_MEM_SURFACE_ARRAY;
+            params.isContiguous = true;
+
+            NvBufSurface *surface = nullptr;
+            if (NvBufSurfaceCreate(&surface, 1, &params) != 0 || !surface)
+            {
+                std::cerr << "NvBufSurfaceCreate YUYV capture buffer failed at index=" << index << std::endl;
+                return false;
+            }
+            surface->numFilled = 1;
+
+            buffers_[index].surface = surface;
+            buffers_[index].dmabuf_fd = static_cast<int>(surface->surfaceList[0].bufferDesc);
+            buffers_[index].length = surface->surfaceList[0].dataSize;
+
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.index = index;
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_DMABUF;
+            buf.m.fd = buffers_[index].dmabuf_fd;
+            buf.length = buffers_[index].length;
+
+            // Some UVC drivers require QUERYBUF with the imported fd before QBUF.
+            (void)ioctl(cam_fd_, VIDIOC_QUERYBUF, &buf);
+
+            memset(&buf, 0, sizeof(buf));
+            buf.index = index;
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_DMABUF;
+            buf.m.fd = buffers_[index].dmabuf_fd;
+            buf.length = buffers_[index].length;
+
+            if (ioctl(cam_fd_, VIDIOC_QBUF, &buf) < 0)
+            {
+                std::cerr << "VIDIOC_QBUF DMABUF failed: " << strerror(errno) << " (" << errno << ")" << std::endl;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool VideoV4L2Capturer::streamOn()
     {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -359,12 +509,28 @@ namespace trb::video
 
     void VideoV4L2Capturer::closeDevice()
     {
+        if (cam_fd_ >= 0 && !buffers_.empty())
+        {
+            struct v4l2_requestbuffers rb;
+            memset(&rb, 0, sizeof(rb));
+            rb.count = 0;
+            rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            rb.memory = (config_.memory_mode == MemoryMode::kDmaBuf)
+                            ? V4L2_MEMORY_DMABUF
+                            : V4L2_MEMORY_MMAP;
+            (void)ioctl(cam_fd_, VIDIOC_REQBUFS, &rb);
+        }
+
         for (auto &b : buffers_)
         {
             if (b.start && b.start != MAP_FAILED)
                 munmap(b.start, b.length);
+            if (b.surface)
+                NvBufSurfaceDestroy(reinterpret_cast<NvBufSurface *>(b.surface));
             b.start = nullptr;
             b.length = 0;
+            b.surface = nullptr;
+            b.dmabuf_fd = -1;
         }
         buffers_.clear();
 
