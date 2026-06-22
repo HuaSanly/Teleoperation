@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <shared_mutex>
 #include <map>
 #include <atomic>
 #include <fcntl.h>
@@ -490,12 +491,14 @@ namespace trb::video
 
     void VideoEncoder::shutdown()
     {
+        shutting_down_.store(true, std::memory_order_release);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
         if (!encoder_)
         {
             return;
         }
 
-        drainInputDone();
+        (void)encoder_->abort();
 
         {
             std::lock_guard<std::mutex> lk(input_done_callback_mutex_);
@@ -505,11 +508,6 @@ namespace trb::video
             std::lock_guard<std::mutex> lk(sps_pps_mutex_);
             sps_pps_callback_ = nullptr;
         }
-
-        (void)encoder_->capture_plane.setStreamStatus(false);
-        (void)encoder_->output_plane.setStreamStatus(false);
-        encoder_->capture_plane.deinitPlane();
-        encoder_->output_plane.deinitPlane();
 
         {
             std::lock_guard<std::mutex> lk(map_mutex_);
@@ -534,7 +532,9 @@ namespace trb::video
 
     bool VideoEncoder::initialize(const Config &config)
     {
+        std::unique_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
         config_ = config;
+        shutting_down_.store(false, std::memory_order_release);
         const bool is_h265 = (config_.codec == Codec::kH265);
 
         // O_NONBLOCK makes NvV4l2Element::dqBuffer's num_retries argument act as
@@ -861,6 +861,9 @@ namespace trb::video
 
     bool VideoEncoder::submit(int dmabuf_fd, uint64_t timestamp_us)
     {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
+        if (shutting_down_.load(std::memory_order_acquire))
+            return false;
         if (!encoder_)
             return false;
 
@@ -1001,6 +1004,9 @@ namespace trb::video
 
     void VideoEncoder::drainInputDone()
     {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
+        if (shutting_down_.load(std::memory_order_acquire))
+            return;
         if (!encoder_)
             return;
 
@@ -1050,6 +1056,9 @@ namespace trb::video
 
     bool VideoEncoder::dequeueOne(EncodedPacket &out, int timeout_ms)
     {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
+        if (shutting_down_.load(std::memory_order_acquire))
+            return false;
         if (!encoder_)
             return false;
 
@@ -1160,13 +1169,33 @@ namespace trb::video
         out.keyframe       = keyframe;
         out._cap_buf_index = v4l2_buf.index;
         out._nvbuf         = buf;
+        out._lifecycle_lock = std::move(lifecycle_lock);
         return true;
     }
 
     void VideoEncoder::releaseCapture(EncodedPacket &pkt)
     {
-        if (!encoder_ || !pkt._nvbuf)
+        std::shared_lock<std::shared_mutex> lifecycle_lock;
+        if (!pkt._lifecycle_lock.owns_lock())
+        {
+            lifecycle_lock = std::shared_lock<std::shared_mutex>(encoder_lifecycle_mutex_);
+        }
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            pkt.data   = nullptr;
+            pkt.size   = 0;
+            pkt._nvbuf = nullptr;
+            pkt._lifecycle_lock = {};
             return;
+        }
+        if (!encoder_ || !pkt._nvbuf)
+        {
+            pkt.data   = nullptr;
+            pkt.size   = 0;
+            pkt._nvbuf = nullptr;
+            pkt._lifecycle_lock = {};
+            return;
+        }
 
         struct v4l2_buffer v4l2_buf;
         struct v4l2_plane  planes[MAX_PLANES];
@@ -1183,10 +1212,16 @@ namespace trb::video
         pkt.data   = nullptr;
         pkt.size   = 0;
         pkt._nvbuf = nullptr;
+        pkt._lifecycle_lock = {};
     }
 
     bool VideoEncoder::forceIDR()
     {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
         if (!encoder_)
         {
             return false;
@@ -1269,6 +1304,11 @@ namespace trb::video
 
     bool VideoEncoder::setBitrate(uint32_t bitrate_bps)
     {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(encoder_lifecycle_mutex_);
+        if (shutting_down_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
         if (!encoder_ || bitrate_bps == 0)
         {
             return false;

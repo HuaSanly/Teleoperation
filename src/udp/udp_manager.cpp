@@ -146,8 +146,12 @@ namespace trb::udp
         }
 
         send_queue_.setLimits(config_.queue_max_packets, config_.queue_max_bytes);
-        webrtc_like_pacer_.setConfig(makeWebRtcLikePacerConfig(config_));
-        webrtc_like_pacer_.reset();
+        {
+            std::lock_guard<std::mutex> lock(pacing_mutex_);
+            pacer_.reset();
+            webrtc_like_pacer_.setConfig(makeWebRtcLikePacerConfig(config_));
+            webrtc_like_pacer_.reset();
+        }
 
         control_.start(
             [this](const std::string &message) {
@@ -235,7 +239,11 @@ namespace trb::udp
             input_queue_.clear();
         }
         send_queue_.clear();
-        webrtc_like_pacer_.reset();
+        {
+            std::lock_guard<std::mutex> lock(pacing_mutex_);
+            pacer_.reset();
+            webrtc_like_pacer_.reset();
+        }
         control_.resetHandshake();
         packet_seq_num_.store(0);
         frame_id_.store(0);
@@ -253,12 +261,14 @@ namespace trb::udp
 
     void UdpManager::setPacingEnabled(bool enabled)
     {
+        std::lock_guard<std::mutex> lock(pacing_mutex_);
         config_.pacing_enabled = enabled;
         webrtc_like_pacer_.setConfig(makeWebRtcLikePacerConfig(config_));
     }
 
     void UdpManager::setPacingRateBps(uint64_t bps)
     {
+        std::lock_guard<std::mutex> lock(pacing_mutex_);
         config_.pacing_bps = bps;
         webrtc_like_pacer_.setConfig(makeWebRtcLikePacerConfig(config_));
     }
@@ -695,8 +705,11 @@ namespace trb::udp
 
     void UdpManager::sendThreadMain()
     {
-        pacer_.reset();
-        webrtc_like_pacer_.reset();
+        {
+            std::lock_guard<std::mutex> lock(pacing_mutex_);
+            pacer_.reset();
+            webrtc_like_pacer_.reset();
+        }
         static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
         struct FrameStats
@@ -856,7 +869,10 @@ namespace trb::udp
                 }
 
                 const auto pace_start = std::chrono::steady_clock::now();
-                pacer_.pace(item.wire_bytes, config_.pacing_enabled, config_.pacing_bps);
+                {
+                    std::lock_guard<std::mutex> lock(pacing_mutex_);
+                    pacer_.pace(item.wire_bytes, config_.pacing_enabled, config_.pacing_bps);
+                }
                 const auto pace_end = std::chrono::steady_clock::now();
                 const uint64_t pacing_us = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(pace_end - pace_start).count());
@@ -880,10 +896,15 @@ namespace trb::udp
             }
 
             auto queue_status = send_queue_.status();
-            const bool next_packet_accounted = next_meta.pacing_accounted && config_.pacing_enabled;
+            bool next_packet_accounted = next_meta.pacing_accounted;
             const auto wait_start = std::chrono::steady_clock::now();
-            const auto wait_for = webrtc_like_pacer_.timeUntilNextSend(queue_status.bytes, next_packet_accounted, wait_start);
-            update_pacer_stats(queue_status.bytes);
+            std::chrono::microseconds wait_for{0};
+            {
+                std::lock_guard<std::mutex> lock(pacing_mutex_);
+                next_packet_accounted = next_packet_accounted && config_.pacing_enabled;
+                wait_for = webrtc_like_pacer_.timeUntilNextSend(queue_status.bytes, next_packet_accounted, wait_start);
+                update_pacer_stats(queue_status.bytes);
+            }
             if (wait_for.count() > 0)
             {
                 send_queue_.waitForDataFor(wait_for);
@@ -908,7 +929,7 @@ namespace trb::udp
 
                 const QueueItem::Stream item_stream = item.stream;
                 const size_t item_wire_bytes = item.wire_bytes;
-                const bool item_pacing_accounted = item.pacing_accounted && config_.pacing_enabled;
+                bool item_pacing_accounted = item.pacing_accounted;
                 const uint64_t pacing_us = item_stream == QueueItem::Stream::Video ? pending_video_pacing_us : 0;
                 send_would_block = false;
                 const SendAttemptResult send_result = handle_queue_item(item, pacing_us);
@@ -918,10 +939,13 @@ namespace trb::udp
                     // and let the queue's backlog/capacity policy decide what to evict.
                     send_queue_.requeueFront(std::move(item));
                     queue_status = send_queue_.status();
-                    webrtc_like_pacer_.onBlocked(item_wire_bytes,
-                                                 queue_status.bytes,
-                                                 std::chrono::steady_clock::now());
-                    update_pacer_stats(queue_status.bytes);
+                    {
+                        std::lock_guard<std::mutex> lock(pacing_mutex_);
+                        webrtc_like_pacer_.onBlocked(item_wire_bytes,
+                                                     queue_status.bytes,
+                                                     std::chrono::steady_clock::now());
+                        update_pacer_stats(queue_status.bytes);
+                    }
                     send_would_block = true;
                 }
                 if (item_stream == QueueItem::Stream::Video)
@@ -932,11 +956,15 @@ namespace trb::udp
                 if (send_result == SendAttemptResult::kSent)
                 {
                     queue_status = send_queue_.status();
-                    webrtc_like_pacer_.onPacketSent(item_wire_bytes,
-                                                    item_pacing_accounted,
-                                                    queue_status.bytes,
-                                                    std::chrono::steady_clock::now());
-                    update_pacer_stats(queue_status.bytes);
+                    {
+                        std::lock_guard<std::mutex> lock(pacing_mutex_);
+                        item_pacing_accounted = item_pacing_accounted && config_.pacing_enabled;
+                        webrtc_like_pacer_.onPacketSent(item_wire_bytes,
+                                                        item_pacing_accounted,
+                                                        queue_status.bytes,
+                                                        std::chrono::steady_clock::now());
+                        update_pacer_stats(queue_status.bytes);
+                    }
                 }
 
                 SendQueue::ItemMeta following_meta;
@@ -949,10 +977,15 @@ namespace trb::udp
                     break;
                 }
                 queue_status = send_queue_.status();
-                const bool following_accounted = following_meta.pacing_accounted && config_.pacing_enabled;
-                const auto next_wait = webrtc_like_pacer_.timeUntilNextSend(queue_status.bytes, following_accounted,
-                                                                           std::chrono::steady_clock::now());
-                update_pacer_stats(queue_status.bytes);
+                bool following_accounted = following_meta.pacing_accounted;
+                std::chrono::microseconds next_wait{0};
+                {
+                    std::lock_guard<std::mutex> lock(pacing_mutex_);
+                    following_accounted = following_accounted && config_.pacing_enabled;
+                    next_wait = webrtc_like_pacer_.timeUntilNextSend(queue_status.bytes, following_accounted,
+                                                                     std::chrono::steady_clock::now());
+                    update_pacer_stats(queue_status.bytes);
+                }
                 if (next_wait.count() > 0)
                 {
                     break;

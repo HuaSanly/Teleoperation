@@ -42,10 +42,13 @@ namespace trb::udp
 
     void SendQueue::clear()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.clear();
-        queue_bytes_ = 0;
-        protected_video_group_id_ = kNoProtectedVideoGroup;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.clear();
+            queue_bytes_ = 0;
+            protected_video_group_id_ = kNoProtectedVideoGroup;
+        }
+        cv_.notify_all();
     }
 
     void SendQueue::setProtectedVideoGroup(uint32_t group_id)

@@ -155,6 +155,7 @@ namespace trb::udp
         WebRtcLikePacer webrtc_like_pacer_;
         ControlPlane control_;
         std::unique_ptr<IFecEncoder> fec_encoder_;
+        std::mutex pacing_mutex_;
 
         std::thread recv_thread_;
         std::thread send_thread_;

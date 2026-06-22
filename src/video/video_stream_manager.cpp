@@ -159,6 +159,7 @@ namespace trb::video
                 RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"),
                              "VideoStreamManager: refusing to join current thread '%s'",
                              name);
+                thread.detach();
                 return;
             }
             thread.join();
@@ -655,7 +656,10 @@ namespace trb::video
                 return false;
             }
 
-            restart_supervisor_thread_ = std::thread(&Impl::restartSupervisorThreadMain, this);
+            assignWorkerThread(restart_supervisor_thread_,
+                               std::thread(&Impl::restartSupervisorThreadMain, this),
+                               "restart_supervisor",
+                               false);
             return true;
         }
 
@@ -671,7 +675,7 @@ namespace trb::video
                 restart_reason_.clear();
             }
             restart_cv_.notify_all();
-            joinThread(restart_supervisor_thread_, "restart_supervisor");
+            joinWorkerThread(restart_supervisor_thread_, "restart_supervisor");
             stopPipeline();
         }
 
@@ -786,11 +790,11 @@ namespace trb::video
 
             // Start encode pipeline (V4L2 DQ + MJPEG decode + convert + encode)
             // and optional eye-image thread.
-            encode_thread_ = std::thread(&Impl::encodeThreadMain, this);
+            assignWorkerThread(encode_thread_, std::thread(&Impl::encodeThreadMain, this), "encode", true);
 
             if (eye_image_enabled_)
             {
-                eye_image_thread_ = std::thread(&Impl::eyeImageThreadMain, this);
+                assignWorkerThread(eye_image_thread_, std::thread(&Impl::eyeImageThreadMain, this), "eye_image", true);
                 RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
                             "VideoStreamManager: Started with zero-copy eye_image pipeline (max_fps=%d)",
                             eye_image_max_fps_);
@@ -806,6 +810,8 @@ namespace trb::video
 
         void stopPipeline()
         {
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "VideoStreamManager: stopping video pipeline");
             pipeline_running_.store(false, std::memory_order_release);
 
             if (capturer_)
@@ -821,17 +827,19 @@ namespace trb::video
                 nv12_queue_cv_.notify_all();
             }
 
-            joinThread(capture_thread_, "capture");
-            joinThread(encode_thread_, "encode");
+            joinWorkerThread(capture_thread_, "capture");
+            joinWorkerThread(encode_thread_, "encode");
             if (capturer_)
             {
                 // encode_thread_ owns pipeline startup and may have spawned the
                 // capture thread after the first join attempt during a fast stop.
                 capturer_->interrupt();
             }
-            joinThread(capture_thread_, "capture");
-            joinThread(encoder_dq_thread_, "encoder_dq");
-            joinThread(eye_image_thread_, "eye_image");
+            joinWorkerThread(capture_thread_, "capture");
+            joinWorkerThread(encoder_dq_thread_, "encoder_dq");
+            joinWorkerThread(eye_image_thread_, "eye_image");
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "VideoStreamManager: video worker threads stopped");
 
             {
                 std::lock_guard<std::mutex> lk(nv12_queue_mutex_);
@@ -848,6 +856,13 @@ namespace trb::video
                 }
             };
             const bool leak_gpu_objects = !rclcpp::ok();
+            // Jetson NvBufSurface/CUDA/NvJPEG objects can still be referenced by
+            // driver-side teardown shortly after STREAMOFF/NVENC abort. Destroying
+            // them during in-process unpair has been observed to segfault after the
+            // capturer is stopped. Keep these pool owners alive until process exit;
+            // the next pairing creates a fresh pipeline while the OS reclaims the
+            // retired GPU resources when the process terminates.
+            constexpr bool retire_nvbuf_pipeline_objects = true;
 
             std::shared_ptr<trb::video::VideoEncoder> encoder_to_stop;
             {
@@ -858,8 +873,12 @@ namespace trb::video
             }
             if (encoder_to_stop)
             {
+                RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "VideoStreamManager: stopping encoder");
                 encoder_to_stop->shutdown();
                 encoder_to_stop.reset();
+                RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                            "VideoStreamManager: encoder stopped");
             }
 
             {
@@ -876,24 +895,30 @@ namespace trb::video
                 }
                 encoder_pending_frames_by_fd_.clear();
             }
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "VideoStreamManager: encoder pending frames cleared");
 
             {
                 std::shared_ptr<trb::video::VideoV4L2Capturer> capturer_to_stop;
                 capturer_to_stop = std::move(capturer_);
                 if (capturer_to_stop)
                 {
+                    RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                "VideoStreamManager: stopping capturer");
                     capturer_to_stop->stop();
-                    if (leak_gpu_objects)
+                    if (leak_gpu_objects || retire_nvbuf_pipeline_objects)
                     {
                         leak_shared(capturer_to_stop);
                     }
+                    RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                                "VideoStreamManager: capturer stopped");
                 }
             }
 
             {
-                // Jetson NVBUF-backed destructors still race during global ROS
-                // shutdown. For ordinary in-process stops (unpair/re-pair), all
-                // worker threads have exited, so release in a deterministic order.
+                // These components own NvBufSurface/CUDA/NvJPEG pools. On Jetson,
+                // immediate destruction after STREAMOFF/NVENC abort can race with
+                // driver teardown, so the normal in-process stop path retires them.
                 std::shared_ptr<trb::video::VideoDecoder> decoder_to_release;
                 std::shared_ptr<trb::video::VideoUndistorter> undistorter_to_release;
                 std::shared_ptr<trb::video::VideoConverter> converter_to_release;
@@ -907,7 +932,7 @@ namespace trb::video
                         converter_to_release = std::move(converter_);
                     }
 
-                    if (leak_gpu_objects)
+                    if (leak_gpu_objects || retire_nvbuf_pipeline_objects)
                     {
                         leak_shared(decoder_to_release);
                         leak_shared(undistorter_to_release);
@@ -921,6 +946,10 @@ namespace trb::video
                     }
                 }
             }
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        retire_nvbuf_pipeline_objects
+                            ? "VideoStreamManager: video components retired"
+                            : "VideoStreamManager: video components released");
 
             {
                 std::shared_ptr<trb::video::EyeImagePublisher> eye_image_publisher_to_release;
@@ -943,11 +972,14 @@ namespace trb::video
                 std::lock_guard<std::mutex> lk(enc_timing_mutex_);
                 enc_start_steady_us_by_ts_.clear();
             }
+            RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"),
+                        "VideoStreamManager: video pipeline stopped");
         }
 
         void requestPipelineRestart(const std::string &reason)
         {
-            if (!running_.load(std::memory_order_acquire))
+            if (!running_.load(std::memory_order_acquire) ||
+                !pipeline_running_.load(std::memory_order_acquire))
             {
                 return;
             }
@@ -1123,9 +1155,28 @@ namespace trb::video
 
         void encodeThreadMain()
         {
-            if (!initializePostprocess() || !initializeEncoder())
+            if (!initializePostprocess())
             {
-                requestPipelineRestart("encode_pipeline_init_failed");
+                if (pipeline_running_.load(std::memory_order_acquire))
+                {
+                    requestPipelineRestart("encode_pipeline_init_failed");
+                }
+                return;
+            }
+            if (!pipeline_running_.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            if (!initializeEncoder())
+            {
+                if (pipeline_running_.load(std::memory_order_acquire))
+                {
+                    requestPipelineRestart("encode_pipeline_init_failed");
+                }
+                return;
+            }
+            if (!pipeline_running_.load(std::memory_order_acquire))
+            {
                 return;
             }
 
@@ -1138,6 +1189,10 @@ namespace trb::video
                     decoder_.reset();
                 }
             }
+            if (!pipeline_running_.load(std::memory_order_acquire))
+            {
+                return;
+            }
 
             // Once the pipeline is up, spawn the capture thread that pumps
             // MJPEG frames from V4L2 into the decoder, and the dedicated
@@ -1148,13 +1203,16 @@ namespace trb::video
             {
                 if (!yuyv_direct_enabled_)
                 {
-                    capture_thread_ = std::thread(&Impl::captureThreadMain, this);
+                    assignWorkerThread(capture_thread_, std::thread(&Impl::captureThreadMain, this), "capture", true);
                 }
-                encoder_dq_thread_ = std::thread(&Impl::encoderDqThreadMain, this);
+                assignWorkerThread(encoder_dq_thread_, std::thread(&Impl::encoderDqThreadMain, this), "encoder_dq", true);
             }
             else
             {
-                requestPipelineRestart("encode_pipeline_init_failed");
+                if (pipeline_running_.load(std::memory_order_acquire))
+                {
+                    requestPipelineRestart("encode_pipeline_init_failed");
+                }
                 return;
             }
 
@@ -1304,6 +1362,10 @@ namespace trb::video
         // blocking the encode pipeline on camera frame arrival.
         void captureThreadMain()
         {
+            if (!pipeline_running_.load(std::memory_order_acquire))
+            {
+                return;
+            }
             if (!capturer_ || !capturer_->start())
             {
                 RCLCPP_ERROR(rclcpp::get_logger("teleop_robot_bridge.video"), "Failed to start V4L2 capturer");
@@ -1461,6 +1523,10 @@ namespace trb::video
         // Responsibility: Receive NV12 fd from encode thread, CUDA crop/scale/RGB, publish ROS images.
         void eyeImageThreadMain()
         {
+            if (!pipeline_running_.load(std::memory_order_acquire))
+            {
+                return;
+            }
             RCLCPP_INFO(rclcpp::get_logger("teleop_robot_bridge.video"), "[EYE_IMAGE] Thread started (CUDA shared fd mode)");
 
             // Initialize eye image publisher (no independent decoder)
@@ -1844,6 +1910,43 @@ namespace trb::video
             nv12_queue_cv_.notify_one();
         }
 
+        void assignWorkerThread(std::thread &slot, std::thread thread, const char *name, bool require_pipeline_running)
+        {
+            std::thread previous;
+            std::thread rejected;
+            {
+                std::lock_guard<std::mutex> lk(worker_thread_mutex_);
+                if (slot.joinable())
+                {
+                    previous = std::move(slot);
+                }
+                if (!require_pipeline_running || pipeline_running_.load(std::memory_order_acquire))
+                {
+                    slot = std::move(thread);
+                }
+                else
+                {
+                    rejected = std::move(thread);
+                }
+            }
+            joinThread(previous, name);
+            joinThread(rejected, name);
+        }
+
+        void joinWorkerThread(std::thread &slot, const char *name)
+        {
+            std::thread thread;
+            {
+                std::lock_guard<std::mutex> lk(worker_thread_mutex_);
+                if (!slot.joinable())
+                {
+                    return;
+                }
+                thread = std::move(slot);
+            }
+            joinThread(thread, name);
+        }
+
     private:
         rclcpp::Node &nh_;
 
@@ -1943,6 +2046,7 @@ namespace trb::video
         std::string restart_reason_;
 
         // Worker threads
+        std::mutex worker_thread_mutex_;
         std::thread encode_thread_;
         std::thread capture_thread_;
         std::thread encoder_dq_thread_;

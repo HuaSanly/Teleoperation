@@ -6,6 +6,7 @@
 #include <deque>
 #include <queue>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #include <map>
 #include <cstdint>
@@ -96,6 +97,7 @@ namespace trb::video
             // Internal bookkeeping \u2013 do not modify.
             uint32_t  _cap_buf_index{0};
             NvBuffer* _nvbuf{nullptr};
+            std::shared_lock<std::shared_mutex> _lifecycle_lock;
         };
 
         using InputDoneCallback = std::function<void(int dmabuf_fd)>;
@@ -154,6 +156,11 @@ namespace trb::video
         std::vector<uint8_t> cached_pps_;
         std::vector<uint8_t> cached_vps_;  // H.265 only
         std::mutex sps_pps_mutex_;
+
+        // Guards the lifetime of encoder_ against teardown while encode/DQ
+        // worker threads are still making short-lived NvVideoEncoder calls.
+        mutable std::shared_mutex encoder_lifecycle_mutex_;
+        std::atomic<bool> shutting_down_{false};
         std::unique_ptr<NvVideoEncoder> encoder_;
 
         std::mutex input_mutex_;
