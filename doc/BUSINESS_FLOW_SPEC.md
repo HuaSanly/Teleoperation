@@ -275,9 +275,13 @@ Pose UDP socket bind
        teleop/controller/right_joy
        teleop/pose/joint24
        teleop/pose/joint24_valid_mask
+       teleop/pose/joint24_waist
+       teleop/pose/joint24_waist_valid_mask
 ```
 
 姿态输入应作为独立输入流，不应依赖视频流是否正常。
+
+`teleop/pose/joint24` 发布 VR 侧发来的原始 24 关节数据；`teleop/pose/joint24_waist` 由机器人端接收逻辑基于 `Pelvis` 本地转换得到。
 
 ## 12. 发送调度业务规则
 

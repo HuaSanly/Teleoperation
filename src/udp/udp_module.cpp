@@ -132,6 +132,7 @@ namespace trb::udp
         pose.recv_timeout_ms = declareOrGet<int>(node, "pose_udp.recv_timeout_ms", udp.recv_timeout_ms);
         pose.qos_depth = declareOrGet<int>(node, "pose_udp.qos.depth", 10);
         pose.frame_id_waist = declareOrGet<std::string>(node, "udp.pose_udp.frame_id.waist", declareOrGet<std::string>(node, "pose_udp.frame_id.waist", "vr_waist"));
+        pose.frame_id_joint24 = declareOrGet<std::string>(node, "udp.pose_udp.frame_id.joint24", declareOrGet<std::string>(node, "pose_udp.frame_id.joint24", "vr_tracking"));
         pose.frame_id_hmd = declareOrGet<std::string>(node, "udp.pose_udp.frame_id.hmd", declareOrGet<std::string>(node, "pose_udp.frame_id.hmd", "vr_hmd"));
         pose.frame_id_left_controller = declareOrGet<std::string>(node, "udp.pose_udp.frame_id.left_controller", declareOrGet<std::string>(node, "pose_udp.frame_id.left_controller", "vr_left_controller"));
         pose.frame_id_right_controller = declareOrGet<std::string>(node, "udp.pose_udp.frame_id.right_controller", declareOrGet<std::string>(node, "pose_udp.frame_id.right_controller", "vr_right_controller"));

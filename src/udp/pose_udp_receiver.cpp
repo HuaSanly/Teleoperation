@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 
 namespace trb::udp
@@ -38,6 +39,24 @@ namespace trb::udp
 
         constexpr uint8_t kSensorEntryCount = 3;
         constexpr uint8_t kJointCount = 24;
+        constexpr uint32_t kJointMaskAll = (1u << kJointCount) - 1u;
+        constexpr double kQuatNormEpsilon = 1e-8;
+
+        struct Vec3
+        {
+            double x{0.0};
+            double y{0.0};
+            double z{0.0};
+        };
+
+        struct Quat
+        {
+            double x{0.0};
+            double y{0.0};
+            double z{0.0};
+            double w{1.0};
+        };
+
         uint16_t readLeU16(const uint8_t *p)
         {
             return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 0) |
@@ -129,6 +148,89 @@ namespace trb::udp
             return pose;
         }
 
+        geometry_msgs::msg::Pose makeIdentityPose()
+        {
+            return makePose(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        bool isFinite(double value)
+        {
+            return std::isfinite(value);
+        }
+
+        bool normalizeQuat(Quat &q)
+        {
+            const double norm_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+            if (!isFinite(norm_sq) || norm_sq < kQuatNormEpsilon)
+            {
+                return false;
+            }
+            const double inv_norm = 1.0 / std::sqrt(norm_sq);
+            q.x *= inv_norm;
+            q.y *= inv_norm;
+            q.z *= inv_norm;
+            q.w *= inv_norm;
+            return true;
+        }
+
+        Quat conjugateQuat(const Quat &q)
+        {
+            return Quat{-q.x, -q.y, -q.z, q.w};
+        }
+
+        Quat multiplyQuat(const Quat &a, const Quat &b)
+        {
+            return Quat{
+                a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+            };
+        }
+
+        Vec3 rotateVector(const Quat &q, const Vec3 &v)
+        {
+            const Quat vector_quat{v.x, v.y, v.z, 0.0};
+            const Quat rotated = multiplyQuat(multiplyQuat(q, vector_quat), conjugateQuat(q));
+            return Vec3{rotated.x, rotated.y, rotated.z};
+        }
+
+        bool poseToTransform(const geometry_msgs::msg::Pose &pose, Vec3 &position, Quat &orientation)
+        {
+            position = Vec3{pose.position.x, pose.position.y, pose.position.z};
+            orientation = Quat{pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w};
+            if (!isFinite(position.x) || !isFinite(position.y) || !isFinite(position.z) ||
+                !isFinite(orientation.x) || !isFinite(orientation.y) || !isFinite(orientation.z) || !isFinite(orientation.w))
+            {
+                return false;
+            }
+            return normalizeQuat(orientation);
+        }
+
+        geometry_msgs::msg::Pose makeRelativePose(
+            const Vec3 &joint_position,
+            const Quat &joint_orientation,
+            const Vec3 &origin_position,
+            const Quat &origin_inverse)
+        {
+            const Vec3 relative_position = rotateVector(origin_inverse,
+                                                        Vec3{joint_position.x - origin_position.x,
+                                                             joint_position.y - origin_position.y,
+                                                             joint_position.z - origin_position.z});
+            Quat relative_orientation = multiplyQuat(origin_inverse, joint_orientation);
+            (void)normalizeQuat(relative_orientation);
+
+            geometry_msgs::msg::Pose pose;
+            pose.position.x = relative_position.x;
+            pose.position.y = relative_position.y;
+            pose.position.z = relative_position.z;
+            pose.orientation.x = relative_orientation.x;
+            pose.orientation.y = relative_orientation.y;
+            pose.orientation.z = relative_orientation.z;
+            pose.orientation.w = relative_orientation.w;
+            return pose;
+        }
+
         sensor_msgs::msg::Joy makeJoyMsg(
             const rclcpp::Time &stamp,
             float trigger_value,
@@ -180,6 +282,8 @@ namespace trb::udp
 
         pub_joint24_ = node.create_publisher<geometry_msgs::msg::PoseArray>("teleop/pose/joint24", qos);
         pub_joint24_valid_mask_ = node.create_publisher<std_msgs::msg::UInt32>("teleop/pose/joint24_valid_mask", qos);
+        pub_joint24_waist_ = node.create_publisher<geometry_msgs::msg::PoseArray>("teleop/pose/joint24_waist", qos);
+        pub_joint24_waist_valid_mask_ = node.create_publisher<std_msgs::msg::UInt32>("teleop/pose/joint24_waist_valid_mask", qos);
 
         pub_left_joy_ = node.create_publisher<sensor_msgs::msg::Joy>("teleop/controller/left_joy", qos);
         pub_right_joy_ = node.create_publisher<sensor_msgs::msg::Joy>("teleop/controller/right_joy", qos);
@@ -446,6 +550,7 @@ namespace trb::udp
         const uint8_t joint_count = data[joint_block_payload + 0];
         const uint8_t joint_flags = data[joint_block_payload + 1];
         const uint32_t valid_mask = readLeU32(data + joint_block_payload + 4);
+        const uint32_t raw_joint_mask = valid_mask & kJointMaskAll;
         if (joint_count != kJointCount)
         {
             const auto now = clock_.now();
@@ -458,10 +563,7 @@ namespace trb::udp
         }
 
         const size_t joint_entries_offset = joint_block_payload + 8;
-        geometry_msgs::msg::PoseArray joint24_msg;
-        joint24_msg.header.stamp = stamp;
-        joint24_msg.header.frame_id = cfg_.frame_id_waist;
-        joint24_msg.poses.reserve(kJointCount);
+        std::array<geometry_msgs::msg::Pose, kJointCount> raw_poses;
 
         auto readPose = [&](size_t pose_offset)
         {
@@ -476,14 +578,71 @@ namespace trb::udp
 
         for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
         {
-            joint24_msg.poses.push_back(readPose(joint_entries_offset + joint_index * 28));
+            raw_poses[joint_index] = readPose(joint_entries_offset + joint_index * 28);
         }
 
+        geometry_msgs::msg::PoseArray joint24_msg;
+        joint24_msg.header.stamp = stamp;
+        joint24_msg.header.frame_id = cfg_.frame_id_joint24;
+        joint24_msg.poses.reserve(kJointCount);
+        for (const auto &pose : raw_poses)
+        {
+            joint24_msg.poses.push_back(pose);
+        }
         pub_joint24_->publish(joint24_msg);
 
         std_msgs::msg::UInt32 valid_mask_msg;
         valid_mask_msg.data = valid_mask;
         pub_joint24_valid_mask_->publish(valid_mask_msg);
+
+        geometry_msgs::msg::PoseArray joint24_waist_msg;
+        joint24_waist_msg.header.stamp = stamp;
+        joint24_waist_msg.header.frame_id = cfg_.frame_id_waist;
+        joint24_waist_msg.poses.reserve(kJointCount);
+
+        uint32_t waist_valid_mask = 0;
+        Vec3 pelvis_position;
+        Quat pelvis_orientation;
+        const bool pelvis_valid = (raw_joint_mask & 1u) != 0u &&
+                                  poseToTransform(raw_poses[0], pelvis_position, pelvis_orientation);
+
+        if (pelvis_valid)
+        {
+            const Quat pelvis_inverse = conjugateQuat(pelvis_orientation);
+            for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
+            {
+                const uint32_t joint_bit = 1u << joint_index;
+                Vec3 joint_position;
+                Quat joint_orientation;
+                if ((raw_joint_mask & joint_bit) != 0u &&
+                    poseToTransform(raw_poses[joint_index], joint_position, joint_orientation))
+                {
+                    joint24_waist_msg.poses.push_back(makeRelativePose(
+                        joint_position,
+                        joint_orientation,
+                        pelvis_position,
+                        pelvis_inverse));
+                    waist_valid_mask |= joint_bit;
+                }
+                else
+                {
+                    joint24_waist_msg.poses.push_back(makeIdentityPose());
+                }
+            }
+        }
+        else
+        {
+            for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
+            {
+                joint24_waist_msg.poses.push_back(makeIdentityPose());
+            }
+        }
+
+        pub_joint24_waist_->publish(joint24_waist_msg);
+
+        std_msgs::msg::UInt32 waist_valid_mask_msg;
+        waist_valid_mask_msg.data = waist_valid_mask;
+        pub_joint24_waist_valid_mask_->publish(waist_valid_mask_msg);
 
         (void)joint_flags;
     }

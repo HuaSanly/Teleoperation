@@ -292,6 +292,10 @@ Total                : 930
 - `teleop/controller/right_joy`
 - `teleop/pose/joint24`
 - `teleop/pose/joint24_valid_mask`
+- `teleop/pose/joint24_waist`
+- `teleop/pose/joint24_waist_valid_mask`
+
+`teleop/pose/joint24` 发布 UDP 中的原始 24 关节数据。`teleop/pose/joint24_waist` 由接收端使用 `joint24[0]` (`Pelvis`) 转换得到，以腰部/Pelvis 为原点。
 
 ## 9. 新实现发送架构约束
 

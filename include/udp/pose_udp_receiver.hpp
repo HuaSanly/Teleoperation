@@ -28,6 +28,7 @@ namespace trb::udp
         int qos_depth{10};
 
         std::string frame_id_waist{"vr_waist"};
+        std::string frame_id_joint24{"vr_tracking"};
         std::string frame_id_hmd{"vr_hmd"};
         std::string frame_id_left_controller{"vr_left_controller"};
         std::string frame_id_right_controller{"vr_right_controller"};
@@ -76,6 +77,8 @@ namespace trb::udp
 
         rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_joint24_;
         rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr pub_joint24_valid_mask_;
+        rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_joint24_waist_;
+        rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr pub_joint24_waist_valid_mask_;
 
         rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr pub_left_joy_;
         rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr pub_right_joy_;

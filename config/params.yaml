@@ -67,6 +67,7 @@
         depth: 10
       frame_id:
         waist: "vr_waist"
+        joint24: "vr_tracking"
         hmd: "vr_hmd"
         left_controller: "vr_left_controller"
         right_controller: "vr_right_controller"
