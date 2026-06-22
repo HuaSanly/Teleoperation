@@ -48,8 +48,12 @@ namespace trb::udp
             uint64_t cap_to_fec_samples{0};
             uint64_t fec_internal_wait_us_total{0};
             uint64_t fec_internal_wait_samples{0};
+            uint64_t fec_compute_us_total{0};
+            uint64_t fec_compute_samples{0};
             uint64_t send_queue_delay_us_total{0};
             uint64_t send_queue_delay_samples{0};
+            uint64_t tail_queue_delay_us_total{0};
+            uint64_t tail_queue_delay_samples{0};
             uint64_t pacing_us_total{0};
             uint64_t send_syscall_us_total{0};
             uint64_t end_to_end_us_total{0};
@@ -174,6 +178,8 @@ namespace trb::udp
         std::atomic<uint64_t> cap_to_fec_samples_{0};
         std::atomic<uint64_t> fec_internal_wait_us_total_{0};
         std::atomic<uint64_t> fec_internal_wait_samples_{0};
+        std::atomic<uint64_t> fec_compute_us_total_{0};
+        std::atomic<uint64_t> fec_compute_samples_{0};
         std::atomic<uint64_t> fec_output_packets_{0};
         std::atomic<uint64_t> udp_sent_video_frames_{0};
         std::atomic<uint64_t> udp_sent_video_packets_{0};
@@ -182,6 +188,8 @@ namespace trb::udp
         std::atomic<uint64_t> udp_send_drop_packets_{0};
         std::atomic<uint64_t> udp_video_queue_delay_us_total_{0};
         std::atomic<uint64_t> udp_video_queue_delay_samples_{0};
+        std::atomic<uint64_t> udp_video_tail_queue_delay_us_total_{0};
+        std::atomic<uint64_t> udp_video_tail_queue_delay_samples_{0};
         std::atomic<uint64_t> udp_video_pacing_us_total_{0};
         std::atomic<uint64_t> udp_video_send_syscall_us_total_{0};
         std::atomic<uint64_t> udp_video_end_to_end_us_total_{0};

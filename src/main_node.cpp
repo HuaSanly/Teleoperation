@@ -1725,6 +1725,18 @@ namespace trb
         const double e2e_ms = udp_stats.end_to_end_samples > 0
                                   ? static_cast<double>(udp_stats.end_to_end_us_total) / static_cast<double>(udp_stats.end_to_end_samples) / 1000.0
                                   : 0.0;
+        const auto avg_us_to_ms = [](uint64_t total_us, uint64_t samples) {
+            return samples > 0 ? static_cast<double>(total_us) / static_cast<double>(samples) / 1000.0 : 0.0;
+        };
+        const double fec_queue_ms = avg_us_to_ms(udp_stats.fec_internal_wait_us_total, udp_stats.fec_internal_wait_samples);
+        const double fec_compute_ms = avg_us_to_ms(udp_stats.fec_compute_us_total, udp_stats.fec_compute_samples);
+        const double udp_queue_ms = avg_us_to_ms(udp_stats.send_queue_delay_us_total, udp_stats.send_queue_delay_samples);
+        const double tail_queue_ms = avg_us_to_ms(udp_stats.tail_queue_delay_us_total, udp_stats.tail_queue_delay_samples);
+        const double pacing_ms = avg_us_to_ms(udp_stats.pacing_us_total, udp_stats.sent_packets);
+        const double udp_send_ms = avg_us_to_ms(udp_stats.send_syscall_us_total, udp_stats.sent_packets);
+        const double pacer_debt_ms = static_cast<double>(udp_stats.pacer_debt_us) / 1000.0;
+        const double pacer_expected_queue_ms = static_cast<double>(udp_stats.pacer_expected_queue_us) / 1000.0;
+        const double pacer_adjusted_mbps = static_cast<double>(udp_stats.pacer_adjusted_bps) / 1000000.0;
 
         if (udp_drop_total > 0 || udp_sockdrop_total > 0)
         {
@@ -1736,7 +1748,7 @@ namespace trb
         }
 
         RCLCPP_INFO(this->get_logger(),
-                    "[VIDEO] fmt=%s fps=cap%.1f dec%.1f conv%.1f und%.1f enc%.1f tx%.1f %.1fMbps drop=dec%lu conv%lu und%lu enc%lu udp%lu sock=blk%lu drop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f und%.2f enc%.2f e2e=%.2fms",
+                    "[VIDEO] fmt=%s fps=cap%.1f dec%.1f conv%.1f und%.1f enc%.1f tx%.1f %.1fMbps drop=dec%lu conv%lu und%lu enc%lu udp%lu sock=blk%lu drop%lu q=%zupkts/%.1fKB lat=dec%.2f conv%.2f und%.2f enc%.2f fecq%.2f fec%.2f udpq%.2f tailq%.2f pace%.2f send%.2f e2e=%.2fms pacer=debt%.2f q%.2f rate%.1fMbps",
                     converter_output_format.c_str(),
                     cap_fps,
                     dec_fps,
@@ -1758,7 +1770,16 @@ namespace trb
                     conv_ms,
                     und_ms,
                     enc_ms,
-                    e2e_ms);
+                    fec_queue_ms,
+                    fec_compute_ms,
+                    udp_queue_ms,
+                    tail_queue_ms,
+                    pacing_ms,
+                    udp_send_ms,
+                    e2e_ms,
+                    pacer_debt_ms,
+                    pacer_expected_queue_ms,
+                    pacer_adjusted_mbps);
     }
 
     void MainNode::ensureNegotiationRetryTimer()

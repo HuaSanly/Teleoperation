@@ -511,7 +511,13 @@ namespace trb::udp
                 }
             }
 
+            const auto fec_compute_start = std::chrono::steady_clock::now();
             processFrame(frame);
+            const auto fec_compute_end = std::chrono::steady_clock::now();
+            fec_compute_us_total_.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(fec_compute_end - fec_compute_start).count()),
+                std::memory_order_relaxed);
+            fec_compute_samples_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -699,6 +705,8 @@ namespace trb::udp
             uint64_t packets{0};
             uint64_t capture_steady_us{0};
             uint64_t last_send_done_us{0};
+            uint64_t last_queue_delay_us{0};
+            bool has_last_queue_delay{false};
         } current;
 
         uint32_t last_sent_frame_id = UINT32_MAX;
@@ -724,11 +732,18 @@ namespace trb::udp
                                                          std::memory_order_relaxed);
                 udp_video_end_to_end_samples_.fetch_add(1, std::memory_order_relaxed);
             }
+            if (current.has_last_queue_delay)
+            {
+                udp_video_tail_queue_delay_us_total_.fetch_add(current.last_queue_delay_us, std::memory_order_relaxed);
+                udp_video_tail_queue_delay_samples_.fetch_add(1, std::memory_order_relaxed);
+            }
             current = FrameStats{};
         };
 
         auto send_datagram = [&](QueueItem &item, uint64_t pacing_us) -> SendAttemptResult {
             const uint64_t dequeue_steady_us = nowSteadyUs();
+            uint64_t queue_delay_us = 0;
+            bool has_queue_delay = false;
             if (item.stream == QueueItem::Stream::Video && current.packets == 0)
             {
                 current.frame_id = item.group_id;
@@ -737,8 +752,9 @@ namespace trb::udp
             }
             if (item.stream == QueueItem::Stream::Video && item.enqueue_steady_us > 0 && dequeue_steady_us >= item.enqueue_steady_us)
             {
-                udp_video_queue_delay_us_total_.fetch_add(dequeue_steady_us - item.enqueue_steady_us,
-                                                          std::memory_order_relaxed);
+                queue_delay_us = dequeue_steady_us - item.enqueue_steady_us;
+                has_queue_delay = true;
+                udp_video_queue_delay_us_total_.fetch_add(queue_delay_us, std::memory_order_relaxed);
                 udp_video_queue_delay_samples_.fetch_add(1, std::memory_order_relaxed);
             }
 
@@ -777,6 +793,11 @@ namespace trb::udp
             if (item.stream == QueueItem::Stream::Video)
             {
                 current.packets += 1;
+                if (has_queue_delay)
+                {
+                    current.last_queue_delay_us = queue_delay_us;
+                    current.has_last_queue_delay = true;
+                }
                 current.last_send_done_us = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(send_end.time_since_epoch()).count());
                 udp_sent_video_packets_.fetch_add(1, std::memory_order_relaxed);
@@ -959,8 +980,12 @@ namespace trb::udp
         snapshot.cap_to_fec_samples = cap_to_fec_samples_.exchange(0, std::memory_order_relaxed);
         snapshot.fec_internal_wait_us_total = fec_internal_wait_us_total_.exchange(0, std::memory_order_relaxed);
         snapshot.fec_internal_wait_samples = fec_internal_wait_samples_.exchange(0, std::memory_order_relaxed);
+        snapshot.fec_compute_us_total = fec_compute_us_total_.exchange(0, std::memory_order_relaxed);
+        snapshot.fec_compute_samples = fec_compute_samples_.exchange(0, std::memory_order_relaxed);
         snapshot.send_queue_delay_us_total = udp_video_queue_delay_us_total_.exchange(0, std::memory_order_relaxed);
         snapshot.send_queue_delay_samples = udp_video_queue_delay_samples_.exchange(0, std::memory_order_relaxed);
+        snapshot.tail_queue_delay_us_total = udp_video_tail_queue_delay_us_total_.exchange(0, std::memory_order_relaxed);
+        snapshot.tail_queue_delay_samples = udp_video_tail_queue_delay_samples_.exchange(0, std::memory_order_relaxed);
         snapshot.pacing_us_total = udp_video_pacing_us_total_.exchange(0, std::memory_order_relaxed);
         snapshot.send_syscall_us_total = udp_video_send_syscall_us_total_.exchange(0, std::memory_order_relaxed);
         snapshot.end_to_end_us_total = udp_video_end_to_end_us_total_.exchange(0, std::memory_order_relaxed);
