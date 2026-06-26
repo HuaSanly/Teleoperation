@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <thread>
 
 namespace trb::udp
 {
@@ -12,39 +11,6 @@ namespace trb::udp
         constexpr double kMaxLowLatencyBurstWindowMs = 1.0;
         constexpr double kBlockedSendCooldownMs = 1.0;
     } // namespace
-
-    void Pacer::reset()
-    {
-        next_send_tp_ = std::chrono::steady_clock::now();
-    }
-
-    void Pacer::pace(size_t bytes, bool enabled, uint64_t pacing_bps)
-    {
-        if (!enabled || pacing_bps == 0)
-        {
-            next_send_tp_ = std::chrono::steady_clock::now();
-            return;
-        }
-        const double rate_bytes_per_sec = static_cast<double>(pacing_bps) / 8.0;
-        if (rate_bytes_per_sec <= 0.0)
-        {
-            next_send_tp_ = std::chrono::steady_clock::now();
-            return;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        if (next_send_tp_ < now)
-        {
-            next_send_tp_ = now;
-        }
-        if (next_send_tp_ > now)
-        {
-            std::this_thread::sleep_until(next_send_tp_);
-        }
-
-        const double packet_us = (static_cast<double>(bytes) * 1e6) / rate_bytes_per_sec;
-        next_send_tp_ += std::chrono::microseconds(static_cast<uint64_t>(std::max(0.0, std::ceil(packet_us))));
-    }
 
     void WebRtcLikePacer::reset()
     {

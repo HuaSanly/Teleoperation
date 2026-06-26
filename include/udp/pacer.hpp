@@ -7,16 +7,6 @@
 namespace trb::udp
 {
 
-    class Pacer
-    {
-    public:
-        void reset();
-        void pace(size_t bytes, bool enabled, uint64_t pacing_bps);
-
-    private:
-        std::chrono::steady_clock::time_point next_send_tp_{std::chrono::steady_clock::now()};
-    };
-
     class WebRtcLikePacer
     {
     public:

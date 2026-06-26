@@ -27,18 +27,6 @@ namespace trb::udp
         constexpr uint8_t kVideoPriority = 2;
         constexpr uint8_t kTelemetryPriority = 3;
  
-        const char *pacingModeToString(UdpManager::PacingMode mode)
-        {
-            switch (mode)
-            {
-            case UdpManager::PacingMode::WebRtcLike:
-                return "webrtc_like";
-            case UdpManager::PacingMode::Legacy:
-            default:
-                return "legacy";
-            }
-        }
-
         WebRtcLikePacer::Config makeWebRtcLikePacerConfig(const UdpManager::Config &config)
         {
             WebRtcLikePacer::Config pacer_config;
@@ -148,7 +136,6 @@ namespace trb::udp
         send_queue_.setLimits(config_.queue_max_packets, config_.queue_max_bytes);
         {
             std::lock_guard<std::mutex> lock(pacing_mutex_);
-            pacer_.reset();
             webrtc_like_pacer_.setConfig(makeWebRtcLikePacerConfig(config_));
             webrtc_like_pacer_.reset();
         }
@@ -163,9 +150,8 @@ namespace trb::udp
             [this]() { return packet_codec_.buildHelloMessage(); },
             [this]() { return packet_codec_.buildPingMessage(); });
 
-        RCLCPP_INFO(logger(), "UdpManager config: remote=%s:%d pacing_mode=%s pacing_enabled=%d pacing_bps=%lu",
+        RCLCPP_INFO(logger(), "UdpManager config: remote=%s:%d pacing_enabled=%d pacing_bps=%lu",
                     config_.remote_ip.c_str(), config_.remote_port,
-                    pacingModeToString(config_.pacing_mode),
                     config_.pacing_enabled ? 1 : 0,
                     static_cast<unsigned long>(config_.pacing_bps));
         RCLCPP_INFO(logger(), "UdpManager pacing: burst=%ums max_burst=%zu max_debt=%ums qlimit=%ums drain=%.2f account_audio=%d batch=%u",
@@ -241,7 +227,6 @@ namespace trb::udp
         send_queue_.clear();
         {
             std::lock_guard<std::mutex> lock(pacing_mutex_);
-            pacer_.reset();
             webrtc_like_pacer_.reset();
         }
         control_.resetHandshake();
@@ -707,7 +692,6 @@ namespace trb::udp
     {
         {
             std::lock_guard<std::mutex> lock(pacing_mutex_);
-            pacer_.reset();
             webrtc_like_pacer_.reset();
         }
         static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
@@ -845,46 +829,6 @@ namespace trb::udp
             udp_pacer_expected_queue_us_.store(stats.expected_queue_us, std::memory_order_relaxed);
             udp_pacer_adjusted_bps_.store(stats.adjusted_pacing_bps, std::memory_order_relaxed);
         };
-
-        if (config_.pacing_mode == PacingMode::Legacy)
-        {
-            while (state_.running.load())
-            {
-                QueueItem item;
-                if (!send_queue_.pop(item, 20))
-                {
-                    continue;
-                }
-                if (item.kind == QueueItem::Kind::GroupEnd)
-                {
-                    if (item.stream == QueueItem::Stream::Video)
-                    {
-                        flush_frame();
-                    }
-                    continue;
-                }
-                if (item.kind != QueueItem::Kind::Datagram)
-                {
-                    continue;
-                }
-
-                const auto pace_start = std::chrono::steady_clock::now();
-                {
-                    std::lock_guard<std::mutex> lock(pacing_mutex_);
-                    pacer_.pace(item.wire_bytes, config_.pacing_enabled, config_.pacing_bps);
-                }
-                const auto pace_end = std::chrono::steady_clock::now();
-                const uint64_t pacing_us = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(pace_end - pace_start).count());
-                const SendAttemptResult send_result = handle_queue_item(item, pacing_us);
-                if (send_result == SendAttemptResult::kWouldBlock && item.kind == QueueItem::Kind::Datagram)
-                {
-                    send_queue_.requeueFront(std::move(item));
-                    (void)socket_->waitWritable(2);
-                }
-            }
-            return;
-        }
 
         uint64_t pending_video_pacing_us = 0;
         while (state_.running.load())

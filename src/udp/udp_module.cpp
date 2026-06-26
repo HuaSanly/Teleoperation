@@ -22,27 +22,6 @@ namespace trb::udp
             return value;
         }
 
-        UdpManager::PacingMode parsePacingMode(const std::string &value)
-        {
-            if (value == "webrtc_like" || value == "webrtc" || value == "priority")
-            {
-                return UdpManager::PacingMode::WebRtcLike;
-            }
-            return UdpManager::PacingMode::Legacy;
-        }
-
-        const char *pacingModeToString(UdpManager::PacingMode mode)
-        {
-            switch (mode)
-            {
-            case UdpManager::PacingMode::WebRtcLike:
-                return "webrtc_like";
-            case UdpManager::PacingMode::Legacy:
-            default:
-                return "legacy";
-            }
-        }
-
         bool hasValidContext(rclcpp::Node &node)
         {
             const auto base = node.get_node_base_interface();
@@ -106,8 +85,6 @@ namespace trb::udp
         udp.send_buffer_bytes = declareOrGet<int>(node, "udp.send.buffer_bytes", declareOrGet<int>(node, "udp.send.sndbuf_bytes", 0));
 
         udp.pacing_enabled = declareOrGet<bool>(node, "udp.pacing.enabled", true);
-        const std::string pacing_mode = declareOrGet<std::string>(node, "udp.pacing.mode", pacingModeToString(udp.pacing_mode));
-        udp.pacing_mode = parsePacingMode(pacing_mode);
         udp.pacing_bps = static_cast<uint64_t>(std::max(0, declareOrGet<int>(node, "udp.pacing.bps", 0)));
         udp.pacing_send_burst_interval_ms = static_cast<uint32_t>(std::max(0, declareOrGet<int>(node, "udp.pacing.send_burst_interval_ms", static_cast<int>(udp.pacing_send_burst_interval_ms))));
         udp.pacing_max_burst_bytes = static_cast<size_t>(std::max(0, declareOrGet<int>(node, "udp.pacing.max_burst_bytes", static_cast<int>(udp.pacing_max_burst_bytes))));
@@ -172,9 +149,8 @@ namespace trb::udp
             return false;
         }
 
-        RCLCPP_INFO(logger_, "UDP config loaded: remote=%s:%d pacing_mode=%s pacing_enabled=%d pacing_bps=%lu",
+        RCLCPP_INFO(logger_, "UDP config loaded: remote=%s:%d pacing_enabled=%d pacing_bps=%lu",
                     config_.udp.remote_ip.c_str(), config_.udp.remote_port,
-                    pacingModeToString(config_.udp.pacing_mode),
                     config_.udp.pacing_enabled ? 1 : 0,
                     static_cast<unsigned long>(config_.udp.pacing_bps));
         RCLCPP_INFO(logger_, "UDP config loaded: queue_max_bytes=%zu queue_max_packets=%zu fec_table_id=%d fec_input_queue_max_frames=%zu",

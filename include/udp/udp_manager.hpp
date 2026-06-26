@@ -26,12 +26,6 @@ namespace trb::udp
     class UdpManager
     {
     public:
-        enum class PacingMode
-        {
-            Legacy,
-            WebRtcLike,
-        };
-
         struct VideoStatsSnapshot
         {
             uint64_t input_frames{0};
@@ -81,7 +75,6 @@ namespace trb::udp
             bool send_nonblocking{true};
             int recv_timeout_ms{100};
             bool pacing_enabled{true};
-            PacingMode pacing_mode{PacingMode::Legacy};
             uint64_t pacing_bps{0};
             uint32_t pacing_send_burst_interval_ms{5};
             size_t pacing_max_burst_bytes{63000};
@@ -151,7 +144,6 @@ namespace trb::udp
         std::unique_ptr<UdpSocket> socket_;
         PacketCodec packet_codec_;
         SendQueue send_queue_;
-        Pacer pacer_;
         WebRtcLikePacer webrtc_like_pacer_;
         ControlPlane control_;
         std::unique_ptr<IFecEncoder> fec_encoder_;
