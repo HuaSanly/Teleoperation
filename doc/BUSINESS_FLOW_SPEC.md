@@ -250,8 +250,8 @@ ROS battery/device/temperature state
 High-rate telemetry:
 
 ```text
-ROS waist + arm joint feedback
-  -> latest 17-joint snapshot
+ROS IK /joint_states
+  -> latest 19-joint snapshot
   -> every 20ms build Type 0x06
   -> other_queue
 ```
@@ -265,14 +265,19 @@ ROS waist + arm joint feedback
 
 ```text
 Pose UDP socket bind
-  -> receive Type 0x02 V2 datagram
-  -> validate header and blocks
+  -> receive Type 0x02 HMD/controller datagram
+  -> validate header and optional sections
   -> publish:
        teleop/pose/hmd
        teleop/pose/left_controller
        teleop/pose/right_controller
        teleop/controller/left_joy
        teleop/controller/right_joy
+
+Pose UDP socket bind
+  -> receive Type 0x09 Body24Raw datagram
+  -> validate header and body24 blocks
+  -> publish:
        teleop/pose/joint24
        teleop/pose/joint24_valid_mask
        teleop/pose/joint24_waist
@@ -281,7 +286,7 @@ Pose UDP socket bind
 
 姿态输入应作为独立输入流，不应依赖视频流是否正常。
 
-`teleop/pose/joint24` 发布 VR 侧发来的原始 24 关节数据；`teleop/pose/joint24_waist` 由机器人端接收逻辑基于 `Pelvis` 本地转换得到。
+`0x02` 只承载 HMD/手柄位姿和按键；`0x09` 承载 PICO Body24Raw。`teleop/pose/joint24` 发布 `0x09` 中的原始 24 关节数据；`teleop/pose/joint24_waist` 由机器人端接收逻辑基于 `Pelvis` 本地转换得到。
 
 ## 12. 发送调度业务规则
 

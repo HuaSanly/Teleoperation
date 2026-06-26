@@ -14,12 +14,11 @@
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 
 #include "teleop_robot_bridge/msg/agv_battery_state.hpp"
 #include "teleop_robot_bridge/msg/agv_device_state.hpp"
-#include "teleop_robot_bridge/msg/arm_joint_feedback.hpp"
 #include "teleop_robot_bridge/msg/temperature.hpp"
-#include "teleop_robot_bridge/msg/waist_joint_feedback.hpp"
 
 #include "audio/audio_module.hpp"
 #include "grpc/grpc_module.hpp"
@@ -63,8 +62,7 @@ namespace trb
         void onTelemetryBatteryState(const teleop_robot_bridge::msg::AgvBatteryState::SharedPtr msg);
         void onTelemetryTemperature(const teleop_robot_bridge::msg::Temperature::SharedPtr msg);
         void onTelemetryDeviceState(const teleop_robot_bridge::msg::AgvDeviceState::SharedPtr msg);
-        void onWaistJointFeedback(const teleop_robot_bridge::msg::WaistJointFeedback::SharedPtr msg);
-        void onArmJointFeedback(const teleop_robot_bridge::msg::ArmJointFeedback::SharedPtr msg);
+        void onJointState(const sensor_msgs::msg::JointState::SharedPtr msg);
         void teardownActiveSession(const std::string &reason, State target_state);
         void postSessionWork(std::function<void()> work, const char *label);
         void drainSessionWork();
@@ -121,8 +119,7 @@ namespace trb
         rclcpp::Subscription<teleop_robot_bridge::msg::AgvBatteryState>::SharedPtr telemetry_battery_sub_;
         rclcpp::Subscription<teleop_robot_bridge::msg::Temperature>::SharedPtr telemetry_temperature_sub_;
         rclcpp::Subscription<teleop_robot_bridge::msg::AgvDeviceState>::SharedPtr telemetry_device_state_sub_;
-        rclcpp::Subscription<teleop_robot_bridge::msg::WaistJointFeedback>::SharedPtr waist_joint_feedback_sub_;
-        rclcpp::Subscription<teleop_robot_bridge::msg::ArmJointFeedback>::SharedPtr arm_joint_feedback_sub_;
+        rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
         std::chrono::steady_clock::time_point last_video_stats_time_;
         std::chrono::steady_clock::time_point video_start_time_{};
         std::chrono::steady_clock::time_point last_video_keyframe_request_time_{};
@@ -169,8 +166,7 @@ namespace trb
         {
             bool enabled{false};
             double period_sec{0.02};
-            std::string waist_topic{"/waist_joint_feedback"};
-            std::string arm_topic{"/arm_joint_feedback"};
+            std::string joint_state_topic{"/joint_states"};
             telemetry::RobotJointTelemetrySnapshot snapshot;
         };
 

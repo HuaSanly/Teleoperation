@@ -10,7 +10,7 @@ namespace trb::telemetry
 
     constexpr uint8_t kRobotTelemetryPayloadVersion = 1;
     constexpr uint8_t kRobotJointTelemetryPayloadVersion = 1;
-    constexpr uint16_t kRobotJointTelemetrySchemaId = 1;
+    constexpr uint16_t kRobotJointTelemetrySchemaId = 2;
 
     struct RobotTelemetrySnapshot
     {

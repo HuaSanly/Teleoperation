@@ -94,9 +94,8 @@
       high_rate:
         enabled: true
         period_sec: 0.02
-        schema_id: 1
-        waist_topic: "/waist_joint_feedback"
-        arm_topic: "/arm_joint_feedback"
+        schema_id: 2
+        joint_state_topic: "/joint_states"
 
     video:
       profile: [3840, 1520, 30]

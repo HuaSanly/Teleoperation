@@ -9,35 +9,37 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace trb::udp
 {
 
     namespace
     {
-        constexpr uint8_t kPoseType = 0x02;
-        constexpr uint8_t kProtocolVersion = 2;
-        constexpr uint16_t kTotalPacketBytes = 930;
+        constexpr uint8_t kPoseControllerType = 0x02;
+        constexpr uint8_t kBody24RawType = 0x09;
+        constexpr uint8_t kProtocolVersion = 1;
 
-        constexpr uint8_t kSensorBlockType = 1;
-        constexpr uint8_t kButtonsBlockType = 2;
-        constexpr uint8_t kJoint24BlockType = 3;
+        constexpr size_t kPoseControllerHeaderBytes = 13;
+        constexpr size_t kPoseEntryBytes = 28;
+        constexpr size_t kControllerButtonsEntryBytes = 23;
+        constexpr size_t kEulerEntryBytes = 12;
+        constexpr size_t kAimEntryBytes = 38;
+        constexpr uint8_t kPoseFlagIncludeEuler = 0x01;
+        constexpr uint8_t kPoseFlagIncludeAim = 0x02;
+        constexpr uint8_t kPoseFlagIncludeButtons = 0x04;
 
-        constexpr uint16_t kSensorBlockBytes = 176;
-        constexpr uint16_t kButtonsBlockBytes = 54;
-        constexpr uint16_t kJoint24BlockBytes = 684;
-
-        constexpr uint8_t kSensorMaskHmd = 1u << 0;
-        constexpr uint8_t kSensorMaskWaist = 1u << 1;
-        constexpr uint8_t kSensorMaskLeftController = 1u << 2;
-        constexpr uint8_t kSensorMaskRightController = 1u << 3;
-        constexpr uint8_t kSensorMaskLeftFoot = 1u << 4;
-        constexpr uint8_t kSensorMaskRightFoot = 1u << 5;
-
-        constexpr uint8_t kControllerMaskLeft = 1u << 0;
-        constexpr uint8_t kControllerMaskRight = 1u << 1;
-
-        constexpr uint8_t kSensorEntryCount = 3;
+        constexpr uint16_t kBody24RawTotalBytes = 1236;
+        constexpr uint8_t kBody24ProfileFullMotionQuantized = 1;
+        constexpr uint8_t kBody24SpacePicoLocalPose = 0;
+        constexpr uint8_t kBody24BlockCount = 3;
+        constexpr uint8_t kBodyStateBlockType = 1;
+        constexpr uint8_t kJoint24RawPoseQBlockType = 2;
+        constexpr uint8_t kJoint24FullMotionQBlockType = 3;
+        constexpr uint16_t kBodyStateBlockBytes = 40;
+        constexpr uint16_t kJoint24RawPoseQBlockBytes = 540;
+        constexpr uint16_t kJoint24FullMotionQBlockBytes = 640;
+        constexpr uint8_t kPositionScaleCodeMillimeter = 1;
         constexpr uint8_t kJointCount = 24;
         constexpr uint32_t kJointMaskAll = (1u << kJointCount) - 1u;
         constexpr double kQuatNormEpsilon = 1e-8;
@@ -63,6 +65,11 @@ namespace trb::udp
                                          (static_cast<uint16_t>(p[1]) << 8));
         }
 
+        int16_t readLeI16(const uint8_t *p)
+        {
+            return static_cast<int16_t>(readLeU16(p));
+        }
+
         uint64_t readLeU64(const uint8_t *p)
         {
             uint64_t v = 0;
@@ -71,6 +78,11 @@ namespace trb::udp
                 v |= (static_cast<uint64_t>(p[i]) << (8 * i));
             }
             return v;
+        }
+
+        int64_t readLeI64(const uint8_t *p)
+        {
+            return static_cast<int64_t>(readLeU64(p));
         }
 
         uint32_t readLeU32(const uint8_t *p)
@@ -151,6 +163,17 @@ namespace trb::udp
         geometry_msgs::msg::Pose makeIdentityPose()
         {
             return makePose(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
+
+        float dequantizePosition(uint8_t scale_code, int16_t value)
+        {
+            switch (scale_code)
+            {
+            case kPositionScaleCodeMillimeter:
+                return static_cast<float>(value) * 0.001f;
+            default:
+                return std::numeric_limits<float>::quiet_NaN();
+            }
         }
 
         bool isFinite(double value)
@@ -376,65 +399,206 @@ namespace trb::udp
 
     void PoseUdpReceiver::parseAndPublish(const uint8_t *data, size_t len)
     {
-        if (data == nullptr || len < 16)
+        if (data == nullptr || len < 1)
         {
             return;
         }
 
         const uint8_t type = data[0];
-        if (type != kPoseType)
+
+        auto warnThrottled = [&](const char *message)
         {
+            const auto now = clock_.now();
+            if ((now - last_warn_).seconds() > 1.0)
+            {
+                last_warn_ = now;
+                RCLCPP_WARN(logger_, "%s", message);
+            }
+        };
+
+        auto publishJoint24 = [&](const rclcpp::Time &stamp,
+                                  const std::array<geometry_msgs::msg::Pose, kJointCount> &raw_poses,
+                                  uint32_t valid_mask)
+        {
+            const uint32_t raw_joint_mask = valid_mask & kJointMaskAll;
+
+            geometry_msgs::msg::PoseArray joint24_msg;
+            joint24_msg.header.stamp = stamp;
+            joint24_msg.header.frame_id = cfg_.frame_id_joint24;
+            joint24_msg.poses.reserve(kJointCount);
+            for (const auto &pose : raw_poses)
+            {
+                joint24_msg.poses.push_back(pose);
+            }
+            pub_joint24_->publish(joint24_msg);
+
+            std_msgs::msg::UInt32 valid_mask_msg;
+            valid_mask_msg.data = raw_joint_mask;
+            pub_joint24_valid_mask_->publish(valid_mask_msg);
+
+            geometry_msgs::msg::PoseArray joint24_waist_msg;
+            joint24_waist_msg.header.stamp = stamp;
+            joint24_waist_msg.header.frame_id = cfg_.frame_id_waist;
+            joint24_waist_msg.poses.reserve(kJointCount);
+
+            uint32_t waist_valid_mask = 0;
+            Vec3 pelvis_position;
+            Quat pelvis_orientation;
+            const bool pelvis_valid = (raw_joint_mask & 1u) != 0u &&
+                                      poseToTransform(raw_poses[0], pelvis_position, pelvis_orientation);
+
+            if (pelvis_valid)
+            {
+                const Quat pelvis_inverse = conjugateQuat(pelvis_orientation);
+                for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
+                {
+                    const uint32_t joint_bit = 1u << joint_index;
+                    Vec3 joint_position;
+                    Quat joint_orientation;
+                    if ((raw_joint_mask & joint_bit) != 0u &&
+                        poseToTransform(raw_poses[joint_index], joint_position, joint_orientation))
+                    {
+                        joint24_waist_msg.poses.push_back(makeRelativePose(
+                            joint_position,
+                            joint_orientation,
+                            pelvis_position,
+                            pelvis_inverse));
+                        waist_valid_mask |= joint_bit;
+                    }
+                    else
+                    {
+                        joint24_waist_msg.poses.push_back(makeIdentityPose());
+                    }
+                }
+            }
+            else
+            {
+                for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
+                {
+                    joint24_waist_msg.poses.push_back(makeIdentityPose());
+                }
+            }
+
+            pub_joint24_waist_->publish(joint24_waist_msg);
+
+            std_msgs::msg::UInt32 waist_valid_mask_msg;
+            waist_valid_mask_msg.data = waist_valid_mask;
+            pub_joint24_waist_valid_mask_->publish(waist_valid_mask_msg);
+        };
+
+        if (type == kPoseControllerType)
+        {
+            if (len < kPoseControllerHeaderBytes)
+            {
+                return;
+            }
+
+            const uint64_t ts_ms = readLeU64(data + 1);
+            const uint8_t version = data[9];
+            const uint8_t flags = data[10];
+            if (version != kProtocolVersion)
+            {
+                warnThrottled("PoseUdpReceiver: unsupported 0x02 version");
+                return;
+            }
+
+            size_t expected_bytes = kPoseControllerHeaderBytes + 3 * kPoseEntryBytes;
+            if (flags & kPoseFlagIncludeEuler)
+            {
+                expected_bytes += 3 * kEulerEntryBytes;
+            }
+            if (flags & kPoseFlagIncludeButtons)
+            {
+                expected_bytes += 2 * kControllerButtonsEntryBytes;
+            }
+            if (flags & kPoseFlagIncludeAim)
+            {
+                expected_bytes += 2 * kAimEntryBytes;
+            }
+            if (len < expected_bytes)
+            {
+                warnThrottled("PoseUdpReceiver: short 0x02 pose/controller datagram");
+                return;
+            }
+
+            const rclcpp::Time stamp(ts_ms * 1000000ULL, RCL_SYSTEM_TIME);
+            auto readPoseMsg = [&](size_t pose_offset, const std::string &frame_id)
+            {
+                return makePoseMsg(frame_id,
+                                   stamp,
+                                   readLeF32(data + pose_offset + 0),
+                                   readLeF32(data + pose_offset + 4),
+                                   readLeF32(data + pose_offset + 8),
+                                   readLeF32(data + pose_offset + 12),
+                                   readLeF32(data + pose_offset + 16),
+                                   readLeF32(data + pose_offset + 20),
+                                   readLeF32(data + pose_offset + 24));
+            };
+
+            size_t off = kPoseControllerHeaderBytes;
+            pub_hmd_->publish(readPoseMsg(off + 0 * kPoseEntryBytes, cfg_.frame_id_hmd));
+            pub_left_controller_->publish(readPoseMsg(off + 1 * kPoseEntryBytes, cfg_.frame_id_left_controller));
+            pub_right_controller_->publish(readPoseMsg(off + 2 * kPoseEntryBytes, cfg_.frame_id_right_controller));
+            off += 3 * kPoseEntryBytes;
+
+            if (flags & kPoseFlagIncludeEuler)
+            {
+                off += 3 * kEulerEntryBytes;
+            }
+
+            if ((flags & kPoseFlagIncludeButtons) && cfg_.publish_buttons)
+            {
+                auto publishControllerButtons = [&](size_t buttons_offset,
+                                                    rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr &pub)
+                {
+                    pub->publish(makeJoyMsg(stamp,
+                                            readLeF32(data + buttons_offset + 0),
+                                            data[buttons_offset + 4],
+                                            readLeF32(data + buttons_offset + 5),
+                                            data[buttons_offset + 9],
+                                            data[buttons_offset + 10],
+                                            data[buttons_offset + 11],
+                                            data[buttons_offset + 12],
+                                            readLeF32(data + buttons_offset + 13),
+                                            readLeF32(data + buttons_offset + 17),
+                                            data[buttons_offset + 21],
+                                            data[buttons_offset + 22]));
+                };
+                publishControllerButtons(off + 0 * kControllerButtonsEntryBytes, pub_left_joy_);
+                publishControllerButtons(off + 1 * kControllerButtonsEntryBytes, pub_right_joy_);
+            }
+            return;
+        }
+
+        if (type != kBody24RawType)
+        {
+            return;
+        }
+
+        if (len < kBody24RawTotalBytes)
+        {
+            warnThrottled("PoseUdpReceiver: short 0x09 body24 datagram");
             return;
         }
 
         const uint8_t version = data[1];
         const uint16_t total_bytes = readLeU16(data + 2);
         const uint64_t ts_ms = readLeU64(data + 4);
+        const uint8_t profile = data[12];
+        const uint8_t body_space = data[13];
         const uint8_t block_count = data[14];
-
-        if (version != kProtocolVersion)
+        if (version != kProtocolVersion ||
+            total_bytes != kBody24RawTotalBytes ||
+            profile != kBody24ProfileFullMotionQuantized ||
+            body_space != kBody24SpacePicoLocalPose ||
+            block_count != kBody24BlockCount)
         {
-            const auto now = clock_.now();
-            if ((now - last_warn_).seconds() > 1.0)
-            {
-                last_warn_ = now;
-                RCLCPP_WARN(logger_, "PoseUdpReceiver: unsupported version=%u", static_cast<unsigned>(version));
-            }
+            warnThrottled("PoseUdpReceiver: invalid 0x09 body24 header");
             return;
         }
 
-        if (total_bytes != kTotalPacketBytes || block_count != 3 || len < total_bytes)
-        {
-            const auto now = clock_.now();
-            if ((now - last_warn_).seconds() > 1.0)
-            {
-                last_warn_ = now;
-                RCLCPP_WARN(logger_, "PoseUdpReceiver: invalid V2 header len=%zu total=%u block_count=%u",
-                            len,
-                            static_cast<unsigned>(total_bytes),
-                            static_cast<unsigned>(block_count));
-            }
-            return;
-        }
-
-        // Convert Unix ms to ROS time (ns).
-        const rclcpp::Time stamp(static_cast<uint64_t>(ts_ms) * 1000000ULL, RCL_SYSTEM_TIME);
-
+        const rclcpp::Time stamp(ts_ms * 1000000ULL, RCL_SYSTEM_TIME);
         size_t off = 16;
-
-        auto readPoseMsg = [&](size_t pose_offset, const std::string &frame_id)
-        {
-            return makePoseMsg(frame_id,
-                               stamp,
-                               readLeF32(data + pose_offset + 0),
-                               readLeF32(data + pose_offset + 4),
-                               readLeF32(data + pose_offset + 8),
-                               readLeF32(data + pose_offset + 12),
-                               readLeF32(data + pose_offset + 16),
-                               readLeF32(data + pose_offset + 20),
-                               readLeF32(data + pose_offset + 24));
-        };
-
         auto readBlockHeader = [&](uint8_t expected_type, uint16_t expected_bytes) -> bool
         {
             if (off + 4 > total_bytes)
@@ -445,206 +609,67 @@ namespace trb::udp
             const uint16_t block_bytes = readLeU16(data + off + 2);
             if (block_type != expected_type || block_bytes != expected_bytes || off + block_bytes > total_bytes)
             {
-                const auto now = clock_.now();
-                if ((now - last_warn_).seconds() > 1.0)
-                {
-                    last_warn_ = now;
-                    RCLCPP_WARN(logger_, "PoseUdpReceiver: invalid block header off=%zu type=%u bytes=%u expected_type=%u expected_bytes=%u",
-                                off,
-                                static_cast<unsigned>(block_type),
-                                static_cast<unsigned>(block_bytes),
-                                static_cast<unsigned>(expected_type),
-                                static_cast<unsigned>(expected_bytes));
-                }
                 return false;
             }
             off += 4;
             return true;
         };
 
-        if (!readBlockHeader(kSensorBlockType, kSensorBlockBytes))
+        if (!readBlockHeader(kBodyStateBlockType, kBodyStateBlockBytes))
         {
+            warnThrottled("PoseUdpReceiver: invalid 0x09 body state block");
+            return;
+        }
+        const size_t body_state_payload = off;
+        const int32_t state_result = static_cast<int32_t>(readLeU32(data + body_state_payload + 0));
+        const int32_t data_result = static_cast<int32_t>(readLeU32(data + body_state_payload + 4));
+        const uint8_t is_tracking = data[body_state_payload + 8];
+        const uint32_t joint_valid_mask = readLeU32(data + body_state_payload + 12) & kJointMaskAll;
+        const int64_t body_timestamp = readLeI64(data + body_state_payload + 28);
+        (void)body_timestamp;
+        off = 16 + kBodyStateBlockBytes;
+
+        if (!readBlockHeader(kJoint24RawPoseQBlockType, kJoint24RawPoseQBlockBytes))
+        {
+            warnThrottled("PoseUdpReceiver: invalid 0x09 joint pose block");
+            return;
+        }
+        const size_t joint_pose_payload = off;
+        const uint8_t joint_count = data[joint_pose_payload + 0];
+        const uint8_t position_scale_code = data[joint_pose_payload + 2];
+        const uint32_t pose_valid_mask = readLeU32(data + joint_pose_payload + 4) & kJointMaskAll;
+        if (joint_count != kJointCount || position_scale_code != kPositionScaleCodeMillimeter)
+        {
+            warnThrottled("PoseUdpReceiver: invalid 0x09 joint pose payload");
             return;
         }
 
-        const size_t sensor_block_payload = off;
-        const uint8_t sensor_mask = data[sensor_block_payload + 0];
-        const uint8_t entry_count = data[sensor_block_payload + 2];
-        if (entry_count != kSensorEntryCount)
-        {
-            const auto now = clock_.now();
-            if ((now - last_warn_).seconds() > 1.0)
-            {
-                last_warn_ = now;
-                RCLCPP_WARN(logger_, "PoseUdpReceiver: invalid SensorRaw entry_count=%u", static_cast<unsigned>(entry_count));
-            }
-            return;
-        }
-
-        const size_t reserved_pose_offset = sensor_block_payload + 4;
-        const size_t entries_offset = reserved_pose_offset + 28;
-        const size_t hmd_pose_offset = entries_offset + 0 * 28;
-        const size_t left_controller_pose_offset = entries_offset + 1 * 28;
-        const size_t right_controller_pose_offset = entries_offset + 2 * 28;
-
-        if (sensor_mask & kSensorMaskHmd)
-        {
-            pub_hmd_->publish(readPoseMsg(hmd_pose_offset, cfg_.frame_id_hmd));
-        }
-        if (sensor_mask & kSensorMaskLeftController)
-        {
-            pub_left_controller_->publish(readPoseMsg(left_controller_pose_offset, cfg_.frame_id_left_controller));
-        }
-        if (sensor_mask & kSensorMaskRightController)
-        {
-            pub_right_controller_->publish(readPoseMsg(right_controller_pose_offset, cfg_.frame_id_right_controller));
-        }
-
-        off = 16 + kSensorBlockBytes;
-        if (!readBlockHeader(kButtonsBlockType, kButtonsBlockBytes))
-        {
-            return;
-        }
-
-        const size_t buttons_block_payload = off;
-        const uint8_t controller_mask = data[buttons_block_payload + 0];
-        const size_t left_buttons_offset = buttons_block_payload + 4;
-        const size_t right_buttons_offset = left_buttons_offset + 23;
-
-        auto publishControllerButtons = [&](size_t buttons_offset,
-                                            rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr &pub)
-        {
-            pub->publish(makeJoyMsg(stamp,
-                                    readLeF32(data + buttons_offset + 0),
-                                    data[buttons_offset + 4],
-                                    readLeF32(data + buttons_offset + 5),
-                                    data[buttons_offset + 9],
-                                    data[buttons_offset + 10],
-                                    data[buttons_offset + 11],
-                                    data[buttons_offset + 12],
-                                    readLeF32(data + buttons_offset + 13),
-                                    readLeF32(data + buttons_offset + 17),
-                                    data[buttons_offset + 21],
-                                    data[buttons_offset + 22]));
-        };
-
-        if (cfg_.publish_buttons)
-        {
-            if (controller_mask & kControllerMaskLeft)
-            {
-                publishControllerButtons(left_buttons_offset, pub_left_joy_);
-            }
-            if (controller_mask & kControllerMaskRight)
-            {
-                publishControllerButtons(right_buttons_offset, pub_right_joy_);
-            }
-        }
-
-        off = 16 + kSensorBlockBytes + kButtonsBlockBytes;
-        if (!readBlockHeader(kJoint24BlockType, kJoint24BlockBytes))
-        {
-            return;
-        }
-
-        const size_t joint_block_payload = off;
-        const uint8_t joint_count = data[joint_block_payload + 0];
-        const uint8_t joint_flags = data[joint_block_payload + 1];
-        const uint32_t valid_mask = readLeU32(data + joint_block_payload + 4);
-        const uint32_t raw_joint_mask = valid_mask & kJointMaskAll;
-        if (joint_count != kJointCount)
-        {
-            const auto now = clock_.now();
-            if ((now - last_warn_).seconds() > 1.0)
-            {
-                last_warn_ = now;
-                RCLCPP_WARN(logger_, "PoseUdpReceiver: invalid Joint24 count=%u", static_cast<unsigned>(joint_count));
-            }
-            return;
-        }
-
-        const size_t joint_entries_offset = joint_block_payload + 8;
         std::array<geometry_msgs::msg::Pose, kJointCount> raw_poses;
-
-        auto readPose = [&](size_t pose_offset)
-        {
-            return makePose(readLeF32(data + pose_offset + 0),
-                            readLeF32(data + pose_offset + 4),
-                            readLeF32(data + pose_offset + 8),
-                            readLeF32(data + pose_offset + 12),
-                            readLeF32(data + pose_offset + 16),
-                            readLeF32(data + pose_offset + 20),
-                            readLeF32(data + pose_offset + 24));
-        };
-
+        const size_t joint_entries_offset = joint_pose_payload + 8;
         for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
         {
-            raw_poses[joint_index] = readPose(joint_entries_offset + joint_index * 28);
+            const size_t pose_offset = joint_entries_offset + joint_index * 22;
+            raw_poses[joint_index] = makePose(
+                dequantizePosition(position_scale_code, readLeI16(data + pose_offset + 0)),
+                dequantizePosition(position_scale_code, readLeI16(data + pose_offset + 2)),
+                dequantizePosition(position_scale_code, readLeI16(data + pose_offset + 4)),
+                readLeF32(data + pose_offset + 6),
+                readLeF32(data + pose_offset + 10),
+                readLeF32(data + pose_offset + 14),
+                readLeF32(data + pose_offset + 18));
         }
 
-        geometry_msgs::msg::PoseArray joint24_msg;
-        joint24_msg.header.stamp = stamp;
-        joint24_msg.header.frame_id = cfg_.frame_id_joint24;
-        joint24_msg.poses.reserve(kJointCount);
-        for (const auto &pose : raw_poses)
+        off = 16 + kBodyStateBlockBytes + kJoint24RawPoseQBlockBytes;
+        if (!readBlockHeader(kJoint24FullMotionQBlockType, kJoint24FullMotionQBlockBytes))
         {
-            joint24_msg.poses.push_back(pose);
-        }
-        pub_joint24_->publish(joint24_msg);
-
-        std_msgs::msg::UInt32 valid_mask_msg;
-        valid_mask_msg.data = valid_mask;
-        pub_joint24_valid_mask_->publish(valid_mask_msg);
-
-        geometry_msgs::msg::PoseArray joint24_waist_msg;
-        joint24_waist_msg.header.stamp = stamp;
-        joint24_waist_msg.header.frame_id = cfg_.frame_id_waist;
-        joint24_waist_msg.poses.reserve(kJointCount);
-
-        uint32_t waist_valid_mask = 0;
-        Vec3 pelvis_position;
-        Quat pelvis_orientation;
-        const bool pelvis_valid = (raw_joint_mask & 1u) != 0u &&
-                                  poseToTransform(raw_poses[0], pelvis_position, pelvis_orientation);
-
-        if (pelvis_valid)
-        {
-            const Quat pelvis_inverse = conjugateQuat(pelvis_orientation);
-            for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
-            {
-                const uint32_t joint_bit = 1u << joint_index;
-                Vec3 joint_position;
-                Quat joint_orientation;
-                if ((raw_joint_mask & joint_bit) != 0u &&
-                    poseToTransform(raw_poses[joint_index], joint_position, joint_orientation))
-                {
-                    joint24_waist_msg.poses.push_back(makeRelativePose(
-                        joint_position,
-                        joint_orientation,
-                        pelvis_position,
-                        pelvis_inverse));
-                    waist_valid_mask |= joint_bit;
-                }
-                else
-                {
-                    joint24_waist_msg.poses.push_back(makeIdentityPose());
-                }
-            }
-        }
-        else
-        {
-            for (size_t joint_index = 0; joint_index < kJointCount; ++joint_index)
-            {
-                joint24_waist_msg.poses.push_back(makeIdentityPose());
-            }
+            warnThrottled("PoseUdpReceiver: invalid 0x09 joint motion block");
+            return;
         }
 
-        pub_joint24_waist_->publish(joint24_waist_msg);
-
-        std_msgs::msg::UInt32 waist_valid_mask_msg;
-        waist_valid_mask_msg.data = waist_valid_mask;
-        pub_joint24_waist_valid_mask_->publish(waist_valid_mask_msg);
-
-        (void)joint_flags;
+        const uint32_t valid_mask = state_result == 0 && data_result == 0 && is_tracking != 0
+                                        ? (joint_valid_mask & pose_valid_mask)
+                                        : 0u;
+        publishJoint24(stamp, raw_poses, valid_mask);
     }
 
     void PoseUdpReceiver::recvThreadMain()

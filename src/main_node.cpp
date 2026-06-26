@@ -19,8 +19,7 @@ namespace trb
         using AgvBatteryStateMsg = teleop_robot_bridge::msg::AgvBatteryState;
         using AgvDeviceStateMsg = teleop_robot_bridge::msg::AgvDeviceState;
         using TemperatureMsg = teleop_robot_bridge::msg::Temperature;
-        using ArmJointFeedbackMsg = teleop_robot_bridge::msg::ArmJointFeedback;
-        using WaistJointFeedbackMsg = teleop_robot_bridge::msg::WaistJointFeedback;
+        using JointStateMsg = sensor_msgs::msg::JointState;
 
         template <typename T>
         T declareOrGet(rclcpp::Node &node, const std::string &name, const T &default_value)
@@ -96,10 +95,7 @@ namespace trb
         constexpr const char *kFallbackModel = "teleop_robot_demo";
         constexpr const char *kFallbackFirmwareVersion = "v0.0.0-demo";
 
-        constexpr size_t kRobotJointTelemetryJointCount = 17;
-        constexpr size_t kWaistJointCount = 3;
-        constexpr size_t kArmJointCount = 14;
-        constexpr size_t kArmJointOffset = kWaistJointCount;
+        constexpr size_t kRobotJointTelemetryJointCount = 19;
         constexpr std::array<const char *, kRobotJointTelemetryJointCount> kRobotJointTelemetryJointNames{
             "Waist01_Joint",
             "Waist02_Joint",
@@ -118,29 +114,8 @@ namespace trb
             "openarm_right_joint5",
             "openarm_right_joint6",
             "openarm_right_joint7",
-        };
-
-        constexpr std::array<const char *, kWaistJointCount> kWaistFeedbackJointNames{
-            "waist_1",
-            "waist_2",
-            "waist_3",
-        };
-
-        constexpr std::array<const char *, kArmJointCount> kArmFeedbackJointNames{
-            "joint_1",
-            "joint_2",
-            "joint_3",
-            "joint_4",
-            "joint_5",
-            "joint_6",
-            "joint_7",
-            "joint_8",
-            "joint_9",
-            "joint_10",
-            "joint_11",
-            "joint_12",
-            "joint_13",
-            "joint_14",
+            "Head02_Joint",
+            "Head03_Joint",
         };
 
         std::optional<size_t> exactRobotJointIndex(const std::string &name)
@@ -151,46 +126,6 @@ namespace trb
                 {
                     return joint_index;
                 }
-            }
-            return std::nullopt;
-        }
-
-        std::optional<size_t> waistJointIndexFromFeedbackName(const std::string &name, size_t source_index)
-        {
-            if (const auto exact_index = exactRobotJointIndex(name))
-            {
-                return *exact_index < kWaistJointCount ? exact_index : std::nullopt;
-            }
-            for (size_t joint_index = 0; joint_index < kWaistFeedbackJointNames.size(); ++joint_index)
-            {
-                if (name == kWaistFeedbackJointNames[joint_index])
-                {
-                    return joint_index;
-                }
-            }
-            if (name.empty() && source_index < kWaistJointCount)
-            {
-                return source_index;
-            }
-            return std::nullopt;
-        }
-
-        std::optional<size_t> armJointIndexFromFeedbackName(const std::string &name, size_t source_index)
-        {
-            if (const auto exact_index = exactRobotJointIndex(name))
-            {
-                return *exact_index >= kArmJointOffset ? exact_index : std::nullopt;
-            }
-            for (size_t joint_index = 0; joint_index < kArmFeedbackJointNames.size(); ++joint_index)
-            {
-                if (name == kArmFeedbackJointNames[joint_index])
-                {
-                    return kArmJointOffset + joint_index;
-                }
-            }
-            if (name.empty() && source_index < kArmJointCount)
-            {
-                return kArmJointOffset + source_index;
             }
             return std::nullopt;
         }
@@ -303,12 +238,9 @@ namespace trb
             [this](const AgvDeviceStateMsg::SharedPtr msg) { onTelemetryDeviceState(msg); });
         if (joint_telemetry_config_.enabled)
         {
-            waist_joint_feedback_sub_ = this->create_subscription<WaistJointFeedbackMsg>(
-                joint_telemetry_config_.waist_topic, 10,
-                [this](const WaistJointFeedbackMsg::SharedPtr msg) { onWaistJointFeedback(msg); });
-            arm_joint_feedback_sub_ = this->create_subscription<ArmJointFeedbackMsg>(
-                joint_telemetry_config_.arm_topic, 10,
-                [this](const ArmJointFeedbackMsg::SharedPtr msg) { onArmJointFeedback(msg); });
+            joint_state_sub_ = this->create_subscription<JointStateMsg>(
+                joint_telemetry_config_.joint_state_topic, 10,
+                [this](const JointStateMsg::SharedPtr msg) { onJointState(msg); });
         }
 
         video_module_ = std::make_unique<trb::video::VideoModule>(*this, trb::video::VideoModule::Config::configFromRosParam(*this));
@@ -498,8 +430,7 @@ namespace trb
 
         joint_telemetry_config_.enabled = declareOrGet<bool>(*this, "telemetry.high_rate.enabled", true);
         joint_telemetry_config_.period_sec = std::max(0.005, declareOrGet<double>(*this, "telemetry.high_rate.period_sec", 0.02));
-        joint_telemetry_config_.waist_topic = declareOrGet<std::string>(*this, "telemetry.high_rate.waist_topic", "/waist_joint_feedback");
-        joint_telemetry_config_.arm_topic = declareOrGet<std::string>(*this, "telemetry.high_rate.arm_topic", "/arm_joint_feedback");
+        joint_telemetry_config_.joint_state_topic = declareOrGet<std::string>(*this, "telemetry.high_rate.joint_state_topic", "/joint_states");
         const int joint_schema_id = declareOrGet<int>(*this, "telemetry.high_rate.schema_id", telemetry::kRobotJointTelemetrySchemaId);
         joint_telemetry_config_.snapshot = telemetry::RobotJointTelemetrySnapshot{};
         joint_telemetry_config_.snapshot.version = telemetry::kRobotJointTelemetryPayloadVersion;
@@ -543,7 +474,7 @@ namespace trb
         telemetry_config_.snapshot.firmware_version = msg->firmware_version;
     }
 
-    void MainNode::onWaistJointFeedback(const WaistJointFeedbackMsg::SharedPtr msg)
+    void MainNode::onJointState(const JointStateMsg::SharedPtr msg)
     {
         if (!msg)
         {
@@ -552,42 +483,27 @@ namespace trb
 
         std::lock_guard<std::mutex> lock(joint_telemetry_snapshot_mutex_);
         joint_telemetry_config_.snapshot.sample_timestamp_ms = stampToUnixMs(msg->header.stamp.sec, msg->header.stamp.nanosec);
-        for (size_t source_index = 0; source_index < kWaistJointCount; ++source_index)
+
+        for (auto &joint : joint_telemetry_config_.snapshot.joints)
         {
-            const auto joint_index = waistJointIndexFromFeedbackName(msg->name[source_index], source_index);
+            joint = telemetry::RobotJointStateSample{};
+        }
+
+        const size_t sample_count = std::min(msg->name.size(), msg->position.size());
+        for (size_t source_index = 0; source_index < sample_count; ++source_index)
+        {
+            const auto joint_index = exactRobotJointIndex(msg->name[source_index]);
             if (!joint_index)
             {
                 continue;
             }
+            const double velocity = source_index < msg->velocity.size() ? msg->velocity[source_index] : 0.0;
+            const double effort = source_index < msg->effort.size() ? msg->effort[source_index] : 0.0;
             setJointSample(joint_telemetry_config_.snapshot,
                            *joint_index,
                            msg->position[source_index],
-                           msg->velocity[source_index],
-                           msg->effort[source_index]);
-        }
-    }
-
-    void MainNode::onArmJointFeedback(const ArmJointFeedbackMsg::SharedPtr msg)
-    {
-        if (!msg)
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(joint_telemetry_snapshot_mutex_);
-        joint_telemetry_config_.snapshot.sample_timestamp_ms = stampToUnixMs(msg->header.stamp.sec, msg->header.stamp.nanosec);
-        for (size_t source_index = 0; source_index < kArmJointCount; ++source_index)
-        {
-            const auto joint_index = armJointIndexFromFeedbackName(msg->name[source_index], source_index);
-            if (!joint_index)
-            {
-                continue;
-            }
-            setJointSample(joint_telemetry_config_.snapshot,
-                           *joint_index,
-                           msg->position[source_index],
-                           msg->velocity[source_index],
-                           msg->effort[source_index]);
+                           velocity,
+                           effort);
         }
     }
 
