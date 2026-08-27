@@ -2,7 +2,7 @@
 
 > 状态：草案  
 > 目标：提取机器人端从启动到运行、收发媒体、遥测、姿态和异常处理的业务流程。  
-> 原则：协议对外不变，内部模块化，各业务流独立管理。
+> 原则：对齐当前后端的 Publisher-local Stream 接口，内部模块化，各业务流独立管理。
 
 ## 1. 角色
 
@@ -21,7 +21,7 @@ VR endpoint:
 Signaling server:
   注册和 session 管理
   配对事件转发
-  配置转发和 ACK
+  Publisher Manifest 与 StreamConfig 保存/查询
   辅助 UDP endpoint 建链
 ```
 
@@ -42,15 +42,18 @@ Process start
 
 ```text
 SignalingClient.start()
-  -> Register(token, role=ROBOT, device_id, robot_generation)
-  -> receive session_id
+  -> Register(device_id, runtime descriptor)
+  -> receive session_id + authoritative device_type_code/hardware
   -> start heartbeat timer
+  -> publish local Stream Manifest (0x01/0x04/0x05/0x06 as enabled)
   -> notify SessionController registered
 ```
 
 失败处理：
 
 - 注册失败进入 retry。
+- `device_id` 必须已在后端登记，设备类型和硬件信息不能由客户端声明。
+- Manifest 发布失败时保持 Registered 并重试，不启动 UDP 数据面。
 - retry 周期由 `grpc.register_retry_sec` 控制。
 - 未注册成功前，不启动 session-bound media streams。
 
@@ -58,6 +61,7 @@ SignalingClient.start()
 
 ```text
 gRPC registered
+  -> local Stream Manifest published
   -> UdpTransport.start(session_id)
   -> ControlStream sends HELLO periodically
   -> receive ACK
@@ -86,7 +90,7 @@ registered + UDP ready
 
 ```text
 registered + UDP ready
-  -> ListUnpaired(optional)
+  -> ListUnpaired(desired_device_type_code) if peer_session_id is empty
   -> RequestPair(peer)
   -> wait PairEvent.ACCEPT / REJECT
 ```
@@ -96,6 +100,8 @@ Pair accepted:
 ```text
 store paired_peer_session_id
 state = Negotiating
+pull peer Manifest
+subscribe available peer prefixes (0x02/0x09, optional 0x04)
 start video negotiation path
 ```
 
@@ -118,26 +124,29 @@ return to Pairing
 
 ### Video
 
+JSON payload 字段定义见 `doc/STREAM_CONFIG_JSON_V1.md`。
+
 ```text
 Negotiating
   -> VideoStream.start()
   -> wait encoder SPS/PPS
-  -> PublishVideoConfig(width, height, fps, codec, sps, pps, vps)
-  -> wait / infer config accepted by RPC result
+  -> PublishStreamConfig(prefix=0x01, schema=1, JSON payload)
+  -> continue after RPC succeeds
 ```
 
 规则：
 
 - 第一版推荐 H.264。
-- 没有 SPS/PPS 时不能发布 VideoConfig。
+- 没有 SPS/PPS 时不能发布视频 StreamConfig。
 - 启动超时可以只重启 VideoStream，不影响其他流。
 
 ### Audio
 
 ```text
 if audio enabled:
-  -> publish AudioConfig
-  -> start AudioStream after config published
+  -> uplink: PublishStreamConfig(prefix=0x04, JSON schema=1)
+  -> downlink: GetStreamConfig(peer, prefix=0x04)
+  -> validate peer config and start AudioStream
 ```
 
 规则：
@@ -175,7 +184,7 @@ UdpTransport:
   single socket sendto
 
 PoseInputStream:
-  receive Type 0x02
+  receive Type 0x02 / 0x09
   publish ROS pose/joy topics
 ```
 
@@ -207,7 +216,7 @@ USB 3.0 dual camera
 - `appsink` 回调只 copy/ref H.264 AU 并入 `encoded_frame_queue`，不做 packetize、FEC、pacing 或 `sendto()`。
 - appsink 不积压旧帧。
 - `VideoStream worker` 从 `encoded_frame_queue` 取最新 AU，解析 SPS/PPS/IDR，再生成现有 `0x01` UDP 视频分片。
-- SPS/PPS 可用后，通过现有 gRPC `VideoConfig` 流程发布。
+- SPS/PPS 可用后，通过 gRPC `PublishStreamConfig(prefix=0x01)` 发布 JSON 配置。
 - video_queue 只保留 1 到 2 帧。
 - 新 keyframe 入队时清旧视频帧。
 - 网络压力下先丢 FEC parity，再丢旧 P 帧。

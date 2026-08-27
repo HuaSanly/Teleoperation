@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -19,12 +20,18 @@ namespace trb
 
     struct GrpcConfig
     {
+        bool enabled{true};
         std::string server_grpc_ip;
         int server_grpc_port{0};
         bool use_ssl{false};
         std::string device_id;
-        int robot_generation{2};
-        std::string token;
+        std::string firmware_version;
+        std::string software_version;
+        std::string operating_system;
+        std::string operating_system_version;
+        std::string runtime_version;
+        std::string build_id;
+        std::vector<std::string> capabilities;
         int rpc_timeout_ms{5000};
         double register_retry_sec{3.0};
         double heartbeat_sec{15.0};
@@ -51,7 +58,8 @@ namespace trb
         GrpcManager &operator=(const GrpcManager &) = delete;
 
         bool Register();
-        const std::string &session_id() const;
+        std::string session_id() const;
+        std::string device_type_code() const;
 
         bool RequestPair(const std::string &peer_session_id);
         bool AcceptPair(const std::string &peer_session_id);
@@ -59,16 +67,20 @@ namespace trb
         bool Unpair(const std::string &peer_session_id);
 
         bool Subscribe(const std::string &publisher_session_id,
-                       bool sub_video,
-                       bool sub_pose,
-                       bool sub_audio);
+                       const std::vector<uint8_t> &prefixes);
         bool Unsubscribe(const std::string &publisher_session_id);
-        std::vector<signaling::UnpairedEndpoint> ListUnpaired(signaling::RegisterRequest::EndpointType desired_role);
+        std::vector<signaling::UnpairedEndpoint> ListUnpaired(const std::string &desired_device_type_code);
 
-        bool PublishVideoConfig(const signaling::VideoConfig &config, signaling::VideoConfigAck &ack);
-        bool AckVideoConfig(const signaling::VideoConfigAck &ack);
-        bool PublishAudioConfig(const signaling::AudioConfig &config, signaling::AudioConfigAck &ack);
-        bool AckAudioConfig(const signaling::AudioConfigAck &ack);
+        bool PublishStreamManifest(const signaling::PublishStreamManifestRequest &request);
+        bool GetStreamManifest(const std::string &publisher_session_id,
+                               signaling::GetStreamManifestResponse &response);
+        bool PublishStreamConfig(uint8_t prefix,
+                                 uint32_t schema_version,
+                                 const std::string &payload,
+                                 signaling::StreamConfigItem *published_item = nullptr);
+        bool GetStreamConfig(const std::string &publisher_session_id,
+                             uint8_t prefix,
+                             signaling::StreamConfigItem &item);
         bool GetP2pInfo(signaling::GetP2pInfoResponse &response);
         HeartbeatResult Heartbeat();
 
@@ -105,7 +117,9 @@ namespace trb
         GrpcConfig config_;
         rclcpp::Logger logger_;
         std::unique_ptr<signaling::Signaling::Stub> stub_;
+        mutable std::mutex session_mutex_;
         std::string session_id_;
+        std::string device_type_code_;
 
         std::atomic<bool> shutting_down_{false};
         std::mutex pending_rpc_mutex_;

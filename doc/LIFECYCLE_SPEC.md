@@ -103,12 +103,13 @@ Negotiating -> Pairing   on pair reject / negotiation cancel
 含义：
 
 - gRPC session 已建立。
-- UDP transport 可以启动。
+- 本会话的 Publisher Manifest 可以声明。
 
 进入动作：
 
 - 启动 heartbeat。
-- 启动 UDP transport。
+- 声明 enabled 的 `0x01/0x04/0x05/0x06` Publisher-local streams。
+- Manifest 成功后启动 UDP transport。
 - ControlStream 开始发送 HELLO。
 
 退出条件：
@@ -136,7 +137,7 @@ Negotiating -> Pairing   on pair reject / negotiation cancel
 
 - 启动 `EventStream`。
 - passive mode 等待 `PairEvent.REQUEST`。
-- active mode 可 `ListUnpaired` 并 `Pair(REQUEST)`。
+- active mode 可按 `desired_device_type_code` 执行 `ListUnpaired` 并 `Pair(REQUEST)`。
 
 退出条件：
 
@@ -152,12 +153,14 @@ Negotiating -> Pairing   on pair reject / negotiation cancel
 进入动作：
 
 - 启动 `VideoStream` 以获得 SPS/PPS。
-- 发布 `VideoConfig`。
-- 若音频启用，发布 `AudioConfig`。
+- 拉取对端 Manifest 并显式订阅 `0x02/0x09`，需要音频下行时同时订阅 `0x04`。姿态 Prefix 暂未发布时不阻塞视频进入 Running，运行态后台继续重试并补齐订阅。
+- 发布 `0x01` 视频 JSON StreamConfig。
+- 若音频上行启用，发布 `0x04` 音频 JSON StreamConfig。
+- 若音频下行启用，主动拉取并校验对端 `0x04` StreamConfig。
 
 退出条件：
 
-- 必需配置发布成功 -> `Running`
+- 必需订阅与 StreamConfig 发布/拉取成功 -> `Running`
 - pair reject / unpair -> `Pairing`
 - gRPC invalid -> `Connecting`
 
@@ -216,6 +219,7 @@ Stopped
 条件：
 
 - 收到 ACK。
+- 当前会话已经成功声明对应 Prefix 的 Manifest。
 
 动作：
 
@@ -343,7 +347,7 @@ return immediately
 ```text
 encoded_frame_queue
   -> parse SPS/PPS/IDR/keyframe
-  -> update VideoConfig readiness
+  -> update video StreamConfig readiness
   -> VideoPacketizer
   -> optional FEC
   -> video_queue

@@ -58,7 +58,8 @@ namespace trb
         void setStreamEndCallback(StreamEndCallback callback) { on_stream_end_ = std::move(callback); }
 
         bool isRegistered() const { return registered_.load(); }
-        const std::string &sessionId() const;
+        std::string sessionId() const;
+        std::string deviceTypeCode() const;
         const Config &config() const { return config_; }
 
         void startEventStream();
@@ -67,9 +68,13 @@ namespace trb
         bool acceptPair(const std::string &peer_session_id);
         bool rejectPair(const std::string &peer_session_id);
         bool unpair(const std::string &peer_session_id);
-        bool subscribe(const std::string &publisher_session_id, bool sub_video, bool sub_pose, bool sub_audio);
+        bool subscribe(const std::string &publisher_session_id, const std::vector<uint8_t> &prefixes);
         bool unsubscribe(const std::string &publisher_session_id);
-        std::vector<signaling::UnpairedEndpoint> listUnpaired(signaling::RegisterRequest::EndpointType desired_role);
+        std::vector<signaling::UnpairedEndpoint> listUnpaired(const std::string &desired_device_type_code);
+        bool getStreamPrefixes(const std::string &publisher_session_id, std::vector<uint8_t> &prefixes);
+        bool publishRobotStreamManifest(bool audio_enabled,
+                                        bool low_rate_telemetry_enabled,
+                                        bool high_rate_telemetry_enabled);
 
         bool publishVideoConfig(uint32_t width,
                                 uint32_t height,
@@ -84,7 +89,9 @@ namespace trb
                                 float dfov_deg);
 
         bool publishAudioConfig(const AudioConfig &audio_config);
-        bool ackAudioConfig(bool success, const std::string &message, const std::string &config_id);
+        bool fetchAudioConfig(const std::string &publisher_session_id,
+                              AudioConfig &audio_config,
+                              std::string &config_id);
 
     private:
         void tryRegister();

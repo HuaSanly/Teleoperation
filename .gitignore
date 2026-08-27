@@ -1,6 +1,7 @@
 /logs/
 /h264/
 /urdf/
+/sync_back_new/
 # Prerequisites
 *.d
 

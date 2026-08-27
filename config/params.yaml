@@ -11,14 +11,22 @@
       auto_accept: true
       list_unpaired_on_start: false
       peer_session_id: ""
+      peer_device_type_code: ""
 
     grpc:
+      enabled: true
       server_grpc_ip: "grpc-dev.eifuture.com"
       server_grpc_port: 7777
       use_ssl: true
-      device_id: "robot_876"
-      robot_generation: 2
-      token: "secure"
+      device_id: "device:2775c4052fe22992a2460196"
+      runtime:
+        firmware_version: ""
+        software_version: "teleop_robot_bridge"
+        operating_system: "Linux"
+        operating_system_version: ""
+        runtime_version: "ROS 2"
+        build_id: ""
+        capabilities: ["publisher_streams"]
       rpc_timeout_ms: 5000
       register_retry_sec: 3.0
       heartbeat_sec: 3.0
@@ -99,7 +107,7 @@
 
     video:
       profile: [3840, 1520, 30]
-      device: "/dev/video0"
+      device: "/dev/video1"
       pixel_format: "mjpeg"
       sbs_crop:
         enabled: false
@@ -166,7 +174,7 @@
     audio:
       enabled: true
       uplink_enabled: false
-      downlink_enabled: true
+      downlink_enabled: false
       aec_enabled: false
       capture_device: "plughw:2,0"
       playback_device: "plughw:2,0"

@@ -7,44 +7,54 @@ package signaling;
 import "google/protobuf/empty.proto";
 
 // --- 1. HELLO (注册) ---
+message DeviceHardwareDescriptor {
+  optional uint32 hardware_generation = 1;
+  optional string hardware_version = 2;
+  optional string hardware_revision = 3;
+  map<string, string> extensions = 100;
+}
+
+message DeviceRuntimeDescriptor {
+  optional string firmware_version = 1;
+  optional string software_version = 2;
+  optional string operating_system = 3;
+  optional string operating_system_version = 4;
+  optional string runtime_version = 5;
+  optional string build_id = 6;
+  repeated string capabilities = 7;
+  map<string, string> extensions = 100;
+}
+
 message RegisterRequest {
-  string token = 1;
-  EndpointType role = 2;
-  string device_id = 3; // 展示用，允许重复
-  int32 robot_generation = 4; // 仅机器人使用；VR 传 0
-  string vr_version = 5; // 仅 VR 使用；机器人传空字符串
-  
-  enum EndpointType {
-    UNKNOWN = 0;
-    ROBOT = 1;
-    VR = 2;
-  }
+  string device_id = 3; // 后端登记生成的稳定设备 ID，1-64 UTF-8 bytes，仅允许 A-Z a-z 0-9 _ - . :
+  DeviceRuntimeDescriptor runtime = 6;
 }
 
 // --- 7. 列出未配对的对端 ---
 message ListUnpairedRequest {
-  // 可选筛选角色，留空则根据发起端自动取反：VR请求列出机器人，机器人请求列出VR
-  RegisterRequest.EndpointType desired_role = 1;
+  string desired_device_type_code = 2; // 必填；匹配该设备类型节点及完整子树
 }
 
 message ListUnpairedResponse {
   repeated UnpairedEndpoint endpoints = 1;
+  bool success = 2;
+  string message = 3;
 }
 
 message UnpairedEndpoint {
   string session_id = 1;
   string device_id = 2;
-  RegisterRequest.EndpointType role = 3;
-  int32 robot_generation = 4;
-  string vr_version = 5;
+  string device_type_code = 6;
+  DeviceHardwareDescriptor hardware = 7;
+  DeviceRuntimeDescriptor runtime = 8;
 }
 
 message EndpointInfo {
   string session_id = 1;
   string device_id = 2;
-  RegisterRequest.EndpointType role = 3;
-  int32 robot_generation = 4;
-  string vr_version = 5;
+  string device_type_code = 6;
+  DeviceHardwareDescriptor hardware = 7;
+  DeviceRuntimeDescriptor runtime = 8;
 }
 
 // --- 8. 事件订阅与推送 ---
@@ -71,8 +81,6 @@ message EventMessage {
   oneof payload {
     PairEvent pair = 10;
     SystemCommand system = 11; // [新增] 系统指令
-    VideoConfig video_config = 12; // [新增] 视频参数同步（转发给配对端/订阅者）
-    AudioConfig audio_config = 13; // [新增] 音频参数同步（转发给配对端/订阅者）
   }
 }
 
@@ -92,6 +100,8 @@ message RegisterResponse {
   string session_id = 3; // [新增] 唯一会话ID，用于UDP握手
   string client_ip = 4;  // [新增] 你的公网IP
   int32 client_port = 5; // [新增] 你的公网端口
+  string device_type_code = 6;
+  DeviceHardwareDescriptor hardware = 7;
 }
 
 // --- 2. PING (心跳) ---
@@ -110,14 +120,14 @@ message HeartbeatAck {
 // --- 3. PAR1 (配对 - 三方握手) ---
 message PairRequest {
   Operation op = 1;
-  string peer_session_id = 2; 
+  string peer_session_id = 2;
   PairState state = 3; // [新增] 对应 Flags
-  
+
   enum Operation {
     PAIR = 0;
     UNPAIR = 1;
   }
-  
+
   enum PairState {
     REQUEST = 0;  // Flags 0x00: 发起请求 / 通知机器人
     PENDING = 1;  // Flags 0x01: 服务器收到，处理中
@@ -135,12 +145,11 @@ message PairResponse {
 message SubscribeRequest {
   Operation op = 1;
   string publisher_session_id = 2; // 订阅谁（SessionId）
-  
-  // 资源掩码 (对应 ResourceMask)
-  bool sub_video = 3;      // 0x02
-  bool sub_pose = 4;       // 0x01
-  bool sub_audio = 5;      // 扩展
-  
+
+  // 订阅目标发布会话已经在 Manifest 中声明的 Publisher-local Prefix。
+  // 同一 Prefix 在不同 PublisherSessionId 下可以具有不同语义。
+  repeated uint32 subscribe_prefixes = 8;
+
   enum Operation {
     SUBSCRIBE = 0;
     UNSUBSCRIBE = 1;
@@ -152,65 +161,78 @@ message SubscribeResponse {
   string message = 2;
 }
 
-// --- 5. VPAR (视频参数) ---
-message VideoFov {
-  float hfov = 1;
-  float vfov = 2;
-  float dfov = 3;
+// --- 5. Publisher-local Stream Manifest ---
+message StreamManifestDeclaration {
+  uint32 prefix = 1;             // 当前发布会话内的 UDP 首字节，范围 0..255
+  string stream_code = 2;        // 发布者定义的稳定流语义代码
+  string display_name = 3;       // 展示名称
+  string description = 4;        // 简短说明
+  string stream_class_code = 5;  // 必须引用后端已启用的流大类
+  string protocol_code = 6;      // 可选；空值表示透明自定义协议
 }
 
-message VideoConfig {
-  CodecType codec = 1;
-  int32 width = 2;
-  int32 height = 3;
-  int32 fps = 4;
-  
-  bytes sps = 5; // H.264 SPS (不含起始码)
-  bytes pps = 6; // H.264 PPS
-  bytes vps = 7; // H.265 VPS
-
-  // 服务端转发用的相关ID：用于接收端回 ACK，以及服务端做超时重发。
-  // 客户端可留空；服务端会在转发时补齐。
-  string config_id = 8;
-
-  // 视场角信息，单位通常为度。
-  VideoFov fov = 9;
-  
-  enum CodecType {
-    H264 = 0;
-    H265 = 1;
-  }
+message StreamManifestItem {
+  string publisher_session_id = 1;
+  uint32 prefix = 2;
+  string stream_code = 3;
+  string display_name = 4;
+  string description = 5;
+  string stream_class_code = 6;
+  string protocol_code = 7;
+  int64 declared_unix_time_ms = 8;
 }
 
-message VideoConfigAck {
+message PublishStreamManifestRequest {
+  repeated StreamManifestDeclaration streams = 1; // 一条或多条增量增加/替换
+}
+
+message DeleteStreamManifestRequest {
+  repeated uint32 prefixes = 1; // 一条或多条增量删除
+}
+
+message StreamManifestMutationResponse {
   bool success = 1;
   string message = 2;
-
-  // 对应 VideoConfig.config_id
-  string config_id = 3;
+  uint64 version = 3;
+  repeated StreamManifestItem items = 4;
 }
 
-// --- 5A. APAR (音频参数) ---
-message AudioConfig {
-  CodecType codec = 1;
-  int32 sample_rate = 2;
-  int32 channels = 3;
-  int32 frame_duration_ms = 4;
-  int32 samples_per_channel = 5;
-  int32 bitrate_bps = 6;
-  bool opus_inband_fec_enabled = 7;
-  bool opus_dtx_enabled = 8;
-  string config_id = 9;
-
-  enum CodecType {
-    OPUS = 0;
-  }
+message GetStreamManifestRequest {
+  string publisher_session_id = 1;
 }
 
-message AudioConfigAck {
+message GetStreamManifestResponse {
+  string publisher_session_id = 1;
+  uint64 version = 2;
+  repeated StreamManifestItem items = 3;
+}
+
+// --- 5A. Publisher-local generic StreamConfig ---
+message PublishStreamConfigRequest {
+  uint32 prefix = 1;
+  uint32 schema_version = 3;
+  bytes payload = 4; // 默认最大 64 KiB，由服务端配置限制
+}
+
+message GetStreamConfigRequest {
+  string publisher_session_id = 1;
+  uint32 prefix = 2;
+}
+
+message StreamConfigItem {
+  string publisher_session_id = 1;
+  uint32 prefix = 2;
+  uint32 schema_version = 4;
+  bytes payload = 5;
+  string config_id = 6;
+  uint64 version = 7;
+  int64 updated_unix_time_ms = 8;
+}
+
+message StreamConfigMutationResponse {
   bool success = 1;
   string message = 2;
-  string config_id = 3;
+  StreamConfigItem item = 3;
 }
 
 // --- 9. P2P 信息下发（客户端主动拉取） ---
@@ -231,13 +253,13 @@ message GetP2pInfoResponse {
 message ControlCommand {
   CommandType type = 1;
   ResourceType resource = 2; // [新增] 控制哪个资源 (Video/Pose)
-  
+
   enum CommandType {
     STOP = 0;
     START = 1;
     FORCE_KEYFRAME = 2;
   }
-  
+
   enum ResourceType {
     ALL = 0;
     VIDEO = 1; // 对应 Category=1
@@ -251,27 +273,16 @@ service Signaling {
   rpc Register (RegisterRequest) returns (RegisterResponse);
   rpc Pair (PairRequest) returns (PairResponse);
   rpc Subscribe (SubscribeRequest) returns (SubscribeResponse);
+  rpc PublishStreamManifest (PublishStreamManifestRequest) returns (StreamManifestMutationResponse);
+  rpc DeleteStreamManifest (DeleteStreamManifestRequest) returns (StreamManifestMutationResponse);
+  rpc GetStreamManifest (GetStreamManifestRequest) returns (GetStreamManifestResponse);
+  rpc PublishStreamConfig (PublishStreamConfigRequest) returns (StreamConfigMutationResponse);
+  rpc GetStreamConfig (GetStreamConfigRequest) returns (StreamConfigItem);
   rpc ListUnpaired (ListUnpairedRequest) returns (ListUnpairedResponse);
   rpc Ping (Heartbeat) returns (HeartbeatAck);
 
   // P2P 信息拉取：调用方 sessionId 从 metadata/header 的 session-id 解析。
   rpc GetP2pInfo (google.protobuf.Empty) returns (GetP2pInfoResponse);
-
-  // 客户端上报视频参数（SPS/PPS/FPS 等）；服务端转发给配对端与订阅了该发布者的端。
-  // sender sessionId 从 metadata/header 的 session-id 解析。
-  rpc PublishVideoConfig (VideoConfig) returns (VideoConfigAck);
-
-  // 接收端对 EventMessage.video_config 回 ACK。
-  // sender sessionId 从 metadata/header 的 session-id 解析。
-  rpc AckVideoConfig (VideoConfigAck) returns (google.protobuf.Empty);
-
-  // 客户端上报音频参数（采样率/声道/帧长/码率等）；服务端转发给配对端与订阅了该发布者的端。
-  // sender sessionId 从 metadata/header 的 session-id 解析。
-  rpc PublishAudioConfig (AudioConfig) returns (AudioConfigAck);
-
-  // 接收端对 EventMessage.audio_config 回 ACK。
-  // sender sessionId 从 metadata/header 的 session-id 解析。
-  rpc AckAudioConfig (AudioConfigAck) returns (google.protobuf.Empty);
 
   // 事件推送流（机器人端推荐用这个，而不是 WS）：
   // 客户端发一个订阅请求以绑定 session，服务器通过 server-streaming 推送 EventMessage。

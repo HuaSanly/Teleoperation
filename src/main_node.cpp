@@ -86,6 +86,9 @@ namespace trb
         constexpr auto kVideoStartupTimeout = std::chrono::seconds(8);
         constexpr auto kVideoKeyframeRequestInterval = std::chrono::seconds(1);
         constexpr uint64_t kVideoBackpressureKeyframeThreshold = 100;
+        constexpr uint8_t kPoseControllerPrefix = 0x02;
+        constexpr uint8_t kAudioPrefix = 0x04;
+        constexpr uint8_t kBody24RawPrefix = 0x09;
 
         constexpr uint16_t kFallbackBatteryVoltageMv = 48000;
         constexpr int16_t kFallbackBatteryCurrentMa = -1200;
@@ -223,6 +226,8 @@ namespace trb
     MainNode::MainNode() : Node("main_node")
     {
         configureLogging();
+        peer_subscription_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         direct_running_mode_ = declareOrGet<bool>(*this, "debug.direct_running_mode", false);
         loadPairingParams();
         loadRobotTelemetryParams();
@@ -337,7 +342,9 @@ namespace trb
         }
 
         stopNegotiationRetryTimer();
+        stopPeerSubscriptionRetryTimer();
         stopPairingRetryTimer();
+        stopRegisteredSetupRetryTimer();
         if (session_work_timer_)
         {
             session_work_timer_->cancel();
@@ -405,6 +412,7 @@ namespace trb
         }
 
         desired_peer_session_id_ = declareOrGet<std::string>(*this, "pair.peer_session_id", "");
+        desired_peer_device_type_code_ = declareOrGet<std::string>(*this, "pair.peer_device_type_code", "");
         pair_auto_accept_ = declareOrGet<bool>(*this, "pair.auto_accept", true);
         pair_auto_request_ = declareOrGet<bool>(*this, "pair.auto_request", true);
         pair_list_unpaired_on_start_ = declareOrGet<bool>(*this, "pair.list_unpaired_on_start", false);
@@ -538,17 +546,117 @@ namespace trb
 
         stopNegotiationRetryTimer();
         stopPairingRetryTimer();
+        stopRegisteredSetupRetryTimer();
         setState(State::kRegistered, "grpc registered");
+        publisher_manifest_published_ = false;
+        resetPeerSubscriptionState();
 
-        if (!udp_module_ || !grpc_module_)
+        completeRegisteredSetup();
+    }
+
+    bool MainNode::publishLocalStreamManifest()
+    {
+        if (!grpc_module_ || !grpc_module_->isRegistered())
+        {
+            return false;
+        }
+
+        const bool publishes_audio = audio_module_ && audio_module_->isEnabled() &&
+                                     audio_module_->config().uplink_enabled;
+        return grpc_module_->publishRobotStreamManifest(
+            publishes_audio,
+            telemetry_config_.enabled,
+            joint_telemetry_config_.enabled);
+    }
+
+    void MainNode::completeRegisteredSetup()
+    {
+        if (shutting_down_.load(std::memory_order_acquire) ||
+            !grpc_module_ || !grpc_module_->isRegistered() || !udp_module_)
+        {
+            stopRegisteredSetupRetryTimer();
+            return;
+        }
+
+        if (!publisher_manifest_published_)
+        {
+            if (!publishLocalStreamManifest())
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Robot stream manifest publish failed; registered setup will retry");
+                ensureRegisteredSetupRetryTimer();
+                return;
+            }
+            publisher_manifest_published_ = true;
+        }
+
+        if (!udp_module_->isRunning() && !udp_module_->start(grpc_module_->sessionId()))
+        {
+            RCLCPP_WARN(this->get_logger(), "UdpModule failed to start; registered setup will retry");
+            ensureRegisteredSetupRetryTimer();
+            return;
+        }
+
+        stopRegisteredSetupRetryTimer();
+        updateRobotTelemetryLifecycle();
+    }
+
+    void MainNode::registeredSetupRetryTimerCallback()
+    {
+        if (shutting_down_.load(std::memory_order_acquire) ||
+            !grpc_module_ || !grpc_module_->isRegistered())
+        {
+            stopRegisteredSetupRetryTimer();
+            return;
+        }
+        completeRegisteredSetup();
+    }
+
+    void MainNode::ensureRegisteredSetupRetryTimer()
+    {
+        if (!canScheduleRosWork(*this, shutting_down_))
         {
             return;
         }
-        if (!udp_module_->start(grpc_module_->sessionId()))
+
+        const double retry_sec = grpc_module_ ? grpc_module_->config().register_retry_sec : 3.0;
+        if (!registered_setup_retry_timer_)
         {
-            RCLCPP_WARN(this->get_logger(), "UdpModule failed to start; staying in registered state");
+            try
+            {
+                registered_setup_retry_timer_ = this->create_wall_timer(
+                    periodFromSeconds(retry_sec),
+                    [this]() { registeredSetupRetryTimerCallback(); });
+            }
+            catch (const rclcpp::exceptions::RCLError &ex)
+            {
+                if (!shutting_down_.load(std::memory_order_acquire))
+                {
+                    RCLCPP_WARN(this->get_logger(), "Skip registered setup retry timer creation: %s", ex.what());
+                }
+            }
+            return;
         }
-        updateRobotTelemetryLifecycle();
+
+        try
+        {
+            registered_setup_retry_timer_->reset();
+        }
+        catch (const rclcpp::exceptions::RCLError &ex)
+        {
+            if (!shutting_down_.load(std::memory_order_acquire))
+            {
+                RCLCPP_WARN(this->get_logger(), "Skip registered setup retry timer reset: %s", ex.what());
+            }
+        }
+    }
+
+    void MainNode::stopRegisteredSetupRetryTimer()
+    {
+        if (registered_setup_retry_timer_)
+        {
+            registered_setup_retry_timer_->cancel();
+        }
     }
 
     void MainNode::onGrpcHeartbeatFail()
@@ -558,6 +666,10 @@ namespace trb
             return;
         }
 
+        publisher_manifest_published_ = false;
+        resetPeerSubscriptionState();
+        stopPeerSubscriptionRetryTimer();
+        stopRegisteredSetupRetryTimer();
         teardownActiveSession("heartbeat failed", State::kConnecting);
     }
 
@@ -903,16 +1015,26 @@ namespace trb
         std::string peer_session_id = desired_peer_session_id_;
         if (peer_session_id.empty())
         {
-            const auto endpoints = grpc_module_->listUnpaired(signaling::RegisterRequest::VR);
+            if (desired_peer_device_type_code_.empty())
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Active pairing requires pair.peer_session_id or pair.peer_device_type_code");
+                return false;
+            }
+
+            const auto endpoints = grpc_module_->listUnpaired(desired_peer_device_type_code_);
             if (endpoints.empty())
             {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                     "No unpaired VR endpoints found; active pairing will retry");
+                                     "No unpaired endpoint found for device type %s; active pairing will retry",
+                                     desired_peer_device_type_code_.c_str());
                 return false;
             }
             if (pair_list_unpaired_on_start_)
             {
-                RCLCPP_INFO(this->get_logger(), "Found %zu unpaired VR endpoint(s); requesting the first one", endpoints.size());
+                RCLCPP_INFO(this->get_logger(),
+                            "Found %zu unpaired endpoint(s) for device type %s; requesting the first one",
+                            endpoints.size(), desired_peer_device_type_code_.c_str());
             }
             peer_session_id = endpoints.front().session_id();
         }
@@ -998,12 +1120,6 @@ namespace trb
             return;
         }
 
-        if (msg.has_audio_config())
-        {
-            handleRemoteAudioConfig(msg.audio_config());
-            return;
-        }
-
         if (!msg.has_pair())
         {
             if (msg.has_system() && msg.system().action() == signaling::SystemCommand::REQUEST_UDP_HELLO)
@@ -1026,22 +1142,31 @@ namespace trb
 
         const auto &peer_info = pair_event.peer();
         const std::string peer = peer_info.session_id();
-        const std::string vr_version = peer_info.vr_version();
-        const bool peer_matches = desired_peer_session_id_.empty() || peer == desired_peer_session_id_;
+        const std::string peer_device_type_code = peer_info.device_type_code();
+        const bool peer_session_matches = desired_peer_session_id_.empty() || peer == desired_peer_session_id_;
+        const bool peer_type_matches = desired_peer_device_type_code_.empty() ||
+                                       peer_device_type_code.rfind(desired_peer_device_type_code_, 0) == 0;
+        const bool peer_matches = peer_session_matches && peer_type_matches;
 
         switch (pair_event.op())
         {
         case signaling::PairEvent::REQUEST:
             if (pair_auto_accept_ && peer_matches && grpc_module_ && grpc_module_->acceptPair(peer))
             {
-                RCLCPP_INFO(this->get_logger(), "Pair request from %s accepted", peer.c_str());
-                paired_peer_session_id_ = peer;
-                paired_vr_version_ = vr_version;
-                stopPairingRetryTimer();
-                if (subscribe_vr_pose_flag_ || wantsRemoteAudio())
+                RCLCPP_INFO(this->get_logger(), "Pair request from %s accepted (device_type=%s)",
+                            peer.c_str(),
+                            peer_device_type_code.empty() ? "<empty>" : peer_device_type_code.c_str());
                 {
-                    (void)grpc_module_->subscribe(peer, false, subscribe_vr_pose_flag_, wantsRemoteAudio());
+                    std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+                    paired_peer_session_id_ = peer;
+                    peer_streams_subscribed_ = false;
+                    peer_subscribed_prefixes_.clear();
+                    if (audio_module_)
+                    {
+                        audio_module_->resetRemoteConfig("new peer paired");
+                    }
                 }
+                stopPairingRetryTimer();
                 setState(State::kNegotiating, "pair accepted");
                 startVideoAndNegotiate();
             }
@@ -1056,24 +1181,34 @@ namespace trb
             break;
 
         case signaling::PairEvent::ACCEPT:
-            RCLCPP_INFO(this->get_logger(), "Pair accepted by %s", peer.c_str());
-            paired_peer_session_id_ = peer;
-            paired_vr_version_ = vr_version;
-            stopPairingRetryTimer();
-            if ((subscribe_vr_pose_flag_ || wantsRemoteAudio()) && grpc_module_)
+            RCLCPP_INFO(this->get_logger(), "Pair accepted by %s (device_type=%s)",
+                        peer.c_str(),
+                        peer_device_type_code.empty() ? "<empty>" : peer_device_type_code.c_str());
             {
-                (void)grpc_module_->subscribe(peer, false, subscribe_vr_pose_flag_, wantsRemoteAudio());
+                std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+                paired_peer_session_id_ = peer;
+                peer_streams_subscribed_ = false;
+                peer_subscribed_prefixes_.clear();
+                if (audio_module_)
+                {
+                    audio_module_->resetRemoteConfig("new peer paired");
+                }
             }
+            stopPairingRetryTimer();
             setState(State::kNegotiating, "paired");
             startVideoAndNegotiate();
             break;
 
         case signaling::PairEvent::REJECT:
             RCLCPP_WARN(this->get_logger(), "Pair rejected by %s", peer.c_str());
-            if (paired_peer_session_id_ == peer)
             {
-                paired_peer_session_id_.clear();
-                paired_vr_version_.clear();
+                std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+                if (paired_peer_session_id_ == peer)
+                {
+                    paired_peer_session_id_.clear();
+                    peer_streams_subscribed_ = false;
+                    peer_subscribed_prefixes_.clear();
+                }
             }
             setState(State::kPairing, "pair rejected");
             if (pair_mode_ == "active")
@@ -1084,14 +1219,14 @@ namespace trb
 
         case signaling::PairEvent::UNPAIR:
             RCLCPP_INFO(this->get_logger(), "Unpaired by %s", peer.c_str());
-            if ((subscribe_vr_pose_flag_ || wantsRemoteAudio()) && grpc_module_)
             {
-                (void)grpc_module_->unsubscribe(peer);
-            }
-            if (paired_peer_session_id_ == peer)
-            {
-                paired_peer_session_id_.clear();
-                paired_vr_version_.clear();
+                std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+                if (paired_peer_session_id_ == peer)
+                {
+                    paired_peer_session_id_.clear();
+                    peer_streams_subscribed_ = false;
+                    peer_subscribed_prefixes_.clear();
+                }
             }
             teardownActiveSession("unpaired by peer", State::kPairing);
             break;
@@ -1101,45 +1236,252 @@ namespace trb
         }
     }
 
-    void MainNode::handleRemoteAudioConfig(const signaling::AudioConfig &config)
+    bool MainNode::ensurePeerSubscriptions()
     {
-        std::string message;
-        trb::audio::AudioModule::Config remote_config;
-        const bool valid = validateRemoteAudioConfig(config, remote_config, message);
-        bool accepted = false;
-        if (valid && audio_module_)
+        if (!grpc_module_)
         {
-            accepted = audio_module_->applyRemoteConfig(remote_config, config.config_id());
-            if (!accepted && message.empty())
-            {
-                message = "failed to apply remote AudioConfig";
-            }
-            if (accepted && state_.load() == State::kRunning && !audio_module_->isRunning())
-            {
-                (void)audio_module_->start();
-            }
-        }
-        if (accepted)
-        {
-            message = "accepted";
-        }
-        else if (message.empty())
-        {
-            message = "rejected";
+            return false;
         }
 
-        if (grpc_module_)
+        std::string peer_session_id;
+        std::vector<uint8_t> subscribed_prefixes;
         {
-            (void)grpc_module_->ackAudioConfig(accepted, message, config.config_id());
+            std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+            if (peer_streams_subscribed_)
+            {
+                return true;
+            }
+            if (paired_peer_session_id_.empty())
+            {
+                return false;
+            }
+            if (!subscribe_vr_pose_flag_ && !wantsRemoteAudio())
+            {
+                peer_streams_subscribed_ = true;
+                peer_subscribed_prefixes_.clear();
+                return true;
+            }
+            peer_session_id = paired_peer_session_id_;
+            subscribed_prefixes = peer_subscribed_prefixes_;
         }
-        RCLCPP_INFO(this->get_logger(),
-                    "Remote AudioConfig %s: config_id=%s message=%s",
-                    accepted ? "accepted" : "rejected",
-                    config.config_id().empty() ? "<empty>" : config.config_id().c_str(),
-                    message.c_str());
+
+        std::vector<uint8_t> available_prefixes;
+        if (!grpc_module_->getStreamPrefixes(peer_session_id, available_prefixes))
+        {
+            return false;
+        }
+
+        const auto has_prefix = [&available_prefixes](uint8_t prefix) {
+            return std::find(available_prefixes.begin(), available_prefixes.end(), prefix) != available_prefixes.end();
+        };
+
+        std::vector<uint8_t> subscribe_prefixes;
+        bool has_pose_stream = false;
+        bool all_requested_streams_available = true;
+        if (subscribe_vr_pose_flag_)
+        {
+            if (!has_prefix(kPoseControllerPrefix) || !has_prefix(kBody24RawPrefix))
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Peer manifest does not yet declare pose prefixes 0x02 and 0x09; video will continue while pose subscription retries");
+                all_requested_streams_available = false;
+            }
+            else
+            {
+                subscribe_prefixes.push_back(kPoseControllerPrefix);
+                subscribe_prefixes.push_back(kBody24RawPrefix);
+                has_pose_stream = true;
+            }
+        }
+
+        if (wantsRemoteAudio())
+        {
+            if (!has_prefix(kAudioPrefix))
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Peer manifest does not yet declare audio prefix 0x04");
+                all_requested_streams_available = false;
+            }
+            else
+            {
+                subscribe_prefixes.push_back(kAudioPrefix);
+            }
+        }
+
+        std::sort(subscribe_prefixes.begin(), subscribe_prefixes.end());
+        subscribe_prefixes.erase(std::unique(subscribe_prefixes.begin(), subscribe_prefixes.end()),
+                                 subscribe_prefixes.end());
+
+        if (subscribe_prefixes != subscribed_prefixes &&
+            !subscribe_prefixes.empty() &&
+            !grpc_module_->subscribe(peer_session_id, subscribe_prefixes))
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "Failed to subscribe to available peer stream prefixes; background retry will continue");
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+        if (paired_peer_session_id_ != peer_session_id)
+        {
+            return false;
+        }
+        if (subscribe_prefixes != peer_subscribed_prefixes_)
+        {
+            peer_subscribed_prefixes_ = subscribe_prefixes;
+            if (!subscribe_prefixes.empty())
+            {
+                RCLCPP_INFO(this->get_logger(),
+                            "Subscribed to %zu available peer stream(s): pose=%d audio=%d complete=%d",
+                            subscribe_prefixes.size(),
+                            has_pose_stream ? 1 : 0,
+                            std::find(subscribe_prefixes.begin(), subscribe_prefixes.end(), kAudioPrefix) !=
+                                    subscribe_prefixes.end()
+                                ? 1
+                                : 0,
+                            all_requested_streams_available ? 1 : 0);
+            }
+        }
+
+        peer_streams_subscribed_ = all_requested_streams_available;
+        return peer_streams_subscribed_;
     }
 
-    bool MainNode::validateRemoteAudioConfig(const signaling::AudioConfig &config,
+    void MainNode::peerSubscriptionRetryTimerCallback()
+    {
+        const State current = state_.load();
+        bool has_peer = false;
+        {
+            std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+            has_peer = !paired_peer_session_id_.empty();
+        }
+        if (shutting_down_.load(std::memory_order_acquire) ||
+            (current != State::kNegotiating && current != State::kRunning) || !has_peer)
+        {
+            stopPeerSubscriptionRetryTimer();
+            return;
+        }
+
+        const bool subscriptions_ready = ensurePeerSubscriptions();
+        const bool remote_audio_ready = fetchRemoteAudioConfig();
+        if (subscriptions_ready && remote_audio_ready)
+        {
+            stopPeerSubscriptionRetryTimer();
+        }
+    }
+
+    void MainNode::ensurePeerSubscriptionRetryTimer()
+    {
+        if (!canScheduleRosWork(*this, shutting_down_))
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(peer_subscription_timer_mutex_);
+        if (!peer_subscription_retry_timer_)
+        {
+            try
+            {
+                peer_subscription_retry_timer_ = this->create_wall_timer(
+                    std::chrono::seconds(1),
+                    [this]() { peerSubscriptionRetryTimerCallback(); },
+                    peer_subscription_callback_group_);
+            }
+            catch (const rclcpp::exceptions::RCLError &ex)
+            {
+                if (!shutting_down_.load(std::memory_order_acquire))
+                {
+                    RCLCPP_WARN(this->get_logger(), "Skip peer subscription retry timer creation: %s", ex.what());
+                }
+            }
+            return;
+        }
+
+        try
+        {
+            peer_subscription_retry_timer_->reset();
+        }
+        catch (const rclcpp::exceptions::RCLError &ex)
+        {
+            if (!shutting_down_.load(std::memory_order_acquire))
+            {
+                RCLCPP_WARN(this->get_logger(), "Skip peer subscription retry timer reset: %s", ex.what());
+            }
+        }
+    }
+
+    void MainNode::stopPeerSubscriptionRetryTimer()
+    {
+        std::lock_guard<std::mutex> lock(peer_subscription_timer_mutex_);
+        if (peer_subscription_retry_timer_)
+        {
+            peer_subscription_retry_timer_->cancel();
+        }
+    }
+
+    void MainNode::resetPeerSubscriptionState()
+    {
+        std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+        peer_streams_subscribed_ = false;
+        peer_subscribed_prefixes_.clear();
+    }
+
+    bool MainNode::fetchRemoteAudioConfig()
+    {
+        if (!wantsRemoteAudio())
+        {
+            return true;
+        }
+        if (!audio_module_ || !grpc_module_)
+        {
+            return false;
+        }
+
+        std::string peer_session_id;
+        {
+            std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+            if (paired_peer_session_id_.empty())
+            {
+                return false;
+            }
+            if (audio_module_->isRemoteConfigReady())
+            {
+                return true;
+            }
+            peer_session_id = paired_peer_session_id_;
+        }
+
+        GrpcModule::AudioConfig config;
+        std::string config_id;
+        if (!grpc_module_->fetchAudioConfig(peer_session_id, config, config_id))
+        {
+            return false;
+        }
+
+        std::string message;
+        trb::audio::AudioModule::Config remote_config;
+        if (!validateRemoteAudioConfig(config, remote_config, message))
+        {
+            RCLCPP_WARN(this->get_logger(), "Remote audio StreamConfig rejected: %s", message.c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+        if (paired_peer_session_id_ != peer_session_id)
+        {
+            return false;
+        }
+        if (!audio_module_->applyRemoteConfig(remote_config, config_id))
+        {
+            RCLCPP_WARN(this->get_logger(), "Failed to apply remote audio StreamConfig");
+            return false;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Remote audio StreamConfig accepted: config_id=%s",
+                    config_id.empty() ? "<empty>" : config_id.c_str());
+        return true;
+    }
+
+    bool MainNode::validateRemoteAudioConfig(const GrpcModule::AudioConfig &config,
                                              trb::audio::AudioModule::Config &remote_config,
                                              std::string &message) const
     {
@@ -1154,26 +1496,21 @@ namespace trb
             message = "audio downlink is disabled";
             return false;
         }
-        if (config.codec() != signaling::AudioConfig::OPUS)
-        {
-            message = "unsupported audio codec";
-            return false;
-        }
-        if (config.sample_rate() <= 0 || config.channels() <= 0 || config.frame_duration_ms() <= 0 ||
-            config.samples_per_channel() <= 0 || config.bitrate_bps() <= 0)
+        if (config.sample_rate == 0 || config.channels == 0 || config.frame_duration_ms == 0 ||
+            config.samples_per_channel == 0 || config.bitrate_bps == 0)
         {
             message = "invalid non-positive audio config field";
             return false;
         }
 
         remote_config = local_config;
-        remote_config.sample_rate = static_cast<uint32_t>(config.sample_rate());
-        remote_config.channels = static_cast<uint32_t>(config.channels());
-        remote_config.frame_duration_ms = static_cast<uint32_t>(config.frame_duration_ms());
-        remote_config.samples_per_channel = static_cast<uint32_t>(config.samples_per_channel());
-        remote_config.bitrate_bps = static_cast<uint32_t>(config.bitrate_bps());
-        remote_config.opus_inband_fec_enabled = config.opus_inband_fec_enabled();
-        remote_config.opus_dtx_enabled = config.opus_dtx_enabled();
+        remote_config.sample_rate = config.sample_rate;
+        remote_config.channels = config.channels;
+        remote_config.frame_duration_ms = config.frame_duration_ms;
+        remote_config.samples_per_channel = config.samples_per_channel;
+        remote_config.bitrate_bps = config.bitrate_bps;
+        remote_config.opus_inband_fec_enabled = config.opus_inband_fec_enabled;
+        remote_config.opus_dtx_enabled = config.opus_dtx_enabled;
 
         if (remote_config.sample_rate != local_config.sample_rate ||
             remote_config.channels != local_config.channels ||
@@ -1192,7 +1529,7 @@ namespace trb
 
     bool MainNode::wantsRemoteAudio() const
     {
-        return audio_module_ && audio_module_->config().enabled && audio_module_->config().downlink_enabled;
+        return audio_module_ && audio_module_->isEnabled() && audio_module_->config().downlink_enabled;
     }
 
     void MainNode::startVideoAndNegotiate()
@@ -1443,17 +1780,36 @@ namespace trb
         }
 
         const bool audio_enabled = audio_module_ && audio_module_->isEnabled();
-        if (audio_enabled && !audio_module_->isConfigPublished() && !publishAudioConfig())
+        const bool publishes_audio = audio_enabled && audio_module_->config().uplink_enabled;
+        if (publishes_audio && !audio_module_->isConfigPublished() && !publishAudioConfig())
         {
             ensureNegotiationRetryTimer();
             return;
         }
+        if (audio_enabled && !publishes_audio)
+        {
+            audio_module_->markConfigPublished();
+        }
 
         stopNegotiationRetryTimer();
-        setState(State::kRunning, audio_enabled ? "VideoConfig and AudioConfig ACK received" : "VideoConfig ACK received");
+        setState(State::kRunning,
+                 audio_enabled ? "local video/audio stream configs published"
+                               : "local video stream config published");
         if (audio_module_)
         {
             audio_module_->start();
+        }
+
+        if (subscribe_vr_pose_flag_ || wantsRemoteAudio())
+        {
+            RCLCPP_INFO(this->get_logger(),
+                        "Local stream sending is running; peer pose/audio receive setup will retry independently");
+            ensurePeerSubscriptionRetryTimer();
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+            peer_streams_subscribed_ = true;
         }
     }
 
@@ -1785,17 +2141,28 @@ namespace trb
 
         stopRobotTelemetry();
         stopNegotiationRetryTimer();
+        stopPeerSubscriptionRetryTimer();
         stopPairingRetryTimer();
+        {
+            std::lock_guard<std::mutex> lock(peer_receive_state_mutex_);
+            paired_peer_session_id_.clear();
+            peer_streams_subscribed_ = false;
+            peer_subscribed_prefixes_.clear();
+            if (audio_module_)
+            {
+                audio_module_->stop();
+                audio_module_->resetConfigPublished();
+                audio_module_->resetRemoteConfig(reason);
+            }
+        }
         stopVideo();
         resetVideoConfigState();
-        if (audio_module_)
+
+        if (target_state == State::kConnecting)
         {
-            audio_module_->stop();
-            audio_module_->resetConfigPublished();
-            audio_module_->resetRemoteConfig(reason);
+            publisher_manifest_published_ = false;
+            stopRegisteredSetupRetryTimer();
         }
-        paired_peer_session_id_.clear();
-        paired_vr_version_.clear();
 
         if (udp_module_)
         {
@@ -1855,7 +2222,9 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<trb::MainNode>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

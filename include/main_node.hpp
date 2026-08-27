@@ -70,13 +70,22 @@ namespace trb
         void onGrpcRegistered();
         void onGrpcHeartbeatFail();
         void onGrpcStreamEnd();
+        void completeRegisteredSetup();
+        void registeredSetupRetryTimerCallback();
+        void ensureRegisteredSetupRetryTimer();
+        void stopRegisteredSetupRetryTimer();
         void onUdpHandshakeReady();
         void onUdpPeerLost();
         void handleUdpPeerLost();
         void onSignalingEvent(const signaling::EventMessage &msg);
         void handleSignalingEvent(const signaling::EventMessage &msg);
-        void handleRemoteAudioConfig(const signaling::AudioConfig &config);
-        bool validateRemoteAudioConfig(const signaling::AudioConfig &config,
+        bool ensurePeerSubscriptions();
+        void peerSubscriptionRetryTimerCallback();
+        void ensurePeerSubscriptionRetryTimer();
+        void stopPeerSubscriptionRetryTimer();
+        void resetPeerSubscriptionState();
+        bool fetchRemoteAudioConfig();
+        bool validateRemoteAudioConfig(const GrpcModule::AudioConfig &config,
                        trb::audio::AudioModule::Config &remote_config,
                        std::string &message) const;
         bool wantsRemoteAudio() const;
@@ -96,6 +105,7 @@ namespace trb
         void stopPairingRetryTimer();
         bool tryActivePairing();
 
+        bool publishLocalStreamManifest();
         bool publishVideoConfig();
         bool publishAudioConfig();
         void tryAdvanceNegotiation();
@@ -111,11 +121,15 @@ namespace trb
         std::unique_ptr<trb::video::VideoModule> video_module_;
 
         rclcpp::TimerBase::SharedPtr negotiation_retry_timer_;
+        rclcpp::TimerBase::SharedPtr peer_subscription_retry_timer_;
         rclcpp::TimerBase::SharedPtr pairing_retry_timer_;
+        rclcpp::TimerBase::SharedPtr registered_setup_retry_timer_;
         rclcpp::TimerBase::SharedPtr session_work_timer_;
         rclcpp::TimerBase::SharedPtr video_stats_timer_;
         rclcpp::TimerBase::SharedPtr telemetry_timer_;
         rclcpp::TimerBase::SharedPtr joint_telemetry_timer_;
+        rclcpp::CallbackGroup::SharedPtr peer_subscription_callback_group_;
+        std::mutex peer_subscription_timer_mutex_;
         rclcpp::Subscription<teleop_robot_bridge::msg::AgvBatteryState>::SharedPtr telemetry_battery_sub_;
         rclcpp::Subscription<teleop_robot_bridge::msg::Temperature>::SharedPtr telemetry_temperature_sub_;
         rclcpp::Subscription<teleop_robot_bridge::msg::AgvDeviceState>::SharedPtr telemetry_device_state_sub_;
@@ -137,9 +151,13 @@ namespace trb
         bool pair_auto_request_{true};
         bool pair_list_unpaired_on_start_{false};
         std::string desired_peer_session_id_;
+        std::string desired_peer_device_type_code_;
         std::string paired_peer_session_id_;
-        std::string paired_vr_version_;
         std::string pair_mode_{"passive"};
+        std::mutex peer_receive_state_mutex_;
+        bool publisher_manifest_published_{false};
+        bool peer_streams_subscribed_{false};
+        std::vector<uint8_t> peer_subscribed_prefixes_;
 
         std::mutex video_config_mutex_;
         bool video_config_sent_{false};

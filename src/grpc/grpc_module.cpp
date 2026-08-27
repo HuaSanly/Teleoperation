@@ -2,15 +2,26 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <sstream>
 #include <utility>
+
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
+#include <openssl/evp.h>
 
 namespace trb
 {
     namespace
     {
         constexpr uint32_t kMaxTransientHeartbeatFailuresBeforeReregister = 3;
+        constexpr uint8_t kVideoPrefix = 0x01;
+        constexpr uint8_t kAudioPrefix = 0x04;
+        constexpr uint8_t kLowRateTelemetryPrefix = 0x05;
+        constexpr uint8_t kHighRateTelemetryPrefix = 0x06;
+        constexpr uint32_t kMediaConfigSchemaVersion = 1;
 
         template <typename T>
         T declareOrGet(rclcpp::Node &node, const std::string &name, const T &default_value)
@@ -58,6 +69,87 @@ namespace trb
             return preview;
         }
 
+        std::string base64Encode(const std::vector<uint8_t> &bytes)
+        {
+            if (bytes.empty())
+            {
+                return {};
+            }
+            const size_t encoded_size = 4 * ((bytes.size() + 2) / 3);
+            std::string encoded(encoded_size + 1, '\0');
+            const int written = EVP_EncodeBlock(
+                reinterpret_cast<unsigned char *>(encoded.data()),
+                bytes.data(),
+                static_cast<int>(bytes.size()));
+            if (written <= 0)
+            {
+                return {};
+            }
+            encoded.resize(static_cast<size_t>(written));
+            return encoded;
+        }
+
+        bool serializeJson(const google::protobuf::Struct &document, std::string &payload)
+        {
+            google::protobuf::util::JsonPrintOptions options;
+            options.add_whitespace = false;
+            options.preserve_proto_field_names = true;
+            return google::protobuf::util::MessageToJsonString(document, &payload, options).ok();
+        }
+
+        const google::protobuf::Value *findJsonField(const google::protobuf::Struct &document,
+                                                      const char *name)
+        {
+            const auto iterator = document.fields().find(name);
+            return iterator == document.fields().end() ? nullptr : &iterator->second;
+        }
+
+        bool readJsonString(const google::protobuf::Struct &document,
+                            const char *name,
+                            std::string &value)
+        {
+            const auto *field = findJsonField(document, name);
+            if (!field || field->kind_case() != google::protobuf::Value::kStringValue)
+            {
+                return false;
+            }
+            value = field->string_value();
+            return true;
+        }
+
+        bool readJsonUint32(const google::protobuf::Struct &document,
+                            const char *name,
+                            uint32_t &value)
+        {
+            const auto *field = findJsonField(document, name);
+            if (!field || field->kind_case() != google::protobuf::Value::kNumberValue)
+            {
+                return false;
+            }
+            const double number = field->number_value();
+            if (!std::isfinite(number) || number <= 0.0 ||
+                number > static_cast<double>(std::numeric_limits<uint32_t>::max()) ||
+                std::floor(number) != number)
+            {
+                return false;
+            }
+            value = static_cast<uint32_t>(number);
+            return true;
+        }
+
+        bool readJsonBool(const google::protobuf::Struct &document,
+                          const char *name,
+                          bool &value)
+        {
+            const auto *field = findJsonField(document, name);
+            if (!field || field->kind_case() != google::protobuf::Value::kBoolValue)
+            {
+                return false;
+            }
+            value = field->bool_value();
+            return true;
+        }
+
         bool hasValidContext(rclcpp::Node &node)
         {
             const auto base = node.get_node_base_interface();
@@ -69,12 +161,19 @@ namespace trb
     GrpcModule::Config GrpcModule::configFromRosParam(rclcpp::Node &node)
     {
         Config config;
+        config.enabled = declareOrGet<bool>(node, "grpc.enabled", true);
         config.server_grpc_ip = declareOrGet<std::string>(node, "grpc.server_grpc_ip", "");
         config.server_grpc_port = declareOrGet<int>(node, "grpc.server_grpc_port", 0);
         config.use_ssl = declareOrGet<bool>(node, "grpc.use_ssl", false);
         config.device_id = declareOrGet<std::string>(node, "grpc.device_id", "");
-        config.robot_generation = declareOrGet<int>(node, "grpc.robot_generation", 2);
-        config.token = declareOrGet<std::string>(node, "grpc.token", "");
+        config.firmware_version = declareOrGet<std::string>(node, "grpc.runtime.firmware_version", "");
+        config.software_version = declareOrGet<std::string>(node, "grpc.runtime.software_version", "teleop_robot_bridge");
+        config.operating_system = declareOrGet<std::string>(node, "grpc.runtime.operating_system", "Linux");
+        config.operating_system_version = declareOrGet<std::string>(node, "grpc.runtime.operating_system_version", "");
+        config.runtime_version = declareOrGet<std::string>(node, "grpc.runtime.runtime_version", "ROS 2");
+        config.build_id = declareOrGet<std::string>(node, "grpc.runtime.build_id", "");
+        config.capabilities = declareOrGet<std::vector<std::string>>(
+            node, "grpc.runtime.capabilities", std::vector<std::string>{"publisher_streams"});
         config.rpc_timeout_ms = declareOrGet<int>(node, "grpc.rpc_timeout_ms", 5000);
         config.register_retry_sec = declareOrGet<double>(node, "grpc.register_retry_sec", 3.0);
         config.heartbeat_sec = declareOrGet<double>(node, "grpc.heartbeat_sec", 15.0);
@@ -109,6 +208,12 @@ namespace trb
     void GrpcModule::start()
     {
         shutting_down_.store(false, std::memory_order_release);
+        if (!config_.enabled)
+        {
+            registered_.store(false);
+            RCLCPP_INFO(logger_, "gRPC signaling is disabled by grpc.enabled");
+            return;
+        }
         tryRegister();
         if (!registered_.load())
         {
@@ -147,10 +252,14 @@ namespace trb
         consecutive_heartbeat_transport_failures_ = 0;
     }
 
-    const std::string &GrpcModule::sessionId() const
+    std::string GrpcModule::sessionId() const
     {
-        static const std::string empty;
-        return manager_ ? manager_->session_id() : empty;
+        return manager_ ? manager_->session_id() : std::string{};
+    }
+
+    std::string GrpcModule::deviceTypeCode() const
+    {
+        return manager_ ? manager_->device_type_code() : std::string{};
     }
 
     void GrpcModule::tryRegister()
@@ -359,9 +468,9 @@ namespace trb
         return manager_ && manager_->Unpair(peer_session_id);
     }
 
-    bool GrpcModule::subscribe(const std::string &publisher_session_id, bool sub_video, bool sub_pose, bool sub_audio)
+    bool GrpcModule::subscribe(const std::string &publisher_session_id, const std::vector<uint8_t> &prefixes)
     {
-        return manager_ && manager_->Subscribe(publisher_session_id, sub_video, sub_pose, sub_audio);
+        return manager_ && manager_->Subscribe(publisher_session_id, prefixes);
     }
 
     bool GrpcModule::unsubscribe(const std::string &publisher_session_id)
@@ -369,13 +478,97 @@ namespace trb
         return manager_ && manager_->Unsubscribe(publisher_session_id);
     }
 
-    std::vector<signaling::UnpairedEndpoint> GrpcModule::listUnpaired(signaling::RegisterRequest::EndpointType desired_role)
+    std::vector<signaling::UnpairedEndpoint> GrpcModule::listUnpaired(const std::string &desired_device_type_code)
     {
         if (!manager_)
         {
             return {};
         }
-        return manager_->ListUnpaired(desired_role);
+        return manager_->ListUnpaired(desired_device_type_code);
+    }
+
+    bool GrpcModule::getStreamPrefixes(const std::string &publisher_session_id, std::vector<uint8_t> &prefixes)
+    {
+        prefixes.clear();
+        if (!manager_)
+        {
+            return false;
+        }
+
+        signaling::GetStreamManifestResponse response;
+        if (!manager_->GetStreamManifest(publisher_session_id, response))
+        {
+            return false;
+        }
+
+        prefixes.reserve(static_cast<size_t>(response.items_size()));
+        for (const auto &item : response.items())
+        {
+            if (item.prefix() <= 0xFFu)
+            {
+                prefixes.push_back(static_cast<uint8_t>(item.prefix()));
+            }
+        }
+        std::sort(prefixes.begin(), prefixes.end());
+        prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+        return true;
+    }
+
+    bool GrpcModule::publishRobotStreamManifest(bool audio_enabled,
+                                                bool low_rate_telemetry_enabled,
+                                                bool high_rate_telemetry_enabled)
+    {
+        if (!manager_)
+        {
+            return false;
+        }
+
+        signaling::PublishStreamManifestRequest request;
+        auto add_stream = [&request](uint8_t prefix,
+                                     const char *stream_code,
+                                     const char *display_name,
+                                     const char *description,
+                                     const char *class_code,
+                                     const char *protocol_code) {
+            auto *stream = request.add_streams();
+            stream->set_prefix(prefix);
+            stream->set_stream_code(stream_code);
+            stream->set_display_name(display_name);
+            stream->set_description(description);
+            stream->set_stream_class_code(class_code);
+            stream->set_protocol_code(protocol_code);
+        };
+
+        add_stream(kVideoPrefix, "video", "Robot Video", "Encoded robot camera video", "video", "video");
+        if (audio_enabled)
+        {
+            add_stream(kAudioPrefix, "audio_opus", "Robot Audio", "Opus robot audio", "audio", "audio_opus");
+        }
+        if (low_rate_telemetry_enabled)
+        {
+            add_stream(kLowRateTelemetryPrefix,
+                       "robot_telemetry_low_rate",
+                       "Robot Telemetry",
+                       "Low-rate robot state snapshot",
+                       "telemetry",
+                       "robot_telemetry_low_rate");
+        }
+        if (high_rate_telemetry_enabled)
+        {
+            add_stream(kHighRateTelemetryPrefix,
+                       "robot_joint_telemetry_high_rate",
+                       "Robot Joint Telemetry",
+                       "High-rate robot joint state",
+                       "telemetry",
+                       "robot_joint_telemetry_high_rate");
+        }
+
+        if (!manager_->PublishStreamManifest(request))
+        {
+            return false;
+        }
+        RCLCPP_INFO(logger_, "Published robot stream manifest with %d stream(s)", request.streams_size());
+        return true;
     }
 
     bool GrpcModule::publishVideoConfig(uint32_t width,
@@ -403,23 +596,28 @@ namespace trb
             return false;
         }
 
-        signaling::VideoConfig config;
-        config.set_codec(is_h265 ? signaling::VideoConfig::H265 : signaling::VideoConfig::H264);
-        config.set_width(static_cast<int32_t>(width));
-        config.set_height(static_cast<int32_t>(height));
-        config.set_fps(static_cast<int32_t>(fps));
-        config.set_sps(sps.data(), sps.size());
-        config.set_pps(pps.data(), pps.size());
-        if (is_h265)
-        {
-            config.set_vps(vps.data(), vps.size());
-        }
+        google::protobuf::Struct document;
+        auto *fields = document.mutable_fields();
+        (*fields)["codec"].set_string_value(is_h265 ? "H265" : "H264");
+        (*fields)["width"].set_number_value(width);
+        (*fields)["height"].set_number_value(height);
+        (*fields)["fps"].set_number_value(fps);
+        (*fields)["sps"].set_string_value(base64Encode(sps));
+        (*fields)["pps"].set_string_value(base64Encode(pps));
+        (*fields)["vps"].set_string_value(base64Encode(vps));
         if (has_fov)
         {
-            auto *fov = config.mutable_fov();
-            fov->set_hfov(hfov_deg);
-            fov->set_vfov(vfov_deg);
-            fov->set_dfov(dfov_deg);
+            auto *fov = (*fields)["fov"].mutable_struct_value()->mutable_fields();
+            (*fov)["hfov"].set_number_value(hfov_deg);
+            (*fov)["vfov"].set_number_value(vfov_deg);
+            (*fov)["dfov"].set_number_value(dfov_deg);
+        }
+
+        std::string payload;
+        if (!serializeJson(document, payload))
+        {
+            RCLCPP_WARN(logger_, "Failed to serialize video StreamConfig JSON");
+            return false;
         }
 
         RCLCPP_INFO(logger_, "========== VideoConfig ==========");
@@ -449,13 +647,14 @@ namespace trb
         }
         RCLCPP_INFO(logger_, "==================================");
 
-        signaling::VideoConfigAck ack;
-        if (!manager_->PublishVideoConfig(config, ack))
+        if (!manager_->PublishStreamConfig(kVideoPrefix,
+                                           kMediaConfigSchemaVersion,
+                                           payload))
         {
-            RCLCPP_WARN(logger_, "VideoConfig publish failed");
+            RCLCPP_WARN(logger_, "Video StreamConfig publish failed");
             return false;
         }
-        RCLCPP_INFO(logger_, "VideoConfig published successfully");
+        RCLCPP_INFO(logger_, "Video StreamConfig published successfully");
         return true;
     }
 
@@ -467,44 +666,82 @@ namespace trb
             return false;
         }
 
-        signaling::AudioConfig config;
-        config.set_codec(signaling::AudioConfig::OPUS);
-        config.set_sample_rate(static_cast<int32_t>(audio_config.sample_rate));
-        config.set_channels(static_cast<int32_t>(audio_config.channels));
-        config.set_frame_duration_ms(static_cast<int32_t>(audio_config.frame_duration_ms));
-        config.set_samples_per_channel(static_cast<int32_t>(audio_config.samples_per_channel));
-        config.set_bitrate_bps(static_cast<int32_t>(audio_config.bitrate_bps));
-        config.set_opus_inband_fec_enabled(audio_config.opus_inband_fec_enabled);
-        config.set_opus_dtx_enabled(audio_config.opus_dtx_enabled);
+        google::protobuf::Struct document;
+        auto *fields = document.mutable_fields();
+        (*fields)["codec"].set_string_value("OPUS");
+        (*fields)["sample_rate"].set_number_value(audio_config.sample_rate);
+        (*fields)["channels"].set_number_value(audio_config.channels);
+        (*fields)["frame_duration_ms"].set_number_value(audio_config.frame_duration_ms);
+        (*fields)["samples_per_channel"].set_number_value(audio_config.samples_per_channel);
+        (*fields)["bitrate_bps"].set_number_value(audio_config.bitrate_bps);
+        (*fields)["opus_inband_fec_enabled"].set_bool_value(audio_config.opus_inband_fec_enabled);
+        (*fields)["opus_dtx_enabled"].set_bool_value(audio_config.opus_dtx_enabled);
 
-        signaling::AudioConfigAck ack;
-        if (!manager_->PublishAudioConfig(config, ack))
+        std::string payload;
+        if (!serializeJson(document, payload))
         {
-            RCLCPP_WARN(logger_, "PublishAudioConfig failed");
+            RCLCPP_WARN(logger_, "Failed to serialize audio StreamConfig JSON");
             return false;
         }
-        RCLCPP_INFO(logger_, "AudioConfig published successfully");
+
+        if (!manager_->PublishStreamConfig(kAudioPrefix,
+                                           kMediaConfigSchemaVersion,
+                                           payload))
+        {
+            RCLCPP_WARN(logger_, "Publish audio StreamConfig failed");
+            return false;
+        }
+        RCLCPP_INFO(logger_, "Audio StreamConfig published successfully");
         return true;
     }
 
-    bool GrpcModule::ackAudioConfig(bool success, const std::string &message, const std::string &config_id)
+    bool GrpcModule::fetchAudioConfig(const std::string &publisher_session_id,
+                                      AudioConfig &audio_config,
+                                      std::string &config_id)
     {
         if (!manager_)
         {
-            RCLCPP_WARN(logger_, "gRPC manager not available, cannot ACK AudioConfig");
             return false;
         }
 
-        signaling::AudioConfigAck ack;
-        ack.set_success(success);
-        ack.set_message(message);
-        ack.set_config_id(config_id);
-        if (!manager_->AckAudioConfig(ack))
+        signaling::StreamConfigItem item;
+        if (!manager_->GetStreamConfig(publisher_session_id, kAudioPrefix, item))
         {
-            RCLCPP_WARN(logger_, "AckAudioConfig failed");
             return false;
         }
-        RCLCPP_INFO(logger_, "AudioConfig ACK sent: success=%d config_id=%s", success ? 1 : 0, config_id.c_str());
+
+        if (item.prefix() != kAudioPrefix ||
+            item.schema_version() != kMediaConfigSchemaVersion)
+        {
+            RCLCPP_WARN(logger_,
+                        "Unsupported remote audio StreamConfig: prefix=0x%02X schema=%u",
+                        item.prefix(),
+                        item.schema_version());
+            return false;
+        }
+
+        google::protobuf::Struct document;
+        if (!google::protobuf::util::JsonStringToMessage(item.payload(), &document).ok())
+        {
+            RCLCPP_WARN(logger_, "Remote audio StreamConfig contains invalid JSON");
+            return false;
+        }
+
+        std::string codec;
+        if (!readJsonString(document, "codec", codec) || codec != "OPUS" ||
+            !readJsonUint32(document, "sample_rate", audio_config.sample_rate) ||
+            !readJsonUint32(document, "channels", audio_config.channels) ||
+            !readJsonUint32(document, "frame_duration_ms", audio_config.frame_duration_ms) ||
+            !readJsonUint32(document, "samples_per_channel", audio_config.samples_per_channel) ||
+            !readJsonUint32(document, "bitrate_bps", audio_config.bitrate_bps) ||
+            !readJsonBool(document, "opus_inband_fec_enabled", audio_config.opus_inband_fec_enabled) ||
+            !readJsonBool(document, "opus_dtx_enabled", audio_config.opus_dtx_enabled))
+        {
+            RCLCPP_WARN(logger_, "Remote audio StreamConfig JSON does not match schema version 1");
+            return false;
+        }
+
+        config_id = item.config_id();
         return true;
     }
 

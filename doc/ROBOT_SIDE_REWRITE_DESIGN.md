@@ -568,7 +568,7 @@ USB 3.0 双目 UVC 摄像头
 - 双目 SBS 作为一个完整视频流处理，第一版不拆左右眼两路。
 - 编码输出必须是 H.264 AU，不是裸 NAL 零散回调。
 - `h264parse` 输出使用 `stream-format=byte-stream` 和 `alignment=au`。
-- 从 H.264 NAL 中解析 SPS / PPS / IDR，并通过现有 `VideoConfig` 语义发布。
+- 从 H.264 NAL 中解析 SPS / PPS / IDR，并通过 `0x01` 通用 StreamConfig 发布。
 - UDP payload 继续走现有 `0x01` 视频协议，不切换 RTP，不切换 WebRTC transport。
 - 第一版不引入 H.265，避免同时改变编码格式和机器人端架构。
 
@@ -589,7 +589,7 @@ appsink callback:
 ```text
 encoded_frame_queue
   -> parse SPS/PPS/IDR/keyframe
-  -> update VideoConfig readiness
+  -> update video StreamConfig readiness
   -> VideoPacketizer
   -> optional FEC
   -> video_queue
@@ -835,7 +835,7 @@ one socket recvfrom
 检查：
 
 - 正常配对。
-- 正常发送 VideoConfig / AudioConfig。
+- 正常声明 Publisher Manifest，并发布视频/音频 StreamConfig。
 - UDP HELLO / PING / ACK 正常。
 - 首个可解码画面从 keyframe 开始。
 - keyframe burst 时 audio / telemetry 不被明显阻塞。
